@@ -42,5 +42,15 @@ class GitHubClient:
         resp.raise_for_status()
         return resp
 
+    async def graphql(self, query: str, variables: dict) -> dict:
+        resp = await self._client.post("/graphql",
+                                       json={"query": query,
+                                             "variables": variables})
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("errors"):
+            raise RuntimeError(str(data["errors"]))
+        return data["data"]
+
     async def aclose(self):
         await self._client.aclose()
