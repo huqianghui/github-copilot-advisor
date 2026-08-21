@@ -1,0 +1,21 @@
+# pyproject.toml(仓库根)
+[project]
+name = "github-copilot-advisor"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv.workspace]
+members = ["shared", "ingestion"]
+
+[tool.uv.sources]
+advisor-shared = { workspace = true }
+
+[dependency-groups]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "respx>=0.21"]
+
+[tool.pytest.ini_options]
+testpaths = ["shared/tests", "ingestion/tests"]
+asyncio_mode = "auto"
+markers = ["integration: requires real Azure/GitHub resources"]
+addopts = "-m 'not integration'"

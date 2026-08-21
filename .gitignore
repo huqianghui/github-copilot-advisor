@@ -3,3 +3,8 @@ __pycache__/
 .env
 superpowers-plugin
 .claude/settings.local.json
+.venv/
+*.egg-info/
+.pytest_cache/
+uv.lock
+.state/
