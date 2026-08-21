@@ -98,3 +98,51 @@ async def test_fetch_skips_issue_without_answer():
     )
     items = [qa async for qa in create(make_config()).fetch(None)]
     assert items == []
+
+
+@respx.mock
+async def test_rate_limited_then_success_retries():
+    respx.get(f"{API}/repos/microsoft/vscode/issues").mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "0"}),
+            httpx.Response(200, json=[issue_payload(number=1)]),
+        ]
+    )
+    respx.get(f"{API}/repos/microsoft/vscode/issues/1/comments").mock(
+        return_value=httpx.Response(200, json=[
+            comment("Fixed in v1.97 — upgrade the extension please.", "MEMBER"),
+        ])
+    )
+    items = [qa async for qa in create(make_config()).fetch(None)]
+    assert len(items) == 1
+    assert items[0].native_id == "1"
+
+
+@respx.mock
+async def test_rate_limited_three_times_raises():
+    respx.get(f"{API}/repos/microsoft/vscode/issues").mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "0"}),
+            httpx.Response(429, headers={"Retry-After": "0"}),
+            httpx.Response(429, headers={"Retry-After": "0"}),
+        ]
+    )
+    with pytest.raises(httpx.HTTPStatusError):
+        [qa async for qa in create(make_config()).fetch(None)]
+
+
+@respx.mock
+async def test_pagination_two_pages():
+    respx.get(f"{API}/repos/microsoft/vscode/issues").mock(
+        side_effect=[
+            httpx.Response(200, json=[issue_payload(number=i) for i in range(1, 101)]),
+            httpx.Response(200, json=[issue_payload(number=101)]),
+        ]
+    )
+    respx.get(url__regex=r".*/issues/\d+/comments").mock(
+        return_value=httpx.Response(200, json=[
+            comment("Fixed in v1.97 — upgrade the extension please.", "MEMBER"),
+        ])
+    )
+    items = [qa async for qa in create(make_config()).fetch(None)]
+    assert len(items) == 101
