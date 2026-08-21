@@ -9,4 +9,4 @@ enterprise_url_template: "https://github.com/enterprises/{slug}"
 status_api: https://www.githubstatus.com/api/v2/summary.json
 allowlist_doc: https://docs.github.com/en/copilot/reference/copilot-allowlist-reference
 self_test_commands:
-  - 'curl -s --max-time 10 {url} -o /dev/null -w "HTTP %{http_code}, DNS %{time_namelookup}s, TLS %{time_appconnect}s, total %{time_total}s\n"'
+  - 'curl -s --max-time 10 {url} -o /dev/null -w "HTTP %{{http_code}}, DNS %{{time_namelookup}}s, TLS %{{time_appconnect}}s, total %{{time_total}}s\n"'

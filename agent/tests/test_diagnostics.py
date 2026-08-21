@@ -105,3 +105,19 @@ async def test_status_api_failure_degrades_gracefully(tmp_path):
     out = await make_diag(tmp_path).run()
     assert out["github_status"]["indicator"] == "unknown"
     assert out["verdict"] == "github_ok_check_egress"
+
+
+@respx.mock
+async def test_shipped_diagnostics_yaml_renders_self_test_commands():
+    """守护测试:真实配置文件的模板必须能安全 format(回归 KeyError)。"""
+    from pathlib import Path as _P
+    shipped = _P(__file__).parent.parent / "diagnostics.yaml"
+    for url in ["https://github.com/login", "https://api.github.com/user",
+                "https://copilot-proxy.githubusercontent.com"]:
+        respx.get(url).mock(return_value=httpx.Response(200))
+    respx.get("https://www.githubstatus.com/api/v2/summary.json").mock(
+        return_value=httpx.Response(200, json={"status": {"indicator": "none"},
+                                               "incidents": []}))
+    out = await NetworkDiagnostics(shipped, timeout_seconds=1.0).run()
+    assert out["self_test_commands"]
+    assert "%{http_code}" in out["self_test_commands"][0]
