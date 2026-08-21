@@ -197,7 +197,9 @@ Provider 链抽象:按配置顺序尝试(Bing Grounding → Tavily → WorkIQ...
 单 provider 失败/超时自动 failover。每 provider 一个 adapter,配置驱动。
 返回统一格式:title/snippet/url/date。
 
-**3. `escalation_lookup(channel_id)` —— 最后一级**
+**3. `escalate_to_human(reason)` —— 最后一级**
+
+(channel_id 由 backend 从当前请求注入,LLM 只提供 reason —— 一句话概括已尝试路径,供接手人参考)
 
 查静态配置表:channel → CSAM/CSA(姓名、邮箱、Teams user ID、是否在群)。
 agent 据此决定 @提及(在群)或给联系方式(不在群)。
@@ -209,12 +211,15 @@ agent 据此决定 @提及(在群)或给联系方式(不在群)。
    "该问题正在讨论中"的补充信息
 2. 返回 no_results 才允许 `web_search`
 3. 仍无好答案 → 通用排查建议(网络测试、重启、重试、升级版本)+ 开工单指引
-4. 用户表示"还是不行/不满意"或涉及账务/合同 → `escalation_lookup` 升级到人
+4. 用户表示"还是不行/不满意"或涉及账务/合同 → `escalate_to_human` 升级到人
 5. 回答语言跟随提问;引用永远带原始 url;不确定就说不确定,不编造
 
 ### 7.4 多轮会话
 
-- MAF thread/session 维护历史;会话 key = Teams conversation ID(reply thread 或 1:1)
+- MAF thread/session 维护历史;会话 key = `AdvisorRequest.conversation_key` —— 平台无关的
+  不透明字符串,agent core 只作字典 key 使用、从不解析。**如何推导是各渠道 adapter 的私有
+  实现**:Teams 用 conversation.id(天然含 reply thread);企微/飞书等未来各自用本平台的
+  会话/话题标识推导,core 与其他 adapter 均不受影响
 - 存储接口抽象:v1 in-memory(TTL+条数上限),留 Cosmos DB/Redis 实现位
 - 升级推进依赖对话历史,无显式状态字段
 
@@ -248,7 +253,8 @@ Teams 客户端(@提及 / 1:1)
 关键规则:
 - 触发:channel 仅 @提及响应;1:1 全部响应;其余群消息忽略(自动沉淀留后续)
 - 即时反馈:先发 typing indicator,agent 完成再回正文(检索+LLM 5-15s)
-- conversation_key:channel = channel ID + reply thread ID(同串共享会话);1:1 = conversation ID
+- conversation_key(Teams adapter 私有推导规则):直接取 Teams conversation.id ——
+  channel 回帖时其值为 `"{channel_id};messageid={根消息ID}"`,天然同串共享会话;1:1 即会话 id
 - 本地开发:dev tunnel / Bot Framework Emulator / 测试租户
 
 ## 9. 升级流程与联系人配置 ✅(已确认)
