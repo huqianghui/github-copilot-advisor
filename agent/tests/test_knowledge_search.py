@@ -57,3 +57,10 @@ async def test_no_filter_when_product_area_none():
 
 def test_threshold_constant():
     assert MIN_RERANKER_SCORE == 1.5
+
+
+async def test_product_area_quote_escaped():
+    fake = FakeSearchClient([])
+    await KnowledgeSearchClient(fake, FakeEmbeddings()).search(
+        "q", product_area="vs'code")
+    assert fake.kwargs["filter"] == "product_area eq 'vs''code'"

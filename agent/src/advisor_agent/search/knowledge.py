@@ -18,12 +18,16 @@ class KnowledgeSearchClient:
         vector = VectorizedQuery(vector=emb.data[0].embedding,
                                  k_nearest_neighbors=top,
                                  fields="content_vector")
+        odata_filter = None
+        if product_area:
+            safe = product_area.replace("'", "''")
+            odata_filter = f"product_area eq '{safe}'"
         pager = await self.search_client.search(
             search_text=query,
             vector_queries=[vector],
             query_type="semantic",
             semantic_configuration_name="default",
-            filter=f"product_area eq '{product_area}'" if product_area else None,
+            filter=odata_filter,
             top=top,
         )
         results = []
