@@ -154,7 +154,7 @@ git commit -m "chore: scaffold uv workspace with shared and ingestion packages"
   - `QADocument.make_id(source: str, native_id: str) -> str`(staticmethod,sha256 前 32 hex)
   - `QADocument.embedding_text() -> str`(返回 `f"{title}\n{content}"`)
   - `QADocument.to_search_document() -> dict`(datetime 转 ISO8601 字符串,`content_vector` 为 None 时不含该键)
-  - `RAW_CONTENT_MAX_CHARS = 32_000`(常量,truncation 在 connector 侧使用)
+  - `RAW_CONTENT_MAX_CHARS = 32_000`(常量,truncation 在 Task 7 Refiner.refine 中使用)
   - `index_schema.build_index_definition(name: str, vector_dimensions: int = 3072) -> dict`:返回 AI Search 创建索引的完整字段/semantic/vector 配置 dict
 
 - [ ] **Step 1: 写失败测试**
