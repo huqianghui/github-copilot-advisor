@@ -1,0 +1,49 @@
+sources:
+  - name: copilot-faq
+    type: github_discussions
+    repo_org: githubcopilotfaq
+    product_area: general
+    filters: { answered: true }
+
+  - name: vscode-copilot-issues
+    type: github_issues
+    repo: microsoft/vscode
+    product_area: vscode
+    filters:
+      labels: [github-copilot]
+      state: closed
+
+  - name: vscode-copilot-release
+    type: github_issues
+    repo: microsoft/vscode-copilot-release
+    product_area: vscode
+    filters: { state: closed }
+
+  - name: intellij-copilot
+    type: github_issues
+    repo: microsoft/copilot-intellij-feedback
+    product_area: intellij
+    filters: { state: closed }
+
+  - name: copilot-cli-issues
+    type: github_issues
+    repo: github/copilot-cli
+    product_area: cli
+    filters: { state: closed }
+
+  - name: copilot-cli-discussions
+    type: github_discussions
+    repo: github/copilot-cli
+    product_area: cli
+    filters: { answered: true }
+
+  - name: community-copilot
+    type: github_discussions
+    repo: community/community
+    product_area: general
+    filters: { answered: true }
+
+  - name: teams-qa
+    type: manual_qa
+    path: ./data/teams_qa/
+    product_area: general
