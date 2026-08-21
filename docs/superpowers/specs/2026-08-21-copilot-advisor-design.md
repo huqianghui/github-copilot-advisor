@@ -134,6 +134,10 @@ source config → Connector.fetch() → 归一化 → LLM 提炼 → 质量过�
 | content_vector | embedding(打在 title+提炼 body 上,语义干净) | 向量检索 |
 
 导入时 LLM 做一次提炼,原始内容只服务于召回;超长处理发生在导入时,检索时永远是完整一条记录。
+提炼时同步打主题域标签进 keywords(10 个固定值,见 tooling-decision-record §6:
+billing-credits / stability-network / agent-routing / ide-compat / context-session /
+mcp-integration / usage-visibility / m365-workiq / platform-limits / advanced-usecases),
+支撑主题过滤、按主题聚合的运营观测(哪个主题该建工具的数据来源)与 eval 覆盖。
 Hybrid 检索:BM25 + 向量 + semantic ranker(字段名 title/content/keywords 与 semantic
 configuration 槽位一一对应,零映射)。embedding 打在 title+content 上。
 
@@ -249,6 +253,13 @@ corporate egress/proxy/firewall。因此定位为"排除性证据 + 客户自测
    主动调用 network_diagnostics,把探测证据合进回答(从"给建议"升级为"给证据")
 7. 计费/额度/seat 类问题:概念性解答走 search_solutions;涉及"我们组织的实际
    数字"时调 copilot_usage_lookup;群聊中只给 org 级汇总,个人明细引导私聊
+8. 版本/兼容性类问题(插件版本、IDE 兼容):web_search 查询词带
+   "marketplace"/"plugin",优先引用 marketplace.visualstudio.com /
+   plugins.jetbrains.com / github.com releases 的结果
+
+工具面固定为以上 5 个。任何新工具提案先对照
+`2026-08-21-tooling-decision-record.md`(工具准入准则、主题全景映射、
+已推回提案)评估,评审通过才改本 spec。
 
 ### 7.4 多轮会话
 

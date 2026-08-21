@@ -2718,3 +2718,31 @@ Expected: 全部 PASS(test_prompts 增加断言 `"copilot_usage_lookup" in SYSTE
 git add agent/
 git commit -m "feat(agent): copilot usage lookup tool with token-per-tenant and privacy guard"
 ```
+
+---
+
+## 修订记录
+
+### 2026-08-21:版本类问题走 web_search(version_lookup 已推回,见 tooling-decision-record §3)
+
+1. Task 11 的 SYSTEM_PROMPT 工具规则追加第 8 条:
+
+```
+8. 版本/兼容性类问题(插件最新版本、IDE 兼容范围):用 web_search,查询词带
+   "marketplace" 或 "plugin",优先引用 marketplace.visualstudio.com /
+   plugins.jetbrains.com / github.com releases 页面的结果。
+```
+
+(test_prompts.py 增加断言:`"marketplace" in SYSTEM_PROMPT`)
+
+2. Task 12 的 eval_cases.yaml 增加 WebStorm 兼容用例:
+
+```yaml
+  - id: ide-webstorm-compat
+    text: "WebStorm 2024.1 能装最新的 Copilot 插件吗?"
+    expected_stage_in: [kb_hit, live_hit, web]
+    reply_language: zh
+```
+
+该用例同时是 version_lookup 重启条件的度量点:若此类用例长期落在过时答案,
+按 tooling-decision-record §3 重启评估。

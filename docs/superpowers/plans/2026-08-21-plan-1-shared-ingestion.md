@@ -2062,3 +2062,22 @@ Expected: PASS 或 skip(缺环境变量)
 git add ingestion/tests/test_integration_smoke.py .env.example
 git commit -m "test(ingestion): integration smoke test and env template"
 ```
+
+---
+
+## 修订记录
+
+### 2026-08-21:主题域打标(来源:tooling-decision-record §6)
+
+Task 7(LLM 提炼)执行时的两处增强:
+
+1. `build_refine_prompt` 增加打标指令:从固定清单中选 1-2 个主题标签
+   (billing-credits / stability-network / agent-routing / ide-compat /
+   context-session / mcp-integration / usage-visibility / m365-workiq /
+   platform-limits / advanced-usecases),以 `主题标签: tag1, tag2` 行输出在
+   提炼内容末尾
+2. `Refiner.refine` 解析该行:剥离出标签并入 keywords(与 labels、product_area
+   合并去重),`主题标签:` 行不留在 content 里。解析不到就不加,不报错
+
+对应测试(test_refine.py 增加):FakeChat 回复带 `主题标签: stability-network`
+时,断言 `"stability-network" in doc.keywords` 且 `"主题标签" not in doc.content`。
