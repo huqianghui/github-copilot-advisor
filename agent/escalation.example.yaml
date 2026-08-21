@@ -1,0 +1,18 @@
+# agent/escalation.example.yaml — 复制为 agent/escalation.yaml 并填真实值
+# 真实联系人配置不进 git(公开仓库)。
+defaults:
+  support_ticket_url: https://support.github.com/
+  contacts:
+    - role: CSA
+      name: 示例CSA
+      email: csa@example.com
+
+channels:
+  - channel_id: "19:REPLACE_ME@thread.tacv2"
+    tenant: 示例客户
+    contacts:
+      - role: CSAM
+        name: 示例CSAM
+        email: csam@example.com
+        teams_user_id: "29:REPLACE_ME"
+        in_channel: true
