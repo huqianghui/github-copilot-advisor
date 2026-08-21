@@ -10,6 +10,7 @@ defaults:
 channels:
   - channel_id: "19:REPLACE_ME@thread.tacv2"
     tenant: 示例客户
+    enterprise_slug: example-enterprise
     contacts:
       - role: CSAM
         name: 示例CSAM

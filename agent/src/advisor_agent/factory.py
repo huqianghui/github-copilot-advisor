@@ -7,6 +7,7 @@ from azure.search.documents.aio import SearchClient
 from openai import AsyncAzureOpenAI
 
 from advisor_agent.core import AdvisorCore
+from advisor_agent.diagnostics import NetworkDiagnostics
 from advisor_agent.escalation import EscalationConfig
 from advisor_agent.maf_backend import MAFBackend
 from advisor_agent.search.combined import CombinedSearch
@@ -54,7 +55,11 @@ def build_advisor(channel_name: str = "generic") -> AdvisorCore:
         Path(os.environ.get("ESCALATION_CONFIG",
                             Path(__file__).parent.parent.parent
                             / "escalation.yaml")))
-    tools = AdvisorTools(combined, web, escalation)
+    diagnostics = NetworkDiagnostics(
+        Path(os.environ.get("DIAGNOSTICS_CONFIG",
+                            Path(__file__).parent.parent.parent
+                            / "diagnostics.yaml")))
+    tools = AdvisorTools(combined, web, escalation, diagnostics)
     backend = MAFBackend(tools, _channel_id_provider)
     return AdvisorCore(backend, InMemorySessionStore(),
                        channel_name=channel_name)

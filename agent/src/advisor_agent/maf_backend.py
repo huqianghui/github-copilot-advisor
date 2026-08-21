@@ -1,4 +1,4 @@
-"""编排后端:Azure OpenAI function-calling tool loop + 三个工具注册(spec 7.1/7.5)。
+"""编排后端:Azure OpenAI function-calling tool loop + 四个工具注册(spec 7.1/7.5)。
 
 注:agent-framework-core(已安装,1.14.0)本身只提供 Agent/ChatAgent 骨架,真正
 可用的 chat client 实现(OpenAIChatClient/AzureOpenAIChatClient)分别打包在
@@ -78,6 +78,20 @@ _TOOL_SCHEMAS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "network_diagnostics",
+            "description": (
+                "主动探测 GitHub/Copilot 链路 + GitHub 官方状态页。问题涉及"
+                "超时/登录失败/断连/Authorization error 时,在 search_solutions 后调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
 ]
 
 
@@ -103,6 +117,8 @@ class MAFBackend:
         if name == "escalate_to_human":
             return await self._tools.escalate_to_human(
                 self._channel_id(), arguments["reason"])
+        if name == "network_diagnostics":
+            return await self._tools.network_diagnostics(self._channel_id())
         raise ValueError(f"unknown tool: {name}")
 
     async def run(self, user_text: str, history: list[dict]) -> str:

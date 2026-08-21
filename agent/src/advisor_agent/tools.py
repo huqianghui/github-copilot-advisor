@@ -1,17 +1,20 @@
-"""MAF 注册的三个工具。docstring 即工具描述,LLM 依此决定调用时机(spec 7.2/7.3)。"""
+"""MAF 注册的四个工具。docstring 即工具描述,LLM 依此决定调用时机(spec 7.2/7.3)。"""
 import json
 import time
 
+from advisor_agent.diagnostics import NetworkDiagnostics
 from advisor_agent.escalation import EscalationConfig
 from advisor_agent.run_context import current_run
 from advisor_shared.messages import MentionDirective
 
 
 class AdvisorTools:
-    def __init__(self, combined, web, escalation: EscalationConfig):
+    def __init__(self, combined, web, escalation: EscalationConfig,
+                 diagnostics: NetworkDiagnostics):
         self._combined = combined
         self._web = web
         self._escalation = escalation
+        self._diagnostics = diagnostics
 
     async def search_solutions(self, query: str,
                                product_area: str | None = None) -> str:
@@ -67,3 +70,16 @@ class AdvisorTools:
             "support_ticket_url": ticket_url,
             "reason_recorded": reason,
         }, ensure_ascii=False)
+
+    async def network_diagnostics(self, channel_id: str) -> str:
+        """主动探测 GitHub/Copilot 服务链路并查询 GitHub 官方状态页。
+        当问题涉及超时、登录失败、断连、Authorization error 时,
+        在 search_solutions 之后调用,把探测证据合并进回答。"""
+        run = current_run.get()
+        start = time.monotonic()
+        entry = self._escalation.channel_entry(channel_id)
+        out = await self._diagnostics.run(
+            enterprise_slug=entry.enterprise_slug if entry else None)
+        run.tool_latencies_ms["network_diagnostics"] = int(
+            (time.monotonic() - start) * 1000)
+        return json.dumps(out, ensure_ascii=False)

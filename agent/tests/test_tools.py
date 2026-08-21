@@ -49,12 +49,27 @@ class StubWeb:
         return self._out
 
 
-def make_tools(tmp_path, combined_payload=None, web=(list(), 0)):
+class StubDiagnostics:
+    def __init__(self, payload=None):
+        self.payload = payload or {
+            "probes": [], "github_status": {"indicator": "unknown",
+                                             "incidents": []},
+            "verdict": "partial", "self_test_commands": [],
+            "allowlist_doc": "",
+        }
+
+    async def run(self, enterprise_slug=None):
+        return self.payload
+
+
+def make_tools(tmp_path, combined_payload=None, web=(list(), 0),
+               diagnostics=None):
     p = tmp_path / "e.yaml"
     p.write_text(ESCALATION_YAML, encoding="utf-8")
     payload = combined_payload or {"no_results": True, "results": []}
     return AdvisorTools(StubCombined(payload), StubWeb(web[0], web[1]),
-                        EscalationConfig.load(p))
+                        EscalationConfig.load(p),
+                        diagnostics or StubDiagnostics())
 
 
 async def test_search_solutions_sets_kb_hit_stage_and_citations(tmp_path):
@@ -109,3 +124,16 @@ async def test_escalate_unknown_channel_uses_defaults(tmp_path):
 def test_web_search_docstring_states_precondition(tmp_path):
     tools = make_tools(tmp_path)
     assert "search_solutions" in tools.web_search.__doc__
+
+
+async def test_network_diagnostics_records_latency_and_returns_payload(
+        tmp_path):
+    run = new_run()
+    payload = {"verdict": "github_ok_check_egress", "probes": [],
+               "github_status": {"indicator": "none", "incidents": []},
+               "self_test_commands": ["curl ..."],
+               "allowlist_doc": "https://x/allowlist"}
+    tools = make_tools(tmp_path, diagnostics=StubDiagnostics(payload))
+    out = json.loads(await tools.network_diagnostics("19:abc"))
+    assert out["verdict"] == "github_ok_check_egress"
+    assert "network_diagnostics" in run.tool_latencies_ms

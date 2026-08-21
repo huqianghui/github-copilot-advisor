@@ -16,6 +16,9 @@ class Contact(BaseModel):
 class _ChannelEntry(BaseModel):
     channel_id: str
     tenant: str = ""
+    enterprise_slug: str | None = None
+    github_org: str | None = None
+    org_token_env: str | None = None
     contacts: list[Contact]
 
 
@@ -41,3 +44,6 @@ class EscalationConfig(BaseModel):
         entry = self.channels.get(channel_id)
         contacts = entry.contacts if entry else self.default_contacts
         return contacts, self.support_ticket_url
+
+    def channel_entry(self, channel_id: str) -> _ChannelEntry | None:
+        return self.channels.get(channel_id)

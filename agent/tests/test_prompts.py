@@ -19,3 +19,7 @@ def test_prompt_mentions_source_priority():
 def test_prompt_mentions_marketplace_rule():
     # 附加要求:版本/兼容性类问题走 web_search,查询词带 marketplace/plugin
     assert "marketplace" in SYSTEM_PROMPT
+
+
+def test_prompt_mentions_network_diagnostics_rule():
+    assert "network_diagnostics" in SYSTEM_PROMPT
