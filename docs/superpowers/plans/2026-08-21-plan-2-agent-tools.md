@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 构建平台无关的 advisor agent 核心:MAF(Microsoft Agent Framework)+ Azure OpenAI 编排,三个工具(search_solutions 组合检索 / web_search 多 provider failover / escalate_to_human),多轮会话,QueryPlanner/AnswerEvaluator 扩展点,结构化事件。
+**Goal:** 构建平台无关的 advisor agent 核心:MAF(Microsoft Agent Framework)+ Azure OpenAI 编排,五个工具(search_solutions 组合检索 / web_search 多 provider failover / escalate_to_human / network_diagnostics 网络诊断 / copilot_usage_lookup 用量查询),多轮会话,QueryPlanner/AnswerEvaluator 扩展点,结构化事件。
 
 **Architecture:** `agent` 项目只依赖 `shared`。所有外部能力(AI Search、GitHub、web 搜索、LLM)都在接口后面:MAF 的使用收敛在一个 `MAFBackend` 适配器里(`AgentBackend` 协议),单元测试全部用 fake,MAF/真实资源只出现在 integration 测试。工具通过 `contextvars` 的 `RunContext` 与核心管线交换副作用(mentions、瀑布阶段),避免解析 LLM 自由文本。
 
@@ -19,7 +19,8 @@
 - web_search 仅当 search_solutions 无结果时才被调用(system prompt 规则,工具描述中也写明)
 - 瀑布阶段枚举固定:`kb_hit | live_hit | web | generic_advice | escalated`(spec 10.2 事件用)
 - 凭据只从环境变量读:`AZURE_OPENAI_ENDPOINT`、`AZURE_OPENAI_API_KEY`、`AZURE_OPENAI_CHAT_DEPLOYMENT`(默认 `gpt-4o`)、`AZURE_SEARCH_ENDPOINT`、`AZURE_SEARCH_API_KEY`、`AZURE_SEARCH_INDEX`、`GITHUB_TOKEN`、`TAVILY_API_KEY`、`BRAVE_API_KEY`
-- 真实 CSAM/CSA 联系人不进公开仓库:只提交 `escalation.example.yaml`,`agent/escalation.yaml` 加入 `.gitignore`
+- 真实 CSAM/CSA 联系人不进公开仓库:只提交 `escalation.example.yaml`,`agent/escalation.yaml` 加入 `.gitignore`;客户 org 的 PAT 只放环境变量(配置文件里只存变量名 org_token_env),Task 14 的隐私拦截(群聊禁个人明细)必须在代码层实现
+- Task 8 的 `make_tools` 测试辅助会随 Task 13/14 增加 diagnostics/usage 参数 —— 执行到 T13/T14 时同步更新既有测试,勿跳过
 - 单元测试不打真网(respx/fake);integration 测试沿用计划 1 的 marker 约定
 - LLM 回答失败时的兜底文案(spec 10.1)固定为:`抱歉,我这边暂时出了点问题,请稍后重试。如果持续失败,请联系群里的支持人员。`
 
@@ -2105,4 +2106,615 @@ Expected: 各 case PASS 或明确的行为偏差报告(偏差即 prompt 需要�
 ```bash
 git add agent/tests/
 git commit -m "test(agent): behavior eval set from real customer question themes"
+```
+
+---
+
+### Task 13: agent — network_diagnostics 工具(spec 7.2 工具4)
+
+**Files:**
+- Create: `agent/src/advisor_agent/diagnostics.py`
+- Create: `agent/diagnostics.yaml`
+- Modify: `agent/src/advisor_agent/tools.py`(AdvisorTools 增加方法)
+- Modify: `agent/src/advisor_agent/escalation.py`(_ChannelEntry 加 enterprise_slug)
+- Modify: `agent/src/advisor_agent/prompts.py`(规则 6)
+- Modify: `agent/src/advisor_agent/maf_backend.py`(注册第 4 个工具)
+- Modify: `agent/escalation.example.yaml`(示例加 enterprise_slug)
+- Test: `agent/tests/test_diagnostics.py`
+
+**Interfaces:**
+- Consumes: `EscalationConfig`(T7)、`current_run`(T7)
+- Produces:
+  - `ProbeResult`(pydantic):`name: str, url: str, reachable: bool, status_code: int | None, latency_ms: int | None, error: str | None`
+  - `NetworkDiagnostics`:`__init__(self, config_path: Path, timeout_seconds: float = 5.0)`(加载 diagnostics.yaml:endpoints + status_api + enterprise_url_template + 客户自测命令模板)
+  - `async def run(self, enterprise_slug: str | None = None) -> dict`:并行探测全部端点(slug 有值时追加企业端点)+ 拉状态页 summary;返回 `{"probes": [ProbeResult...], "github_status": {"indicator": str, "incidents": [{"name","shortlink"}...]}, "verdict": "github_ok_check_egress"|"github_incident"|"partial", "self_test_commands": [str,...], "allowlist_doc": url}`
+  - verdict 规则(代码判定,不靠 LLM):全部 reachable 且 indicator=="none" → `github_ok_check_egress`;indicator!="none" → `github_incident`;其余 → `partial`
+  - `AdvisorTools.network_diagnostics() -> str`(JSON;探测耗时计入 run.tool_latencies_ms;api.github.com/user 返回 401 视为 reachable —— 预期行为,能到达即链路通)
+  - 状态页请求失败时降级:`github_status = {"indicator": "unknown", "incidents": []}`,verdict 按探测结果给 `github_ok_check_egress` 或 `partial`,不抛异常
+
+- [ ] **Step 1: 写失败测试(respx mock 全部端点)**
+
+```python
+# agent/tests/test_diagnostics.py
+from pathlib import Path
+
+import httpx
+import respx
+
+from advisor_agent.diagnostics import NetworkDiagnostics
+
+DIAG_YAML = """
+endpoints:
+  - name: github-login
+    url: https://github.com/login
+  - name: github-api
+    url: https://api.github.com/user
+  - name: copilot-proxy
+    url: https://copilot-proxy.githubusercontent.com
+enterprise_url_template: "https://github.com/enterprises/{slug}"
+status_api: https://www.githubstatus.com/api/v2/summary.json
+allowlist_doc: https://docs.github.com/en/copilot/reference/copilot-allowlist-reference
+self_test_commands:
+  - 'curl -s --max-time 10 {url} -o /dev/null -w "HTTP %{{http_code}}, total %{{time_total}}s\\n"'
+"""
+
+
+def make_diag(tmp_path: Path) -> NetworkDiagnostics:
+    p = tmp_path / "diagnostics.yaml"
+    p.write_text(DIAG_YAML, encoding="utf-8")
+    return NetworkDiagnostics(p, timeout_seconds=1.0)
+
+
+def mock_status(indicator="none", incidents=()):
+    respx.get("https://www.githubstatus.com/api/v2/summary.json").mock(
+        return_value=httpx.Response(200, json={
+            "status": {"indicator": indicator},
+            "incidents": [{"name": n, "shortlink": f"https://stspg.io/{i}"}
+                          for i, n in enumerate(incidents)],
+        }))
+
+
+@respx.mock
+async def test_all_reachable_and_status_green_means_check_egress(tmp_path):
+    respx.get("https://github.com/login").mock(
+        return_value=httpx.Response(200))
+    respx.get("https://api.github.com/user").mock(
+        return_value=httpx.Response(401))   # 预期 401:链路通
+    respx.get("https://copilot-proxy.githubusercontent.com").mock(
+        return_value=httpx.Response(200))
+    mock_status("none")
+    out = await make_diag(tmp_path).run()
+    assert out["verdict"] == "github_ok_check_egress"
+    assert all(p["reachable"] for p in out["probes"])
+    assert len(out["probes"]) == 3          # 无 slug 不加企业端点
+    assert out["self_test_commands"]        # 自测命令已按端点展开
+    assert "allowlist" in out["allowlist_doc"]
+
+
+@respx.mock
+async def test_incident_verdict_carries_shortlink(tmp_path):
+    respx.get("https://github.com/login").mock(
+        return_value=httpx.Response(200))
+    respx.get("https://api.github.com/user").mock(
+        return_value=httpx.Response(401))
+    respx.get("https://copilot-proxy.githubusercontent.com").mock(
+        return_value=httpx.Response(200))
+    mock_status("major", incidents=["Copilot degraded"])
+    out = await make_diag(tmp_path).run()
+    assert out["verdict"] == "github_incident"
+    assert out["github_status"]["incidents"][0]["name"] == "Copilot degraded"
+
+
+@respx.mock
+async def test_unreachable_endpoint_yields_partial(tmp_path):
+    respx.get("https://github.com/login").mock(
+        side_effect=httpx.ConnectTimeout("timeout"))
+    respx.get("https://api.github.com/user").mock(
+        return_value=httpx.Response(401))
+    respx.get("https://copilot-proxy.githubusercontent.com").mock(
+        return_value=httpx.Response(200))
+    mock_status("none")
+    out = await make_diag(tmp_path).run()
+    assert out["verdict"] == "partial"
+    failed = [p for p in out["probes"] if not p["reachable"]]
+    assert failed[0]["name"] == "github-login"
+    assert "timeout" in failed[0]["error"].lower()
+
+
+@respx.mock
+async def test_enterprise_slug_adds_probe(tmp_path):
+    for url in ["https://github.com/login", "https://api.github.com/user",
+                "https://copilot-proxy.githubusercontent.com",
+                "https://github.com/enterprises/customer-a"]:
+        respx.get(url).mock(return_value=httpx.Response(200))
+    mock_status("none")
+    out = await make_diag(tmp_path).run(enterprise_slug="customer-a")
+    assert len(out["probes"]) == 4
+    assert any("enterprises/customer-a" in p["url"] for p in out["probes"])
+
+
+@respx.mock
+async def test_status_api_failure_degrades_gracefully(tmp_path):
+    for url in ["https://github.com/login", "https://api.github.com/user",
+                "https://copilot-proxy.githubusercontent.com"]:
+        respx.get(url).mock(return_value=httpx.Response(200))
+    respx.get("https://www.githubstatus.com/api/v2/summary.json").mock(
+        side_effect=httpx.ConnectError("down"))
+    out = await make_diag(tmp_path).run()
+    assert out["github_status"]["indicator"] == "unknown"
+    assert out["verdict"] == "github_ok_check_egress"
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+Run: `uv run pytest agent/tests/test_diagnostics.py -v`
+Expected: FAIL,`ModuleNotFoundError: advisor_agent.diagnostics`
+
+- [ ] **Step 3: 实现 diagnostics.py**
+
+```python
+# agent/src/advisor_agent/diagnostics.py
+"""网络诊断:Azure 侧排除性证据 + GitHub 状态页 + 客户自测指引(spec 7.2 工具4)。
+注意:agent 探测的是 Azure 出口视角,测不到客户网络 —— verdict 只做排除推理。"""
+import asyncio
+import time
+from pathlib import Path
+
+import httpx
+import yaml
+from pydantic import BaseModel
+
+
+class ProbeResult(BaseModel):
+    name: str
+    url: str
+    reachable: bool
+    status_code: int | None = None
+    latency_ms: int | None = None
+    error: str | None = None
+
+
+class NetworkDiagnostics:
+    def __init__(self, config_path: Path, timeout_seconds: float = 5.0):
+        raw = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
+        self.endpoints: list[dict] = raw["endpoints"]
+        self.enterprise_template: str = raw.get("enterprise_url_template", "")
+        self.status_api: str = raw["status_api"]
+        self.allowlist_doc: str = raw.get("allowlist_doc", "")
+        self.self_test_templates: list[str] = raw.get("self_test_commands", [])
+        self.timeout = timeout_seconds
+
+    async def run(self, enterprise_slug: str | None = None) -> dict:
+        endpoints = list(self.endpoints)
+        if enterprise_slug and self.enterprise_template:
+            endpoints.append({
+                "name": f"enterprise-{enterprise_slug}",
+                "url": self.enterprise_template.format(slug=enterprise_slug),
+            })
+        async with httpx.AsyncClient(timeout=self.timeout,
+                                     follow_redirects=True) as client:
+            probes = await asyncio.gather(
+                *(self._probe(client, e) for e in endpoints))
+            status = await self._github_status(client)
+
+        all_reachable = all(p.reachable for p in probes)
+        if status["indicator"] not in ("none", "unknown"):
+            verdict = "github_incident"
+        elif all_reachable:
+            verdict = "github_ok_check_egress"
+        else:
+            verdict = "partial"
+
+        commands = [t.format(url=e["url"])
+                    for e in endpoints for t in self.self_test_templates]
+        return {
+            "probes": [p.model_dump() for p in probes],
+            "github_status": status,
+            "verdict": verdict,
+            "self_test_commands": commands,
+            "allowlist_doc": self.allowlist_doc,
+        }
+
+    async def _probe(self, client: httpx.AsyncClient,
+                     endpoint: dict) -> ProbeResult:
+        start = time.monotonic()
+        try:
+            resp = await client.get(endpoint["url"])
+            # 4xx(如 /user 的 401)说明 TCP/TLS/HTTP 链路是通的
+            return ProbeResult(
+                name=endpoint["name"], url=endpoint["url"], reachable=True,
+                status_code=resp.status_code,
+                latency_ms=int((time.monotonic() - start) * 1000))
+        except Exception as e:
+            return ProbeResult(
+                name=endpoint["name"], url=endpoint["url"], reachable=False,
+                error=f"{type(e).__name__}: {e}")
+
+    async def _github_status(self, client: httpx.AsyncClient) -> dict:
+        try:
+            resp = await client.get(self.status_api)
+            resp.raise_for_status()
+            data = resp.json()
+            return {
+                "indicator": data["status"]["indicator"],
+                "incidents": [{"name": i["name"],
+                               "shortlink": i.get("shortlink", "")}
+                              for i in data.get("incidents", [])],
+            }
+        except Exception:
+            return {"indicator": "unknown", "incidents": []}
+```
+
+- [ ] **Step 4: 写 agent/diagnostics.yaml(生产配置,进 git —— 无敏感信息)**
+
+内容与测试 YAML 相同结构,self_test_commands 用完整两条:
+
+```yaml
+endpoints:
+  - name: github-login
+    url: https://github.com/login
+  - name: github-api
+    url: https://api.github.com/user
+  - name: copilot-proxy
+    url: https://copilot-proxy.githubusercontent.com
+enterprise_url_template: "https://github.com/enterprises/{slug}"
+status_api: https://www.githubstatus.com/api/v2/summary.json
+allowlist_doc: https://docs.github.com/en/copilot/reference/copilot-allowlist-reference
+self_test_commands:
+  - 'curl -s --max-time 10 {url} -o /dev/null -w "HTTP %{{http_code}}, DNS %{{time_namelookup}}s, TLS %{{time_appconnect}}s, total %{{time_total}}s\n"'
+```
+
+- [ ] **Step 5: 接入 AdvisorTools / escalation / prompts / maf_backend**
+
+`escalation.py` 的 `_ChannelEntry` 加字段(样例文件同步):
+
+```python
+class _ChannelEntry(BaseModel):
+    channel_id: str
+    tenant: str = ""
+    enterprise_slug: str | None = None
+    github_org: str | None = None
+    org_token_env: str | None = None
+    contacts: list[Contact]
+```
+
+`EscalationConfig` 加方法:
+
+```python
+    def channel_entry(self, channel_id: str) -> _ChannelEntry | None:
+        return self.channels.get(channel_id)
+```
+
+`tools.py` 的 `AdvisorTools.__init__` 增加参数 `diagnostics: NetworkDiagnostics`,并加方法:
+
+```python
+    async def network_diagnostics(self, channel_id: str) -> str:
+        """主动探测 GitHub/Copilot 服务链路并查询 GitHub 官方状态页。
+        当问题涉及超时、登录失败、断连、Authorization error 时,
+        在 search_solutions 之后调用,把探测证据合并进回答。"""
+        run = current_run.get()
+        start = time.monotonic()
+        entry = self._escalation.channel_entry(channel_id)
+        out = await self._diagnostics.run(
+            enterprise_slug=entry.enterprise_slug if entry else None)
+        run.tool_latencies_ms["network_diagnostics"] = int(
+            (time.monotonic() - start) * 1000)
+        return json.dumps(out, ensure_ascii=False)
+```
+
+`prompts.py` 工具规则追加第 6 条:
+
+```
+6. 问题涉及超时、登录失败、断连、Authorization error 时,在 search_solutions
+   之后调用 network_diagnostics。verdict=github_ok_check_egress 时明确告知:
+   GitHub 服务端正常,问题大概率在贵司出口/代理/防火墙,这不代表账号失效;
+   给出 self_test_commands 让用户在自己电脑上验证(agent 的探测只代表云端视角),
+   并附 allowlist 文档链接提示网络组加白。verdict=github_incident 时贴出
+   incident 名称与链接,建议等待官方恢复。
+```
+
+`maf_backend.py` 注册(channel_id 由 backend 注入,与 escalate_to_human 同模式):
+
+```python
+        async def network_diagnostics() -> str:
+            """主动探测 GitHub/Copilot 链路 + GitHub 官方状态页。问题涉及
+            超时/登录失败/断连/Authorization error 时,在 search_solutions 后调用。"""
+            return await tools.network_diagnostics(self._channel_id())
+```
+
+tools 列表变为 `[search_solutions, web_search, escalate_to_human, network_diagnostics]`。
+Task 8 既有测试的 `make_tools` 辅助需同步加 diagnostics stub 参数。
+
+- [ ] **Step 6: 运行测试确认通过**
+
+Run: `uv run pytest agent/tests/test_diagnostics.py agent/tests/test_tools.py agent/tests/test_prompts.py -v`
+Expected: 全部 PASS(test_prompts 增加断言 `"network_diagnostics" in SYSTEM_PROMPT`)
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add agent/
+git commit -m "feat(agent): network diagnostics tool with egress-exclusion evidence"
+```
+
+---
+
+### Task 14: agent — copilot_usage_lookup 工具(spec 7.2 工具5)
+
+**Files:**
+- Create: `agent/src/advisor_agent/usage.py`
+- Modify: `agent/src/advisor_agent/tools.py`(AdvisorTools 增加方法)
+- Modify: `agent/src/advisor_agent/prompts.py`(规则 7)
+- Modify: `agent/src/advisor_agent/maf_backend.py`(注册第 5 个工具,注入 is_group)
+- Modify: `agent/src/advisor_agent/core.py`(RunContext 无需改;backend 需知道 is_group —— 通过 factory 的 set_current_channel_id 同模式加 set_current_is_group)
+- Test: `agent/tests/test_usage.py`
+
+**Interfaces:**
+- Consumes: `EscalationConfig.channel_entry`(T13)、`current_run`(T7)
+- Produces:
+  - `CopilotUsageClient`:`__init__(self, base_url: str = "https://api.github.com")`
+  - `async def lookup(self, question_type: str, org: str, token: str, username: str | None = None) -> dict`:question_type ∈ `seats_summary | premium_usage | user_usage | billing_mode`;内部只发 GET:
+    - `seats_summary`/`billing_mode` → `GET /orgs/{org}/copilot/billing`(+seats 首页统计)
+    - `premium_usage` → `GET /orgs/{org}/settings/billing/usage`(过滤 Copilot 项)
+    - `user_usage` → `GET /orgs/{org}/copilot/billing/seats` 翻页后按 username 过滤
+  - `AdvisorTools.copilot_usage_lookup(channel_id: str, is_group: bool, question_type: str, username: str | None) -> str`:
+    - channel 未配置 github_org/org_token_env 或环境变量为空 → `{"status": "not_configured", "guidance": "..."}`(guidance 说明需 org admin 创建只读 fine-grained PAT:Copilot read + billing read,交给运营方配置)
+    - **is_group=True 且 question_type=="user_usage" → `{"status": "privacy_blocked", "message": "个人用量明细请与我 1:1 私聊查询"}`(代码层拦截,spec 7.2 隐私规则)**
+    - 正常 → `{"status": "ok", "data": {...}}`
+    - API 4xx/5xx → `{"status": "error", "message": "..."}`(如 token 权限不足 403)
+
+- [ ] **Step 1: 写失败测试**
+
+```python
+# agent/tests/test_usage.py
+import httpx
+import pytest
+import respx
+
+from advisor_agent.usage import CopilotUsageClient
+
+API = "https://api.github.com"
+
+
+@respx.mock
+async def test_billing_mode_returns_org_summary():
+    respx.get(f"{API}/orgs/acme/copilot/billing").mock(
+        return_value=httpx.Response(200, json={
+            "seat_breakdown": {"total": 50, "active_this_cycle": 42},
+            "plan_type": "business",
+            "seat_management_setting": "assign_selected",
+        }))
+    out = await CopilotUsageClient().lookup("billing_mode", "acme", "tok")
+    assert out["plan_type"] == "business"
+    assert out["seat_breakdown"]["total"] == 50
+
+
+@respx.mock
+async def test_user_usage_filters_by_username():
+    respx.get(f"{API}/orgs/acme/copilot/billing/seats").mock(
+        return_value=httpx.Response(200, json={
+            "total_seats": 2,
+            "seats": [
+                {"assignee": {"login": "alice"}, "last_activity_at": "2026-08-20T00:00:00Z",
+                 "last_activity_editor": "vscode/1.97"},
+                {"assignee": {"login": "bob"}, "last_activity_at": None,
+                 "last_activity_editor": None},
+            ]}))
+    out = await CopilotUsageClient().lookup("user_usage", "acme", "tok",
+                                            username="bob")
+    assert len(out["seats"]) == 1
+    assert out["seats"][0]["assignee"]["login"] == "bob"
+
+
+@respx.mock
+async def test_permission_error_propagates_as_http_error():
+    respx.get(f"{API}/orgs/acme/copilot/billing").mock(
+        return_value=httpx.Response(403, json={"message": "forbidden"}))
+    with pytest.raises(httpx.HTTPStatusError):
+        await CopilotUsageClient().lookup("billing_mode", "acme", "tok")
+
+
+async def test_unknown_question_type_raises():
+    with pytest.raises(ValueError, match="question_type"):
+        await CopilotUsageClient().lookup("hack_things", "acme", "tok")
+```
+
+AdvisorTools 层测试(追加到 `agent/tests/test_tools.py`;`make_tools` 已在 T13 扩展,再加 usage stub 与含 github_org 配置的 channel):
+
+```python
+# 追加用例(ESCALATION_YAML 的 "19:abc" 条目加:
+#   github_org: acme
+#   org_token_env: ORG_TOKEN_TEST)
+
+async def test_usage_not_configured_returns_guidance(tmp_path):
+    new_run()
+    tools = make_tools(tmp_path)
+    out = json.loads(await tools.copilot_usage_lookup(
+        "19:zzz", False, "billing_mode", None))   # defaults 无 org 配置
+    assert out["status"] == "not_configured"
+    assert "PAT" in out["guidance"]
+
+
+async def test_usage_privacy_blocked_in_group(tmp_path, monkeypatch):
+    monkeypatch.setenv("ORG_TOKEN_TEST", "tok")
+    new_run()
+    tools = make_tools(tmp_path)
+    out = json.loads(await tools.copilot_usage_lookup(
+        "19:abc", True, "user_usage", "alice"))   # 群聊查个人 → 拦截
+    assert out["status"] == "privacy_blocked"
+
+
+async def test_usage_ok_path_calls_client(tmp_path, monkeypatch):
+    monkeypatch.setenv("ORG_TOKEN_TEST", "tok")
+    new_run()
+    tools = make_tools(tmp_path, usage_result={"plan_type": "business"})
+    out = json.loads(await tools.copilot_usage_lookup(
+        "19:abc", True, "billing_mode", None))    # 群聊查汇总 → 允许
+    assert out["status"] == "ok"
+    assert out["data"]["plan_type"] == "business"
+```
+
+- [ ] **Step 2: 运行测试确认失败**
+
+Run: `uv run pytest agent/tests/test_usage.py -v`
+Expected: FAIL,`ModuleNotFoundError: advisor_agent.usage`
+
+- [ ] **Step 3: 实现 usage.py**
+
+```python
+# agent/src/advisor_agent/usage.py
+"""Copilot 计费/用量只读查询(spec 7.2 工具5)。只实现 GET —— 只读铁律。"""
+import httpx
+
+_QUESTION_TYPES = {"seats_summary", "premium_usage", "user_usage",
+                   "billing_mode"}
+
+
+class CopilotUsageClient:
+    def __init__(self, base_url: str = "https://api.github.com"):
+        self.base_url = base_url
+
+    async def lookup(self, question_type: str, org: str, token: str,
+                     username: str | None = None) -> dict:
+        if question_type not in _QUESTION_TYPES:
+            raise ValueError(f"unknown question_type: {question_type}")
+        headers = {"Accept": "application/vnd.github+json",
+                   "Authorization": f"Bearer {token}"}
+        async with httpx.AsyncClient(base_url=self.base_url,
+                                     headers=headers, timeout=15) as client:
+            if question_type in ("billing_mode", "seats_summary"):
+                resp = await client.get(f"/orgs/{org}/copilot/billing")
+                resp.raise_for_status()
+                return resp.json()
+            if question_type == "premium_usage":
+                resp = await client.get(
+                    f"/orgs/{org}/settings/billing/usage")
+                resp.raise_for_status()
+                data = resp.json()
+                items = [u for u in data.get("usageItems", [])
+                         if "copilot" in (u.get("product") or "").lower()]
+                return {"usageItems": items}
+            # user_usage
+            resp = await client.get(
+                f"/orgs/{org}/copilot/billing/seats",
+                params={"per_page": 100})
+            resp.raise_for_status()
+            data = resp.json()
+            seats = data.get("seats", [])
+            if username:
+                seats = [s for s in seats
+                         if (s.get("assignee") or {}).get("login") == username]
+            return {"total_seats": data.get("total_seats"), "seats": seats}
+```
+
+- [ ] **Step 4: 接入 AdvisorTools / prompts / maf_backend / factory**
+
+`tools.py` 增加(`__init__` 加 `usage: CopilotUsageClient` 参数):
+
+```python
+    async def copilot_usage_lookup(self, channel_id: str, is_group: bool,
+                                   question_type: str,
+                                   username: str | None = None) -> str:
+        """查询本组织 Copilot 计费与用量的真实数据。
+        question_type:billing_mode(计费模式/seat 总量)、seats_summary、
+        premium_usage(premium requests 用量)、user_usage(个人明细,仅限私聊)。"""
+        import os
+        run = current_run.get()
+        entry = self._escalation.channel_entry(channel_id)
+        token = os.environ.get(entry.org_token_env, "") \
+            if entry and entry.org_token_env else ""
+        if not (entry and entry.github_org and token):
+            return json.dumps({
+                "status": "not_configured",
+                "guidance": ("未配置贵组织的查询授权。请组织的 org admin 创建"
+                             "只读 fine-grained PAT(Copilot read + billing "
+                             "read 权限),交给支持团队配置后即可直接查询;"
+                             "也可自行访问 GitHub Settings → Copilot → Usage 查看。"),
+            }, ensure_ascii=False)
+        if is_group and question_type == "user_usage":
+            return json.dumps({
+                "status": "privacy_blocked",
+                "message": "个人用量明细涉及隐私,请与我 1:1 私聊查询。",
+            }, ensure_ascii=False)
+        import time as _t
+        start = _t.monotonic()
+        try:
+            data = await self._usage.lookup(
+                question_type, entry.github_org, token, username)
+            result = {"status": "ok", "data": data}
+        except Exception as e:
+            result = {"status": "error",
+                      "message": f"查询失败:{type(e).__name__}。"
+                                 "可能是 token 权限不足或已过期。"}
+        run.tool_latencies_ms["copilot_usage_lookup"] = int(
+            (_t.monotonic() - start) * 1000)
+        return json.dumps(result, ensure_ascii=False)
+```
+
+`factory.py` 增加(与 channel_id 同模式):
+
+```python
+_is_group_holder: dict[str, bool] = {"value": False}
+
+
+def set_current_is_group(is_group: bool) -> None:
+    _is_group_holder["value"] = is_group
+
+
+def _is_group_provider() -> bool:
+    return _is_group_holder["value"]
+```
+
+(计划 3 的 `bot.py` 在 `set_current_channel_id` 旁边同时调 `set_current_is_group(request.is_group)`。)
+
+`maf_backend.py` 注册(`__init__` 加 `is_group_provider: Callable[[], bool]` 参数):
+
+```python
+        async def copilot_usage_lookup(question_type: str,
+                                       username: str | None = None) -> str:
+            """查询本组织 Copilot 计费/用量真实数据(需组织已授权)。
+            question_type:billing_mode / seats_summary / premium_usage /
+            user_usage(个人明细,仅限 1:1 私聊)。"""
+            return await tools.copilot_usage_lookup(
+                self._channel_id(), self._is_group(), question_type, username)
+```
+
+`prompts.py` 工具规则追加第 7 条:
+
+```
+7. 计费、额度、premium requests、seat 类问题:概念性解答走 search_solutions;
+   用户问"我们组织的实际数字"(额度用了多少、谁占着 seat、计费模式)时调用
+   copilot_usage_lookup。status=not_configured 时把 guidance 原样告知用户;
+   status=privacy_blocked 时引导用户私聊;群聊中只呈现 org 级汇总数字。
+```
+
+- [ ] **Step 5: 运行全部 agent 测试确认通过**
+
+Run: `uv run pytest agent/tests/ -v`
+Expected: 全部 PASS(test_prompts 增加断言 `"copilot_usage_lookup" in SYSTEM_PROMPT`)
+
+- [ ] **Step 6: 更新 eval_cases.yaml(Task 12 的评估集补 2 个新工具用例)**
+
+```yaml
+  # 新工具:网络诊断
+  - id: network-auth-error
+    text: "全组今天 Copilot 都报 Authorization error 让重新登录,是不是账号出问题了?"
+    expected_stage_in: [kb_hit, live_hit, web, generic_advice]
+    expect_tool_called: network_diagnostics
+    reply_language: zh
+  # 新工具:用量查询(未配置 token 的 channel → 指引)
+  - id: usage-premium-numbers
+    text: "帮我看下我们组织这个月 premium requests 用了多少?"
+    expected_stage_in: [kb_hit, live_hit, web, generic_advice]
+    expect_tool_called: copilot_usage_lookup
+    reply_language: zh
+```
+
+(`test_eval_behavior.py` 对 `expect_tool_called` 的断言:`case.get("expect_tool_called") in events[-1].tool_latencies_ms`。)
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add agent/
+git commit -m "feat(agent): copilot usage lookup tool with token-per-tenant and privacy guard"
 ```

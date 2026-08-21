@@ -71,10 +71,11 @@ Advisor Agent Service(常驻在线)
   Teams 适配层(Bot Framework 薄壳,未来企微/飞书/CLI 同为薄壳)
     → Agent Core(MAF + Azure OpenAI)
        Tools:
-         1. knowledge_search(AI Search)
+         1. search_solutions(组合:AI Search KB + GitHub live 并行)
          2. web_search(多 provider + failover)
-         3. github_live_search(open issues/discussions)
-         4. escalation(工单指引 / 查联系人配置表)
+         3. escalate_to_human(工单指引 / 查联系人配置表)
+         4. network_diagnostics(Azure 侧探测 + GitHub 状态页 + 客户自测指引)
+         5. copilot_usage_lookup(Copilot 计费/用量 API,客户 token 授权制)
     → 会话状态存储(内存起步,接口留给 Cosmos/Redis)
 ```
 
@@ -162,7 +163,8 @@ CLI 入口:`python -m ingestion run [--source NAME]`;单源失败不影响其他
 
 ### 7.1 Agent Core
 
-单 agent(MAF + Azure OpenAI)+ 三个工具。升级瀑布由 system prompt 策略驱动 +
+单 agent(MAF + Azure OpenAI)+ 五个工具(检索两级 + 升级 + 网络诊断 + 用量查询)。
+升级瀑布由 system prompt 策略驱动 +
 组合工具内的确定性编排,不做硬编码状态机。
 
 处理管线(带扩展点):
@@ -205,6 +207,36 @@ Provider 链抽象:按配置顺序尝试(Bing Grounding → Tavily → WorkIQ...
 agent 据此决定 @提及(在群)或给联系方式(不在群)。
 开工单指引为 system prompt 静态知识,不单独做工具。
 
+**4. `network_diagnostics()` —— 主动网络诊断(超时/登录/断连类问题)**
+
+关键事实:agent 跑在 Azure,探测的是 **Azure 出口视角**,测不到客户的
+corporate egress/proxy/firewall。因此定位为"排除性证据 + 客户自测指引"两条腿:
+
+- Agent 侧并行探测(配置驱动 `diagnostics.yaml`,超时 5s):
+  `https://github.com/login`、`https://api.github.com/user`(预期 401,可达即通)、
+  `https://copilot-proxy.githubusercontent.com`;企业客户按 channel 配置的
+  enterprise_slug 追加 `https://github.com/enterprises/{slug}`。
+  记录:可达性、HTTP 状态码、延迟
+- 查 GitHub 官方状态页 API(githubstatus.com summary)
+- 证据合成:agent 侧全通 + 状态页正常 → "GitHub 服务正常,问题大概率在贵司
+  出口/代理/防火墙"(排除账号失效与 GitHub 故障);状态页有 incident → 贴链接
+- 返回中附客户自测 curl 命令(客户在自己机器跑,测的才是客户网络)+
+  Copilot allowlist 文档链接,提示网络组加白
+
+**5. `copilot_usage_lookup(question_type, username?)` —— Copilot 计费/用量实况查询**
+
+覆盖占比最高的 P0 主题(Credits/计费 24%)。只读 GitHub API:
+`/orgs/{org}/copilot/billing`(seat 总量/计费模式)、`/orgs/{org}/copilot/billing/seats`
+(成员 seat 明细)、`/orgs/{org}/settings/billing/usage`(premium requests 用量)。
+
+- **token 归属**:查客户 org 需客户授权。按 channel 配置 `github_org` +
+  `org_token_env`(环境变量名,存客户 org 的只读 fine-grained PAT)。
+  **配置了就查真实数字;未配置返回 not_configured,LLM 转为指引:
+  需贵组织 org admin 创建只读 PAT(billing/copilot read)并交给运营方配置**
+- **隐私规则**:org 级汇总可在群里答;指向具体个人的明细只在 1:1 私聊答
+  (代码层判断 is_group 拦截,非仅靠 prompt)
+- **只读铁律**:工具层只实现 GET;建议客户 token 只授 read 权限,双保险
+
 ### 7.3 System prompt 策略(核心规则)
 
 1. 永远先 `search_solutions`;KB(已解决)优先引用,GitHub live(讨论中)作为
@@ -213,6 +245,10 @@ agent 据此决定 @提及(在群)或给联系方式(不在群)。
 3. 仍无好答案 → 通用排查建议(网络测试、重启、重试、升级版本)+ 开工单指引
 4. 用户表示"还是不行/不满意"或涉及账务/合同 → `escalate_to_human` 升级到人
 5. 回答语言跟随提问;引用永远带原始 url;不确定就说不确定,不编造
+6. 问题涉及超时/登录失败/断连/Authorization error → 在 search_solutions 之后
+   主动调用 network_diagnostics,把探测证据合进回答(从"给建议"升级为"给证据")
+7. 计费/额度/seat 类问题:概念性解答走 search_solutions;涉及"我们组织的实际
+   数字"时调 copilot_usage_lookup;群聊中只给 org 级汇总,个人明细引导私聊
 
 ### 7.4 多轮会话
 
@@ -259,7 +295,14 @@ Teams 客户端(@提及 / 1:1)
 
 ## 9. 升级流程与联系人配置 ✅(已确认)
 
-### 9.1 联系人配置表(escalation.yaml,agent 项目内)
+### 9.1 租户配置表(escalation.yaml,agent 项目内)
+
+每个 channel 条目除联系人外,还承载该客户租户的可选能力配置:
+- `enterprise_slug`:企业客户的 GitHub enterprise 标识,network_diagnostics 据此
+  追加探测 `https://github.com/enterprises/{slug}`
+- `github_org` + `org_token_env`:copilot_usage_lookup 用;org_token_env 是
+  **环境变量名**(如 `ORG_TOKEN_CUSTOMER_A`),token 本体永远只在环境变量里,
+  不进配置文件。两字段齐全才启用用量查询,否则工具返回 not_configured
 
 ```yaml
 defaults:                        # 无 channel 匹配时兜底
@@ -272,6 +315,9 @@ defaults:                        # 无 channel 匹配时兜底
 channels:
   - channel_id: "19:abc...@thread.tacv2"
     tenant: 客户A
+    enterprise_slug: customer-a          # 可选:网络诊断探测企业端点
+    github_org: customer-a-org           # 可选:用量查询(与 org_token_env 成对)
+    org_token_env: ORG_TOKEN_CUSTOMER_A  # 环境变量名,token 不进配置文件
     contacts:
       - role: CSAM
         name: 李四
