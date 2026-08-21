@@ -73,3 +73,13 @@ async def test_refine_parses_theme_tag_into_keywords():
     doc = await Refiner(chat).refine(make_raw(), make_config())
     assert "stability-network" in doc.keywords
     assert "主题标签" not in doc.content
+
+
+async def test_refine_strips_theme_tag_line_even_when_tags_invalid():
+    chat = FakeChat(
+        "要点:代理配置错误。解决:设置 http.proxy 后重启。\n"
+        "主题标签: made-up-tag, another-fake"
+    )
+    doc = await Refiner(chat).refine(make_raw(), make_config())
+    assert "主题标签" not in doc.content
+    assert set(doc.keywords) == {"network", "vscode"}

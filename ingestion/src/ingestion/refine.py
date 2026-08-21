@@ -40,8 +40,6 @@ def _extract_theme_tags(content: str) -> tuple[str, list[str]]:
     raw_tags = match.group(1)
     tags = [t.strip() for t in re.split(r"[,,、]", raw_tags) if t.strip()]
     valid_tags = [t for t in tags if t in THEME_TAGS]
-    if not valid_tags:
-        return content, []
     stripped = (content[: match.start()] + content[match.end():]).strip()
     return stripped, valid_tags
 
