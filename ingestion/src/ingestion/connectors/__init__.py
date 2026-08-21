@@ -1,9 +1,11 @@
 from ingestion.config import SourceConfig
 from ingestion.connectors.base import Connector, RawQA
+from ingestion.connectors.github_issues import GitHubIssuesConnector
 from ingestion.connectors.manual_qa import ManualQAConnector
 
 _REGISTRY: dict[str, type[Connector]] = {
     "manual_qa": ManualQAConnector,
+    "github_issues": GitHubIssuesConnector,
 }
 
 
@@ -15,4 +17,4 @@ def create(config: SourceConfig) -> Connector:
     return cls(config)
 
 
-__all__ = ["Connector", "RawQA", "ManualQAConnector", "create"]
+__all__ = ["Connector", "RawQA", "ManualQAConnector", "GitHubIssuesConnector", "create"]
