@@ -47,3 +47,15 @@ cases:
     text: "Copilot 里怎么配置 MCP server?密钥放哪里安全?"
     expected_stage_in: [kb_hit, live_hit, web]
     reply_language: zh
+  # 新工具:网络诊断
+  - id: network-auth-error
+    text: "全组今天 Copilot 都报 Authorization error 让重新登录,是不是账号出问题了?"
+    expected_stage_in: [kb_hit, live_hit, web, generic_advice]
+    expect_tool_called: network_diagnostics
+    reply_language: zh
+  # 新工具:用量查询(未配置 token 的 channel → 指引)
+  - id: usage-premium-numbers
+    text: "帮我看下我们组织这个月 premium requests 用了多少?"
+    expected_stage_in: [kb_hit, live_hit, web, generic_advice]
+    expect_tool_called: copilot_usage_lookup
+    reply_language: zh

@@ -33,6 +33,10 @@ SYSTEM_PROMPT = """\
 7. 版本/兼容性类问题(插件最新版本、IDE 兼容范围):用 web_search,查询词带
    "marketplace" 或 "plugin",优先引用 marketplace.visualstudio.com /
    plugins.jetbrains.com / github.com releases 页面的结果。
+8. 计费、额度、premium requests、seat 类问题:概念性解答走 search_solutions;
+   用户问"我们组织的实际数字"(额度用了多少、谁占着 seat、计费模式)时调用
+   copilot_usage_lookup。status=not_configured 时把 guidance 原样告知用户;
+   status=privacy_blocked 时引导用户私聊;群聊中只呈现 org 级汇总数字。
 
 ## 回答风格
 

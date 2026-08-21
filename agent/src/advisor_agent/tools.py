@@ -1,20 +1,23 @@
-"""MAF 注册的四个工具。docstring 即工具描述,LLM 依此决定调用时机(spec 7.2/7.3)。"""
+"""MAF 注册的五个工具。docstring 即工具描述,LLM 依此决定调用时机(spec 7.2/7.3)。"""
 import json
+import os
 import time
 
 from advisor_agent.diagnostics import NetworkDiagnostics
 from advisor_agent.escalation import EscalationConfig
 from advisor_agent.run_context import current_run
+from advisor_agent.usage import CopilotUsageClient
 from advisor_shared.messages import MentionDirective
 
 
 class AdvisorTools:
     def __init__(self, combined, web, escalation: EscalationConfig,
-                 diagnostics: NetworkDiagnostics):
+                 diagnostics: NetworkDiagnostics, usage: CopilotUsageClient):
         self._combined = combined
         self._web = web
         self._escalation = escalation
         self._diagnostics = diagnostics
+        self._usage = usage
 
     async def search_solutions(self, query: str,
                                product_area: str | None = None) -> str:
@@ -83,3 +86,39 @@ class AdvisorTools:
         run.tool_latencies_ms["network_diagnostics"] = int(
             (time.monotonic() - start) * 1000)
         return json.dumps(out, ensure_ascii=False)
+
+    async def copilot_usage_lookup(self, channel_id: str, is_group: bool,
+                                   question_type: str,
+                                   username: str | None = None) -> str:
+        """查询本组织 Copilot 计费与用量的真实数据。
+        question_type:billing_mode(计费模式/seat 总量)、seats_summary、
+        premium_usage(premium requests 用量)、user_usage(个人明细,仅限私聊)。"""
+        run = current_run.get()
+        entry = self._escalation.channel_entry(channel_id)
+        token = os.environ.get(entry.org_token_env, "") \
+            if entry and entry.org_token_env else ""
+        if not (entry and entry.github_org and token):
+            return json.dumps({
+                "status": "not_configured",
+                "guidance": ("未配置贵组织的查询授权。请组织的 org admin 创建"
+                             "只读 fine-grained PAT(Copilot read + billing "
+                             "read 权限),交给支持团队配置后即可直接查询;"
+                             "也可自行访问 GitHub Settings → Copilot → Usage 查看。"),
+            }, ensure_ascii=False)
+        if is_group and question_type == "user_usage":
+            return json.dumps({
+                "status": "privacy_blocked",
+                "message": "个人用量明细涉及隐私,请与我 1:1 私聊查询。",
+            }, ensure_ascii=False)
+        start = time.monotonic()
+        try:
+            data = await self._usage.lookup(
+                question_type, entry.github_org, token, username)
+            result = {"status": "ok", "data": data}
+        except Exception as e:
+            result = {"status": "error",
+                      "message": f"查询失败:{type(e).__name__}。"
+                                 "可能是 token 权限不足或已过期。"}
+        run.tool_latencies_ms["copilot_usage_lookup"] = int(
+            (time.monotonic() - start) * 1000)
+        return json.dumps(result, ensure_ascii=False)

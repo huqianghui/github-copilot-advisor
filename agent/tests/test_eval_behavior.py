@@ -56,6 +56,8 @@ async def test_eval_case(case):
 
     assert events[-1].stage in case["expected_stage_in"], \
         f"stage={events[-1].stage}, want {case['expected_stage_in']}"
+    if case.get("expect_tool_called"):
+        assert case["expect_tool_called"] in events[-1].tool_latencies_ms
     if case.get("expect_mention"):
         assert resp.mentions or "@" in resp.markdown or events[-1].mentioned_human
     if case.get("reply_language") == "zh":

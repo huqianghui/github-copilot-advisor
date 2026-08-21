@@ -23,3 +23,7 @@ def test_prompt_mentions_marketplace_rule():
 
 def test_prompt_mentions_network_diagnostics_rule():
     assert "network_diagnostics" in SYSTEM_PROMPT
+
+
+def test_prompt_mentions_usage_lookup_rule():
+    assert "copilot_usage_lookup" in SYSTEM_PROMPT

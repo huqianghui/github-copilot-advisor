@@ -92,14 +92,42 @@ _TOOL_SCHEMAS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "copilot_usage_lookup",
+            "description": (
+                "查询本组织 Copilot 计费/用量真实数据(需组织已授权)。"
+                "question_type:billing_mode / seats_summary / premium_usage / "
+                "user_usage(个人明细,仅限 1:1 私聊)。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question_type": {
+                        "type": "string",
+                        "enum": ["billing_mode", "seats_summary",
+                                 "premium_usage", "user_usage"],
+                    },
+                    "username": {
+                        "type": "string",
+                        "description": "仅 user_usage 需要:GitHub 用户名",
+                    },
+                },
+                "required": ["question_type"],
+            },
+        },
+    },
 ]
 
 
 class MAFBackend:
     def __init__(self, tools: AdvisorTools,
-                 channel_id_provider: Callable[[], str]):
+                 channel_id_provider: Callable[[], str],
+                 is_group_provider: Callable[[], bool]):
         self._tools = tools
         self._channel_id = channel_id_provider
+        self._is_group = is_group_provider
         self._client = AsyncAzureOpenAI(
             azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
             api_key=os.environ["AZURE_OPENAI_API_KEY"],
@@ -119,6 +147,10 @@ class MAFBackend:
                 self._channel_id(), arguments["reason"])
         if name == "network_diagnostics":
             return await self._tools.network_diagnostics(self._channel_id())
+        if name == "copilot_usage_lookup":
+            return await self._tools.copilot_usage_lookup(
+                self._channel_id(), self._is_group(),
+                arguments["question_type"], arguments.get("username"))
         raise ValueError(f"unknown tool: {name}")
 
     async def run(self, user_text: str, history: list[dict]) -> str:

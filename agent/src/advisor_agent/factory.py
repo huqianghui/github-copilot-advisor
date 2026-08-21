@@ -16,8 +16,10 @@ from advisor_agent.search.knowledge import KnowledgeSearchClient
 from advisor_agent.search.web import BraveProvider, TavilyProvider, WebSearchChain
 from advisor_agent.sessions import InMemorySessionStore
 from advisor_agent.tools import AdvisorTools
+from advisor_agent.usage import CopilotUsageClient
 
 _channel_id_holder: dict[str, str] = {"value": ""}
+_is_group_holder: dict[str, bool] = {"value": False}
 
 
 def _channel_id_provider() -> str:
@@ -28,6 +30,15 @@ def set_current_channel_id(channel_id: str) -> None:
     """渠道 adapter 在每次 handle 前调用(单 worker 内串行时安全;
     多并发部署改为 contextvars,接口不变)。"""
     _channel_id_holder["value"] = channel_id
+
+
+def _is_group_provider() -> bool:
+    return _is_group_holder["value"]
+
+
+def set_current_is_group(is_group: bool) -> None:
+    """渠道 adapter 在每次 handle 前调用,与 set_current_channel_id 同模式。"""
+    _is_group_holder["value"] = is_group
 
 
 def build_advisor(channel_name: str = "generic") -> AdvisorCore:
@@ -59,7 +70,8 @@ def build_advisor(channel_name: str = "generic") -> AdvisorCore:
         Path(os.environ.get("DIAGNOSTICS_CONFIG",
                             Path(__file__).parent.parent.parent
                             / "diagnostics.yaml")))
-    tools = AdvisorTools(combined, web, escalation, diagnostics)
-    backend = MAFBackend(tools, _channel_id_provider)
+    usage = CopilotUsageClient()
+    tools = AdvisorTools(combined, web, escalation, diagnostics, usage)
+    backend = MAFBackend(tools, _channel_id_provider, _is_group_provider)
     return AdvisorCore(backend, InMemorySessionStore(),
                        channel_name=channel_name)

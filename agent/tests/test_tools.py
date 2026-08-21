@@ -15,6 +15,8 @@ defaults:
       email: csa@example.com
 channels:
   - channel_id: "19:abc"
+    github_org: acme
+    org_token_env: ORG_TOKEN_TEST
     contacts:
       - role: CSAM
         name: 李四
@@ -62,14 +64,23 @@ class StubDiagnostics:
         return self.payload
 
 
+class StubUsage:
+    def __init__(self, result=None):
+        self.result = result or {}
+
+    async def lookup(self, question_type, org, token, username=None):
+        return self.result
+
+
 def make_tools(tmp_path, combined_payload=None, web=(list(), 0),
-               diagnostics=None):
+               diagnostics=None, usage_result=None):
     p = tmp_path / "e.yaml"
     p.write_text(ESCALATION_YAML, encoding="utf-8")
     payload = combined_payload or {"no_results": True, "results": []}
     return AdvisorTools(StubCombined(payload), StubWeb(web[0], web[1]),
                         EscalationConfig.load(p),
-                        diagnostics or StubDiagnostics())
+                        diagnostics or StubDiagnostics(),
+                        StubUsage(usage_result))
 
 
 async def test_search_solutions_sets_kb_hit_stage_and_citations(tmp_path):
@@ -137,3 +148,31 @@ async def test_network_diagnostics_records_latency_and_returns_payload(
     out = json.loads(await tools.network_diagnostics("19:abc"))
     assert out["verdict"] == "github_ok_check_egress"
     assert "network_diagnostics" in run.tool_latencies_ms
+
+
+async def test_usage_not_configured_returns_guidance(tmp_path):
+    new_run()
+    tools = make_tools(tmp_path)
+    out = json.loads(await tools.copilot_usage_lookup(
+        "19:zzz", False, "billing_mode", None))   # defaults 无 org 配置
+    assert out["status"] == "not_configured"
+    assert "PAT" in out["guidance"]
+
+
+async def test_usage_privacy_blocked_in_group(tmp_path, monkeypatch):
+    monkeypatch.setenv("ORG_TOKEN_TEST", "tok")
+    new_run()
+    tools = make_tools(tmp_path)
+    out = json.loads(await tools.copilot_usage_lookup(
+        "19:abc", True, "user_usage", "alice"))   # 群聊查个人 → 拦截
+    assert out["status"] == "privacy_blocked"
+
+
+async def test_usage_ok_path_calls_client(tmp_path, monkeypatch):
+    monkeypatch.setenv("ORG_TOKEN_TEST", "tok")
+    new_run()
+    tools = make_tools(tmp_path, usage_result={"plan_type": "business"})
+    out = json.loads(await tools.copilot_usage_lookup(
+        "19:abc", True, "billing_mode", None))    # 群聊查汇总 → 允许
+    assert out["status"] == "ok"
+    assert out["data"]["plan_type"] == "business"
