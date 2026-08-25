@@ -24,7 +24,7 @@ uv sync --all-packages       # 安装全部 workspace(企业网络见上,或先�
 uv run pytest                # 单元测试(不需要任何凭据)
 cp .env.example .env         # 填 Azure/GitHub 凭据
 uv run python -m ingestion run   # 灌知识库
-uv run python -m teams_adapter   # 启动 Teams bot(见 docs/teams-setup.md)
+uv run --env-file .env python -m teams_adapter  # 启动 Teams bot(见 docs/teams-setup.md)
 ```
 
 ## 文档

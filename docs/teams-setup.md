@@ -5,28 +5,63 @@
 1. Azure Portal → 创建资源 → **Azure Bot**
    - Bot handle:copilot-advisor-dev
    - 定价层:F0(开发)
-   - 应用类型:Multi Tenant,让向导自动创建 App Registration
-2. 记录 **Microsoft App ID**;在 App Registration → Certificates & secrets
-   创建 client secret,记录值
-3. Bot 资源 → Channels → 添加 **Microsoft Teams** 渠道
+   - 应用类型:**Single Tenant**
+   - Creation type:创建新的 Microsoft App ID,或使用同租户的现有 App Registration
+2. 记录 **Microsoft App ID** 和 **Tenant ID**;在 App Registration →
+   Certificates & secrets 创建 client secret,记录 secret 的 **Value**
+3. 回到资源组,打开资源类型为 **Azure Bot**
+   (`Microsoft.BotService/botServices`)的 `copilot-advisor-dev`
+4. Azure Bot 资源 → Settings → Channels → 添加 **Microsoft Teams** 渠道
+
+> 2025-07-31 后 Azure 已不再支持新建 Multi Tenant Bot,新建时只能使用
+> Single Tenant 或 User-assigned managed identity 是正常现象。本项目本地联调使用
+> Single Tenant + client secret。
 
 ## 二、本地联调(dev tunnel)
 
-```bash
-# 1. 启动隧道(devtunnel CLI;或用 ngrok http 3978)
-devtunnel host -p 3978 --allow-anonymous
+### 1. 安装并启动隧道
 
-# 2. Azure Bot → Configuration → Messaging endpoint 填:
-#    https://<tunnel-id>.devtunnels.ms/api/messages
+```powershell
+# 使用 Microsoft 365 账号登录,创建允许匿名访问的隧道
+devtunnel user login
+devtunnel create --allow-anonymous
+devtunnel port create -p 3978
+devtunnel host
+```
 
-# 3. 环境变量(复制 .env.example 为 .env 并补充):
-export TEAMS_APP_ID=<Microsoft App ID>
-export TEAMS_APP_PASSWORD=<client secret>
-# 计划 2 的 AZURE_OPENAI_* / AZURE_SEARCH_* / GITHUB_TOKEN / TAVILY_API_KEY 同样需要
-cp agent/escalation.example.yaml agent/escalation.yaml  # 填真实联系人
+保持此终端运行,并记录输出中的 `Connect via browser` URL。也可以改用
+`ngrok http 3978`。
 
-# 4. 启动
-uv run python -m teams_adapter
+### 2. 配置 Azure Bot
+
+回到 Azure Portal 中资源类型为 **Azure Bot**
+(`Microsoft.BotService/botServices`)的资源,选择 Settings → Configuration,
+在 **Messaging endpoint** 填写完整的公网 URL,追加 `/api/messages`,然后选择
+Apply。例如:
+
+```text
+https://<tunnel-and-port>.<region>.devtunnels.ms/api/messages
+```
+
+不要手工拼接 tunnel ID;请以 `devtunnel host` 输出的
+`Connect via browser` URL 为准。
+
+
+### 3. 配置环境变量并启动
+
+```powershell
+# 复制配置模板,然后在 .env 中补充真实值
+Copy-Item .env.example .env
+Copy-Item agent\escalation.example.yaml agent\escalation.yaml
+
+# .env 中至少需要:
+# TEAMS_APP_ID=<Microsoft App ID>
+# TEAMS_APP_PASSWORD=<client secret>
+# TEAMS_APP_TENANT_ID=<Directory (tenant) ID>
+# 以及 AZURE_OPENAI_* / AZURE_SEARCH_* / GITHUB_TOKEN / TAVILY_API_KEY
+
+# 显式加载 .env 后启动;服务默认监听 3978
+uv run --env-file .env python -m teams_adapter
 ```
 
 ## 三、装进 Teams

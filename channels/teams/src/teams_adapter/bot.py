@@ -15,6 +15,17 @@ logger = logging.getLogger(__name__)
 
 
 def _activity_to_dict(activity) -> dict:
+    if hasattr(activity, "serialize"):
+        serialized = activity.serialize()
+        if isinstance(serialized, dict):
+            for source, target in zip(
+                    getattr(activity, "entities", None) or [],
+                    serialized.get("entities") or []):
+                additional = getattr(source, "additional_properties", None)
+                if isinstance(target, dict) and isinstance(additional, dict):
+                    for key, value in additional.items():
+                        target.setdefault(key, value)
+            return serialized
     if hasattr(activity, "as_dict"):
         d = activity.as_dict()
         return d() if callable(d) else d
@@ -28,7 +39,19 @@ class AdvisorBot(ActivityHandler):
 
     async def on_message_activity(self, turn_context: TurnContext):
         activity = _activity_to_dict(turn_context.activity)
-        if not should_respond(activity, self.bot_id):
+        respond = should_respond(activity, self.bot_id)
+        conversation = activity.get("conversation") or {}
+        logger.info(
+            "message activity channel=%s conversation_type=%s is_group=%s "
+            "mentions=%d respond=%s",
+            activity.get("channelId"),
+            conversation.get("conversationType"),
+            conversation.get("isGroup"),
+            sum(1 for entity in activity.get("entities") or []
+                if entity.get("type") == "mention"),
+            respond,
+        )
+        if not respond:
             return
         await turn_context.send_activity(Activity(type="typing"))
         request = to_advisor_request(activity, self.bot_id)
