@@ -2,6 +2,7 @@
 from types import SimpleNamespace
 
 from advisor_shared.messages import AdvisorResponse
+from botbuilder.schema import Activity, ChannelAccount, ConversationAccount
 from teams_adapter.bot import AdvisorBot
 
 BOT_ID = "28:bot"
@@ -14,6 +15,15 @@ class FakeTurnContext:
             **activity_dict,
             "as_dict": lambda: activity_dict,
         })
+        self.sent = []
+
+    async def send_activity(self, activity):
+        self.sent.append(activity)
+
+
+class ActivityTurnContext:
+    def __init__(self, activity):
+        self.activity = activity
         self.sent = []
 
     async def send_activity(self, activity):
@@ -56,6 +66,39 @@ async def test_responds_with_typing_then_answer():
     types = [getattr(a, "type", a.get("type") if isinstance(a, dict) else None)
              for a in ctx.sent]
     assert types[0] == "typing"
+    assert len(ctx.sent) == 2
+
+
+async def test_responds_to_real_personal_activity():
+    core = StubCore()
+    bot = AdvisorBot(core, BOT_ID)
+    ctx = ActivityTurnContext(Activity(
+        type="message",
+        text="登录失败",
+        conversation=ConversationAccount(
+            id="19:personal",
+            conversation_type="personal",
+        ),
+        from_property=ChannelAccount(id="29:u", name="n"),
+    ))
+
+    await bot.on_message_activity(ctx)
+
+    assert len(core.requests) == 1
+    assert core.requests[0].text == "登录失败"
+    assert core.requests[0].user_id == "29:u"
+    assert len(ctx.sent) == 2
+
+
+async def test_responds_to_deserialized_group_mention_activity():
+    core = StubCore()
+    bot = AdvisorBot(core, BOT_ID)
+    ctx = ActivityTurnContext(Activity().deserialize(group_activity_dict()))
+
+    await bot.on_message_activity(ctx)
+
+    assert len(core.requests) == 1
+    assert core.requests[0].text == "登录失败"
     assert len(ctx.sent) == 2
 
 

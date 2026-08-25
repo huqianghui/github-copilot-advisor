@@ -1,5 +1,5 @@
 # channels/teams/src/teams_adapter/__main__.py
-"""启动:python -m teams_adapter(需 TEAMS_APP_ID/TEAMS_APP_PASSWORD 及计划 2 全部环境变量)。"""
+"""启动 Teams adapter,需 Bot 身份和 advisor agent 的全部环境变量。"""
 import logging
 import os
 
@@ -12,20 +12,15 @@ from botbuilder.integration.aiohttp import (
 from advisor_agent.factory import build_advisor
 from teams_adapter.app import create_app
 from teams_adapter.bot import AdvisorBot
-
-
-class _Config:
-    APP_ID = os.environ.get("TEAMS_APP_ID", "")
-    APP_PASSWORD = os.environ.get("TEAMS_APP_PASSWORD", "")
-    APP_TYPE = "MultiTenant"
-    APP_TENANTID = ""
+from teams_adapter.config import TeamsBotConfig
 
 
 def main():
     logging.basicConfig(level=logging.INFO)
-    adapter = CloudAdapter(ConfigurationBotFrameworkAuthentication(_Config()))
+    config = TeamsBotConfig()
+    adapter = CloudAdapter(ConfigurationBotFrameworkAuthentication(config))
     core = build_advisor(channel_name="teams")
-    bot = AdvisorBot(core, bot_id=f"28:{_Config.APP_ID}")
+    bot = AdvisorBot(core, bot_id=f"28:{config.APP_ID}")
     app = create_app(bot, adapter)
     web.run_app(app, port=int(os.environ.get("PORT", 3978)))
 
