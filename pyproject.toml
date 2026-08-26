@@ -12,6 +12,15 @@ members = ["shared", "ingestion", "agent", "channels/teams"]
 advisor-shared = { workspace = true }
 advisor-agent = { workspace = true }
 
+# Corporate PyPI mirror (Azure DevOps artifacts feed). Public PyPI's download
+# CDN (files.pythonhosted.org) is unreachable in this environment; pip already
+# routes through this feed via its global config. uv does not read pip config,
+# so declare it here as the default index for reproducible resolves.
+[[tool.uv.index]]
+name = "corp"
+url = "https://packagefeedproxy.microsoft.io/pypi/simple/"
+default = true
+
 [dependency-groups]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "respx>=0.21"]
 
