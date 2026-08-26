@@ -1,10 +1,10 @@
 # channels/teams/src/teams_adapter/bot.py
-"""Teams bot:触发判定 → typing → agent core → 渲染回复(spec 8.2)。
-纯逻辑在 extract/render;此处只做 SDK 对象与 dict 的桥接。"""
+"""Teams handler 注册:触发判定 → typing → agent core → 渲染回复(spec 8.2)。
+纯逻辑仍在 extract/render;此处只做 Agents SDK 对象与 dict 的桥接。"""
 import logging
 
-from botbuilder.core import ActivityHandler, TurnContext
-from botbuilder.schema import Activity
+from microsoft_agents.activity import Activity
+from microsoft_agents.hosting.core import AgentApplication, TurnContext, TurnState
 
 from advisor_agent.core import FALLBACK_MESSAGE
 from advisor_agent.factory import set_current_channel_id, set_current_is_group
@@ -14,32 +14,19 @@ from teams_adapter.render import render_reply
 logger = logging.getLogger(__name__)
 
 
-def _activity_to_dict(activity) -> dict:
-    if hasattr(activity, "serialize"):
-        serialized = activity.serialize()
-        if isinstance(serialized, dict):
-            for source, target in zip(
-                    getattr(activity, "entities", None) or [],
-                    serialized.get("entities") or []):
-                additional = getattr(source, "additional_properties", None)
-                if isinstance(target, dict) and isinstance(additional, dict):
-                    for key, value in additional.items():
-                        target.setdefault(key, value)
-            return serialized
-    if hasattr(activity, "as_dict"):
-        d = activity.as_dict()
-        return d() if callable(d) else d
-    return activity
+def _activity_to_dict(activity: Activity) -> dict:
+    # Pydantic Activity → Bot-Schema-aliased dict,使 extract/render 继续看到
+    # conversationType / channelData / channelId(camelCase),而非 snake_case。
+    return activity.model_dump(by_alias=True, exclude_none=True)
 
 
-class AdvisorBot(ActivityHandler):
-    def __init__(self, core, bot_id: str):
-        self.core = core
-        self.bot_id = bot_id
-
-    async def on_message_activity(self, turn_context: TurnContext):
-        activity = _activity_to_dict(turn_context.activity)
-        respond = should_respond(activity, self.bot_id)
+def register_handlers(agent_app: AgentApplication, core):
+    @agent_app.activity("message")
+    async def on_message(context: TurnContext, _state: TurnState):
+        recipient = context.activity.recipient
+        bot_id = recipient.id if recipient else ""
+        activity = _activity_to_dict(context.activity)
+        respond = should_respond(activity, bot_id)
         conversation = activity.get("conversation") or {}
         logger.info(
             "message activity channel=%s conversation_type=%s is_group=%s "
@@ -53,17 +40,19 @@ class AdvisorBot(ActivityHandler):
         )
         if not respond:
             return
-        await turn_context.send_activity(Activity(type="typing"))
-        request = to_advisor_request(activity, self.bot_id)
+        await context.send_activity(Activity(type="typing"))
+        request = to_advisor_request(activity, bot_id)
         set_current_channel_id(request.channel_id)
         set_current_is_group(request.is_group)
         try:
-            response = await self.core.handle(request)
+            response = await core.handle(request)
             reply = render_reply(response)
         except Exception:
             logger.exception("core.handle failed")
             reply = {"type": "message", "text": FALLBACK_MESSAGE,
                      "entities": []}
-        await turn_context.send_activity(Activity(
+        await context.send_activity(Activity(
             type=reply["type"], text=reply["text"],
             entities=reply["entities"] or None))
+
+    return on_message
