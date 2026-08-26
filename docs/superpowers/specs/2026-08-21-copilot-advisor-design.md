@@ -68,7 +68,7 @@ Ingestion Service(定时批处理)
   Azure AI Search(hybrid 检索)
         ↑ 读
 Advisor Agent Service(常驻在线)
-  Teams 适配层(Bot Framework 薄壳,未来企微/飞书/CLI 同为薄壳)
+  Teams 适配层(Microsoft 365 Agents SDK 薄壳,未来企微/飞书/CLI 同为薄壳)
     → Agent Core(MAF + Azure OpenAI)
        Tools:
          1. search_solutions(组合:AI Search KB + GitHub live 并行)
@@ -287,7 +287,7 @@ corporate egress/proxy/firewall。因此定位为"排除性证据 + 客户自测
 
 ### 8.2 Teams adapter(v1)
 
-技术:Bot Framework SDK(Python)+ Azure Bot Service 注册(Entra 应用)
+技术:Microsoft 365 Agents SDK(Python)+ Azure Bot Service 注册(Entra 应用)。Bot Framework SDK 已被微软归档(2025-12-31 后停止支持),故迁移至其接替方案 Agents SDK
 
 ```
 Teams 客户端(@提及 / 1:1)
