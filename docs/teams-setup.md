@@ -54,7 +54,7 @@ https://<tunnel-and-port>.<region>.devtunnels.ms/api/messages
 Copy-Item .env.example .env
 Copy-Item agent\escalation.example.yaml agent\escalation.yaml
 
-# .env 中至少需要(SingleTenant 的 tenant id 现落在 ...__TENANTID):
+# .env 中至少需要(SingleTenant 的 tenant id, 落在 ...__TENANTID):
 # CONNECTIONS__SERVICE_CONNECTION__SETTINGS__CLIENTID=<Microsoft App ID>
 # CONNECTIONS__SERVICE_CONNECTION__SETTINGS__CLIENTSECRET=<client secret>
 # CONNECTIONS__SERVICE_CONNECTION__SETTINGS__TENANTID=<Directory (tenant) ID>
