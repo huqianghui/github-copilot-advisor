@@ -28,6 +28,7 @@ def _configure_logging() -> None:
         "%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
     ms.addHandler(handler)
     ms.setLevel(logging.INFO)
+    ms.propagate = False
 
 
 def build_agent_app():
