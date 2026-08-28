@@ -54,10 +54,10 @@ https://<tunnel-and-port>.<region>.devtunnels.ms/api/messages
 Copy-Item .env.example .env
 Copy-Item agent\escalation.example.yaml agent\escalation.yaml
 
-# .env 中至少需要:
-# TEAMS_APP_ID=<Microsoft App ID>
-# TEAMS_APP_PASSWORD=<client secret>
-# TEAMS_APP_TENANT_ID=<Directory (tenant) ID>
+# .env 中至少需要(SingleTenant 的 tenant id, 落在 ...__TENANTID):
+# CONNECTIONS__SERVICE_CONNECTION__SETTINGS__CLIENTID=<Microsoft App ID>
+# CONNECTIONS__SERVICE_CONNECTION__SETTINGS__CLIENTSECRET=<client secret>
+# CONNECTIONS__SERVICE_CONNECTION__SETTINGS__TENANTID=<Directory (tenant) ID>
 # 以及 AZURE_OPENAI_* / AZURE_SEARCH_* / GITHUB_TOKEN / TAVILY_API_KEY
 
 # 显式加载 .env 后启动;服务默认监听 3978

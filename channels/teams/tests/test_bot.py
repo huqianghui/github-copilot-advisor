@@ -1,28 +1,22 @@
 # channels/teams/tests/test_bot.py
-from types import SimpleNamespace
-
 from advisor_shared.messages import AdvisorResponse
-from botbuilder.schema import Activity, ChannelAccount, ConversationAccount
-from teams_adapter.bot import AdvisorBot
+from microsoft_agents.activity import Activity
+from microsoft_agents.hosting.core import (
+    AgentApplication,
+    MemoryStorage,
+    TurnState,
+)
+from teams_adapter.bot import register_handlers
 
 BOT_ID = "28:bot"
 
 
+class StubConnectionManager:
+    """AgentApplication 要求 connection_manager 存在;handler 级测试不触发认证。"""
+
+
 class FakeTurnContext:
-    def __init__(self, activity_dict):
-        # botbuilder Activity 的属性访问方式;测试里用 SimpleNamespace 等价模拟
-        self.activity = SimpleNamespace(**{
-            **activity_dict,
-            "as_dict": lambda: activity_dict,
-        })
-        self.sent = []
-
-    async def send_activity(self, activity):
-        self.sent.append(activity)
-
-
-class ActivityTurnContext:
-    def __init__(self, activity):
+    def __init__(self, activity: Activity):
         self.activity = activity
         self.sent = []
 
@@ -43,89 +37,95 @@ class StubCore:
         return self.response
 
 
-def group_activity_dict(mentions_bot=True):
+def _agent_app():
+    return AgentApplication[TurnState](
+        storage=MemoryStorage(),
+        adapter=None,
+        connection_manager=StubConnectionManager(),
+        start_typing_timer=False,
+        remove_recipient_mention=False,
+    )
+
+
+def group_activity(mentions_bot=True) -> Activity:
     entities = ([{"type": "mention", "mentioned": {"id": BOT_ID, "name": "A"},
                   "text": "<at>A</at>"}] if mentions_bot else [])
-    return {
-        "type": "message", "text": "<at>A</at> 登录失败",
+    return Activity.model_validate({
+        "type": "message",
+        "text": "<at>A</at> 登录失败",
+        "recipient": {"id": BOT_ID, "name": "bot"},
         "entities": entities,
         "conversation": {"id": "19:c;messageid=1",
                          "conversationType": "channel"},
         "channelData": {"channel": {"id": "19:c"}},
         "from": {"id": "29:u", "name": "n"},
-    }
+    })
+
+
+def personal_activity() -> Activity:
+    return Activity.model_validate({
+        "type": "message",
+        "text": "登录失败",
+        "recipient": {"id": BOT_ID, "name": "bot"},
+        "conversation": {"id": "19:personal", "conversationType": "personal"},
+        "from": {"id": "29:u", "name": "n"},
+    })
+
+
+def test_handler_registered_for_message_activity():
+    # wiring 断言:注册后 agent_app 至少多了一条路由,且返回的 handler 是我们的函数
+    core = StubCore()
+    app = _agent_app()
+    before = len(list(app._route_list))
+    handler = register_handlers(app, core)
+    assert len(list(app._route_list)) == before + 1
+    assert handler.__name__ == "on_message"
 
 
 async def test_responds_with_typing_then_answer():
     core = StubCore()
-    bot = AdvisorBot(core, BOT_ID)
-    ctx = FakeTurnContext(group_activity_dict())
-    await bot.on_message_activity(ctx)
+    handler = register_handlers(_agent_app(), core)
+    ctx = FakeTurnContext(group_activity())
+    await handler(ctx, TurnState())
     assert len(core.requests) == 1
     assert core.requests[0].text == "登录失败"
-    types = [getattr(a, "type", a.get("type") if isinstance(a, dict) else None)
-             for a in ctx.sent]
-    assert types[0] == "typing"
+    assert ctx.sent[0].type == "typing"
     assert len(ctx.sent) == 2
 
 
-async def test_responds_to_real_personal_activity():
+async def test_responds_to_personal_activity():
     core = StubCore()
-    bot = AdvisorBot(core, BOT_ID)
-    ctx = ActivityTurnContext(Activity(
-        type="message",
-        text="登录失败",
-        conversation=ConversationAccount(
-            id="19:personal",
-            conversation_type="personal",
-        ),
-        from_property=ChannelAccount(id="29:u", name="n"),
-    ))
-
-    await bot.on_message_activity(ctx)
-
+    handler = register_handlers(_agent_app(), core)
+    ctx = FakeTurnContext(personal_activity())
+    await handler(ctx, TurnState())
     assert len(core.requests) == 1
     assert core.requests[0].text == "登录失败"
     assert core.requests[0].user_id == "29:u"
     assert len(ctx.sent) == 2
 
 
-async def test_responds_to_deserialized_group_mention_activity():
-    core = StubCore()
-    bot = AdvisorBot(core, BOT_ID)
-    ctx = ActivityTurnContext(Activity().deserialize(group_activity_dict()))
-
-    await bot.on_message_activity(ctx)
-
-    assert len(core.requests) == 1
-    assert core.requests[0].text == "登录失败"
-    assert len(ctx.sent) == 2
-
-
 async def test_ignores_group_message_without_mention():
     core = StubCore()
-    bot = AdvisorBot(core, BOT_ID)
-    ctx = FakeTurnContext(group_activity_dict(mentions_bot=False))
-    await bot.on_message_activity(ctx)
+    handler = register_handlers(_agent_app(), core)
+    ctx = FakeTurnContext(group_activity(mentions_bot=False))
+    await handler(ctx, TurnState())
     assert core.requests == [] and ctx.sent == []
 
 
 async def test_core_error_sends_fallback():
     from advisor_agent.core import FALLBACK_MESSAGE
     core = StubCore(error=RuntimeError("boom"))
-    bot = AdvisorBot(core, BOT_ID)
-    ctx = FakeTurnContext(group_activity_dict())
-    await bot.on_message_activity(ctx)
-    last = ctx.sent[-1]
-    text = getattr(last, "text", last.get("text") if isinstance(last, dict) else "")
-    assert FALLBACK_MESSAGE in text
+    handler = register_handlers(_agent_app(), core)
+    ctx = FakeTurnContext(group_activity())
+    await handler(ctx, TurnState())
+    assert FALLBACK_MESSAGE in ctx.sent[-1].text
 
 
 async def test_sets_current_channel_id_and_is_group():
     from advisor_agent.factory import _channel_id_holder, _is_group_holder
     core = StubCore()
-    bot = AdvisorBot(core, BOT_ID)
-    ctx = FakeTurnContext(group_activity_dict())
-    await bot.on_message_activity(ctx)
+    handler = register_handlers(_agent_app(), core)
+    ctx = FakeTurnContext(group_activity())
+    await handler(ctx, TurnState())
     assert _channel_id_holder["value"] == "19:c"
     assert _is_group_holder["value"] is True
