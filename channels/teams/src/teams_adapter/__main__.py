@@ -41,7 +41,6 @@ def build_agent_app():
         storage=storage,
         adapter=adapter,
         authorization=authorization,
-        connection_manager=connection_manager,
         start_typing_timer=False,       # behavior-preserving:handler 手动发 typing
         remove_recipient_mention=False,  # behavior-preserving:extract.strip_mentions 唯一剥离来源
         **config,

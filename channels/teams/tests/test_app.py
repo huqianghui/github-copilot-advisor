@@ -2,6 +2,7 @@
 import logging
 
 import teams_adapter.app as app_module
+import teams_adapter.__main__ as main_module
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from microsoft_agents.activity import load_configuration_from_env
@@ -18,6 +19,28 @@ def _anon_config() -> AgentAuthConfiguration:
     # 匿名允许 → JWT 装饰器无 Authorization 头也放行(本地/emulator 同款路径)。
     return AgentAuthConfiguration(
         client_id="test", tenant_id="test", anonymous_allowed=True,
+    )
+
+
+def test_build_agent_app_uses_explicit_authorization(monkeypatch):
+    config = load_configuration_from_env({
+        "CONNECTIONS__SERVICE_CONNECTION__SETTINGS__CLIENTID": "test",
+        "CONNECTIONS__SERVICE_CONNECTION__SETTINGS__CLIENTSECRET": "test",
+        "CONNECTIONS__SERVICE_CONNECTION__SETTINGS__TENANTID": "test",
+        "CONNECTIONS__SERVICE_CONNECTION__SETTINGS__ANONYMOUS_ALLOWED": "True",
+    })
+    monkeypatch.setattr(
+        main_module, "load_configuration_from_env", lambda _environ: config)
+    monkeypatch.setattr(
+        main_module, "build_advisor", lambda channel_name: object())
+
+    agent_app, adapter, agent_configuration = main_module.build_agent_app()
+
+    assert isinstance(agent_app, AgentApplication)
+    assert isinstance(adapter, CloudAdapter)
+    assert (
+        agent_app.connection_manager.get_default_connection_configuration()
+        is agent_configuration
     )
 
 
