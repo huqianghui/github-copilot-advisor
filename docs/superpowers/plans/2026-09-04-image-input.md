@@ -516,7 +516,13 @@ _NO_TEXT_PLACEHOLDER = "(用户只发了图片,无文字说明)"
 
 def build_user_message(user_text: str,
                        images: list[ImageInput] | None) -> dict:
-    """构造 user message。无图时保持纯字符串 content —— 纯文本路径零行为变化。"""
+    """构造 user message。无图时保持纯字符串 content —— 纯文本路径零行为变化。
+
+    泄漏面提示:返回值里的 data URL 含完整图片 base64。截图可能带 token/密钥
+    (见 prompt 规则 10),因此**绝不要**把返回的 messages 整体打日志。同理,
+    生产环境不要开 OPENAI_LOG=debug 或把 httpx logger 调到 DEBUG —— 那会把
+    整张图写进日志。这是图片输入新增的泄漏面,纯文本时期不存在。
+    """
     if not images:
         return {"role": "user", "content": user_text}
     content: list[dict] = [
