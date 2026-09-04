@@ -2,6 +2,13 @@
 from pydantic import BaseModel
 
 
+class ImageInput(BaseModel):
+    """用户发送的图片。存原始字节,base64 编码是 backend 的实现细节。"""
+    data: bytes
+    mime_type: str
+    name: str = ""
+
+
 class Citation(BaseModel):
     title: str
     url: str
@@ -21,6 +28,7 @@ class AdvisorRequest(BaseModel):
     user_id: str
     user_name: str
     is_group: bool
+    images: list[ImageInput] = []
 
 
 class AdvisorResponse(BaseModel):

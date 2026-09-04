@@ -2,6 +2,7 @@ from advisor_shared.messages import (
     AdvisorRequest,
     AdvisorResponse,
     Citation,
+    ImageInput,
     MentionDirective,
 )
 
@@ -30,3 +31,21 @@ def test_response_with_citation_and_mention():
     )
     assert resp.citations[0].url == "https://github.com/x"
     assert resp.mentions[0].role == "CSAM"
+
+
+def _req(**kw):
+    base = dict(text="hi", conversation_key="c", channel_id="ch",
+                user_id="u", user_name="n", is_group=False)
+    base.update(kw)
+    return AdvisorRequest(**base)
+
+
+def test_request_defaults_to_no_images():
+    assert _req().images == []
+
+
+def test_request_carries_images():
+    req = _req(text="", images=[ImageInput(data=b"\x89PNG", mime_type="image/png")])
+    assert req.images[0].data == b"\x89PNG"
+    assert req.images[0].mime_type == "image/png"
+    assert req.images[0].name == ""       # Teams inline image 无文件名
