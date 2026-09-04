@@ -2,13 +2,13 @@ from advisor_agent.core import FALLBACK_MESSAGE, AdvisorCore
 from advisor_agent.run_context import current_run
 from advisor_agent.sessions import InMemorySessionStore
 from advisor_shared.events import AdvisorEvent
-from advisor_shared.messages import AdvisorRequest, MentionDirective
+from advisor_shared.messages import AdvisorRequest, ImageInput, MentionDirective
 
 
-def make_request(text="Copilot 登录失败") -> AdvisorRequest:
+def make_request(text="Copilot 登录失败", images=None) -> AdvisorRequest:
     return AdvisorRequest(text=text, conversation_key="ck1",
                           channel_id="19:abc", user_id="u", user_name="n",
-                          is_group=True)
+                          is_group=True, images=images or [])
 
 
 class StubBackend:
@@ -17,9 +17,11 @@ class StubBackend:
         self.reply, self.fail_times = reply, fail_times
         self.side_effect = side_effect
         self.calls: list[tuple[str, list[dict]]] = []
+        self.images_seen: list[list] = []
 
-    async def run(self, user_text, history):
+    async def run(self, user_text, history, images=None):
         self.calls.append((user_text, list(history)))
+        self.images_seen.append(list(images or []))
         if self.fail_times > 0:
             self.fail_times -= 1
             raise RuntimeError("llm down")
@@ -96,3 +98,39 @@ async def test_backend_exhausted_returns_fallback_and_skips_session():
     assert resp.markdown == FALLBACK_MESSAGE
     assert await sessions.get("ck1") == []
     assert "llm down" in events[0].error
+
+
+def _png(tag=b"x"):
+    return ImageInput(data=tag, mime_type="image/png")
+
+
+async def test_images_forwarded_to_backend():
+    backend = StubBackend()
+    core = AdvisorCore(backend, InMemorySessionStore())
+    img = _png()
+    await core.handle(make_request(text="这是什么错误", images=[img]))
+    assert backend.images_seen[0] == [img]
+
+
+async def test_history_marks_images_when_text_empty():
+    sessions = InMemorySessionStore()
+    core = AdvisorCore(StubBackend(), sessions)
+    await core.handle(make_request(text="", images=[_png(), _png(b"y")]))
+    history = await sessions.get("ck1")
+    assert history[0] == {"role": "user", "content": "[图片×2]"}
+
+
+async def test_history_keeps_text_alongside_image_marker():
+    sessions = InMemorySessionStore()
+    core = AdvisorCore(StubBackend(), sessions)
+    await core.handle(make_request(text="报这个错", images=[_png()]))
+    history = await sessions.get("ck1")
+    assert history[0]["content"] == "[图片×1] 报这个错"
+
+
+async def test_event_records_image_count():
+    events: list[AdvisorEvent] = []
+    core = AdvisorCore(StubBackend(), InMemorySessionStore(),
+                       event_sink=events.append)
+    await core.handle(make_request(images=[_png()]))
+    assert events[0].image_count == 1

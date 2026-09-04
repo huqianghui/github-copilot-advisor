@@ -49,7 +49,8 @@ class AdvisorCore:
         answer, error = None, None
         for _ in range(_MAX_ATTEMPTS):
             try:
-                answer = await self.backend.run(request.text, history)
+                answer = await self.backend.run(
+                    request.text, history, request.images or None)
                 break
             except Exception as e:
                 logger.exception("backend attempt failed")
@@ -70,8 +71,10 @@ class AdvisorCore:
                 mentions=list(run.mentions),
             )
             response = await self.evaluator.evaluate(request, response)
+            user_note = (f"[图片×{len(request.images)}] {request.text}".strip()
+                         if request.images else request.text)
             await self.sessions.append(
-                request.conversation_key, "user", request.text)
+                request.conversation_key, "user", user_note)
             await self.sessions.append(
                 request.conversation_key, "assistant", response.markdown)
 
@@ -83,6 +86,7 @@ class AdvisorCore:
             tool_latencies_ms=run.tool_latencies_ms,
             failover_count=run.failover_count,
             mentioned_human=bool(run.mentions),
+            image_count=len(request.images),
             error=error if answer is None else None,
         ))
         return response

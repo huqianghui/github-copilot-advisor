@@ -153,7 +153,8 @@ class MAFBackend:
                 arguments["question_type"], arguments.get("username"))
         raise ValueError(f"unknown tool: {name}")
 
-    async def run(self, user_text: str, history: list[dict]) -> str:
+    async def run(self, user_text: str, history: list[dict],
+                  images: list = None) -> str:
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages.extend(history)
         messages.append({"role": "user", "content": user_text})
