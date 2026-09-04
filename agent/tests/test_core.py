@@ -134,3 +134,12 @@ async def test_event_records_image_count():
                        event_sink=events.append)
     await core.handle(make_request(images=[_png()]))
     assert events[0].image_count == 1
+
+
+async def test_event_summary_marks_images_when_text_empty():
+    """纯图片消息的摘要不能是空串 —— 事件是运营可见性的唯一出口。"""
+    events: list[AdvisorEvent] = []
+    core = AdvisorCore(StubBackend(), InMemorySessionStore(),
+                       event_sink=collect_events(events))
+    await core.handle(make_request(text="", images=[_png()]))
+    assert events[0].question_summary == "[图片×1]"

@@ -45,6 +45,10 @@ class AdvisorCore:
         request = await self.planner.plan(request)
         run = new_run()
         history = await self.sessions.get(request.conversation_key)
+        # 必须在 planner 之后求值:planner 会换掉 request 对象。
+        # 历史与事件共用 —— 纯图片消息的 question_summary 不能是空串。
+        marked_text = (f"[图片×{len(request.images)}] {request.text}".strip()
+                       if request.images else request.text)
 
         answer, error = None, None
         for _ in range(_MAX_ATTEMPTS):
@@ -71,17 +75,15 @@ class AdvisorCore:
                 mentions=list(run.mentions),
             )
             response = await self.evaluator.evaluate(request, response)
-            user_note = (f"[图片×{len(request.images)}] {request.text}".strip()
-                         if request.images else request.text)
             await self.sessions.append(
-                request.conversation_key, "user", user_note)
+                request.conversation_key, "user", marked_text)
             await self.sessions.append(
                 request.conversation_key, "assistant", response.markdown)
 
         self.event_sink(AdvisorEvent(
             conversation_key=request.conversation_key,
             channel=self.channel_name,
-            question_summary=request.text[:_SUMMARY_CHARS],
+            question_summary=marked_text[:_SUMMARY_CHARS],
             stage=run.stage,
             tool_latencies_ms=run.tool_latencies_ms,
             failover_count=run.failover_count,
