@@ -181,7 +181,8 @@ async def test_text_only_400_is_not_swallowed(backend, monkeypatch):
 
 
 def test_note_does_not_attribute_a_cause():
-    """400 的成因(不支持 vision / 格式不符 / 动图 GIF)代码分辨不了,
-    归因即误诊。这个测试钉住「不猜原因」这条约束。"""
+    """关键词绊线,不是语义守卫:只挡计划里点名的几种归因写法
+    (「部署未启用」「模型不支持」)。真正的约束和理由写在
+    IMAGE_NOT_PROCESSED_NOTE 旁边的注释里。"""
     for forbidden in ("部署", "未启用", "不支持", "模型"):
         assert forbidden not in IMAGE_NOT_PROCESSED_NOTE

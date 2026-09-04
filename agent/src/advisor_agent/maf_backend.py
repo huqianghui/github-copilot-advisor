@@ -28,6 +28,11 @@ _MAX_TOOL_ROUNDS = 6
 
 _NO_TEXT_PLACEHOLDER = "(用户只发了图片,无文字说明)"
 
+# 措辞刻意只说结果、不说原因。400 至少三种成因 —— 部署不支持 vision、图片格式
+# 不受支持、动图 GIF(content-type 就是 image/gif,上游 allow-list 挡不住)——
+# 代码分辨不了,写死任何一个都是猜。猜错是粘性的:用户被告知"看不了图"就不再
+# 发图,功能静默死掉。改这段前请确认新措辞仍然只陈述结果。
+# 注意 test_note_does_not_attribute_a_cause 只挡几个已知词,挡不住语义。
 IMAGE_NOT_PROCESSED_NOTE = (
     "(注:这次没能处理你发送的图片,以上回答未参考图片内容。"
     "可以把图中的关键信息贴成文字,我再帮你看。)")
@@ -200,9 +205,12 @@ class MAFBackend:
         except BadRequestError:
             if not images:
                 raise            # 无图时的 400 是真错误,交给 core 兜底
-            # 不记录成因:400 可能是部署不支持 vision、格式不受支持、动图 GIF……
-            # 这里分辨不了,日志只陈述发生了什么。
-            logger.warning("vision request rejected, retrying without images")
+            # 日志同样不归因:这个分支对带图时的**任何** 400 都触发,
+            # content_filter、context_length_exceeded 也都是 400。写死 "vision
+            # rejected" 会让 on-call 从日志里读出「vision 部署挂了」——把同一种
+            # 误诊搬到运维侧。图片张数是安全的(计数不是内容)且有排查价值。
+            logger.warning("400 on a request carrying %d image(s); retrying without them",
+                           len(images))
             messages[-1] = build_user_message(user_text, None)
             answer = await self._run_tool_loop(messages)
             return f"{answer}\n\n{IMAGE_NOT_PROCESSED_NOTE}"
