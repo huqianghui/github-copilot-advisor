@@ -55,7 +55,7 @@ def test_request_carries_images():
 
 
 def test_rejects_non_image_mime_type():
-    for bad in ("text/html", "../evil"):
+    for bad in ("text/html", "image/png\n"):
         with pytest.raises(ValidationError):
             ImageInput(data=b"x", mime_type=bad)
 
