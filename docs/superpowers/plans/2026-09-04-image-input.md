@@ -555,11 +555,21 @@ git commit -m "feat(agent): build multimodal content parts when images present"
 
 ---
 
-## Task 4: vision 不可用时剥图降级
+## Task 4: 图片请求被拒时剥图降级
 
-模型部署不支持 vision 时 Azure OpenAI 返回 400。必须在 backend 内部处理:
-`core.py` 的 `_MAX_ATTEMPTS = 2` 是无差别重试,两次都会同样失败,最终落到
-`FALLBACK_MESSAGE`,用户无从得知真实原因。
+Azure OpenAI 对带图请求返回 400 时,剥掉图片重试一次。必须在 backend 内部
+处理:`core.py` 的 `_MAX_ATTEMPTS = 2` 是无差别重试,两次都会同样失败,
+最终落到 `FALLBACK_MESSAGE`,用户连"图没被看"都不知道。
+
+**这个分支不能对原因下结论。** 400 的成因至少有三类,而代码分辨不了:
+部署不支持 vision、格式不受支持(SVG/BMP/TIFF —— Task 6 的 allow-list 能挡)、
+**动图 GIF**(content-type 是 `image/gif`,allow-list 挡不住,只有 Azure
+OpenAI 解码时才知道)。后者最现实 —— 用户粘贴复现动图是常见行为。
+
+因此文案必须**不归因**。若声称"当前部署未启用图片理解",在动图 GIF 场景下
+就是误诊,而且是**粘性**的:用户被告知这个能力不存在,从此不再发图,功能
+静默死掉。常量因此命名为 `IMAGE_NOT_PROCESSED_NOTE` —— 它描述的是结果,
+不是猜测的原因。
 
 **Files:**
 - Modify: `agent/src/advisor_agent/maf_backend.py`
@@ -574,7 +584,7 @@ import httpx
 import pytest
 from openai import BadRequestError
 
-from advisor_agent.maf_backend import VISION_UNAVAILABLE_NOTE, MAFBackend
+from advisor_agent.maf_backend import IMAGE_NOT_PROCESSED_NOTE, MAFBackend
 
 
 def _bad_request() -> BadRequestError:
@@ -605,7 +615,7 @@ async def test_vision_400_retries_without_images(backend, monkeypatch):
     monkeypatch.setattr(backend, "_run_tool_loop", fake_loop)
     out = await backend.run("看图", [], [ImageInput(data=PNG, mime_type="image/png")])
     assert "先检查网络代理" in out
-    assert VISION_UNAVAILABLE_NOTE in out
+    assert IMAGE_NOT_PROCESSED_NOTE in out
     assert len(seen) == 2                      # 第一次带图,第二次纯文本
     assert isinstance(seen[1], str)
 
@@ -618,12 +628,19 @@ async def test_text_only_400_is_not_swallowed(backend, monkeypatch):
     monkeypatch.setattr(backend, "_run_tool_loop", fake_loop)
     with pytest.raises(BadRequestError):
         await backend.run("登录失败", [], None)
+
+
+def test_note_does_not_attribute_a_cause():
+    """400 的成因(不支持 vision / 格式不符 / 动图 GIF)代码分辨不了,
+    归因即误诊。这个测试钉住"不猜原因"这条约束。"""
+    for forbidden in ("部署", "未启用", "不支持", "模型"):
+        assert forbidden not in IMAGE_NOT_PROCESSED_NOTE
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `uv run pytest agent/tests/test_maf_backend.py -v`
-Expected: FAIL —— `ImportError: cannot import name 'VISION_UNAVAILABLE_NOTE'`
+Expected: FAIL —— `ImportError: cannot import name 'IMAGE_NOT_PROCESSED_NOTE'`
 
 - [ ] **Step 3: 实现**
 
@@ -645,13 +662,17 @@ from advisor_shared.messages import ImageInput
 logger = logging.getLogger(__name__)
 ```
 
-在 `_NO_TEXT_PLACEHOLDER` 旁加常量:
+在 `_NO_TEXT_PLACEHOLDER` 旁加常量。**注意文案刻意不说原因** —— 见本任务
+开头的说明,代码分辨不了 400 的三类成因,归因即误诊:
 
 ```python
-VISION_UNAVAILABLE_NOTE = (
-    "(注:当前模型部署未启用图片理解,以上回答未参考你发送的图片。"
+IMAGE_NOT_PROCESSED_NOTE = (
+    "(注:这次没能处理你发送的图片,以上回答未参考图片内容。"
     "可以把图中的关键信息贴成文字,我再帮你看。)")
 ```
+
+审查提示:任何把这段文案改回"部署未启用图片理解""模型不支持图片"之类
+归因表述的改动,都应被驳回。
 
 把现有 `run` 的循环体整体提取为 `_run_tool_loop`,`run` 只负责组装与降级:
 
@@ -669,7 +690,7 @@ VISION_UNAVAILABLE_NOTE = (
             logger.warning("vision request rejected, retrying without images")
             messages[-1] = build_user_message(user_text, None)
             answer = await self._run_tool_loop(messages)
-            return f"{answer}\n\n{VISION_UNAVAILABLE_NOTE}"
+            return f"{answer}\n\n{IMAGE_NOT_PROCESSED_NOTE}"
 
     async def _run_tool_loop(self, messages: list[dict]) -> str:
         for _ in range(_MAX_TOOL_ROUNDS):
@@ -800,7 +821,7 @@ Create `channels/teams/tests/test_downloader.py`:
 """TeamsImageDownloader:筛选、白名单与下载安全(图片输入 spec §5)。"""
 from microsoft_agents.activity import Activity
 
-from teams_adapter.downloader import MAX_IMAGES, select_image_urls
+from teams_adapter.downloader import MAX_IMAGES, select_images
 
 GOOD_URL = "https://smba.trafficmanager.net/amer/v3/attachments/1/views/original"
 EVIL_URL = "https://evil.example.com/steal"
@@ -818,7 +839,9 @@ def attachments_activity(attachments: list[dict]) -> Activity:
 
 
 def urls_for(attachments: list[dict]) -> list[str]:
-    return select_image_urls(attachments_activity(attachments).attachments)
+    """只取 URL,便于断言;格式与 content_type 的传递另有专门用例。"""
+    return [url for url, _ in
+            select_images(attachments_activity(attachments).attachments)]
 
 
 def test_keeps_only_image_attachments():
@@ -855,7 +878,28 @@ def test_caps_image_count():
 
 
 def test_handles_none_attachments():
-    assert select_image_urls(None) == []
+    assert select_images(None) == []
+
+
+def test_rejects_formats_azure_openai_cannot_read():
+    """SVG/BMP/TIFF 过不了 Azure OpenAI。放行它们会让请求在 API 层报 400,
+    进而触发 Task 4 的剥图降级 —— 用户收到的将是与真实原因无关的提示。"""
+    for bad in ("image/svg+xml", "image/bmp", "image/tiff",
+                "image/vnd.microsoft.icon"):
+        assert urls_for([{"contentType": bad, "contentUrl": GOOD_URL}]) == []
+
+
+def test_returns_content_type_alongside_url():
+    """content_type 要带出去:_fetch 在响应头不可信时拿它兜底。"""
+    assert select_images(attachments_activity(
+        [{"contentType": "image/jpeg", "contentUrl": GOOD_URL}]).attachments
+    ) == [(GOOD_URL, "image/jpeg")]
+
+
+def test_content_type_is_normalized_to_lowercase():
+    assert select_images(attachments_activity(
+        [{"contentType": "IMAGE/PNG", "contentUrl": GOOD_URL}]).attachments
+    ) == [(GOOD_URL, "image/png")]
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -885,18 +929,28 @@ logger = logging.getLogger(__name__)
 TEAMS_CHANNEL_ID = "msteams"
 # 精确 host 相等比较。不用后缀匹配:trafficmanager.net 是共享命名空间。
 ALLOWED_HOSTS = frozenset({"smba.trafficmanager.net", "api.botframework.com"})
+# Azure OpenAI vision 只接受这四种。放行其他格式会让请求在 API 层报 400,
+# 触发剥图降级,用户收到与真实原因无关的提示。注意:动图 GIF 同样不被接受,
+# 但 content-type 分辨不出动静,只能靠 maf_backend 的不归因降级文案兜底。
+SUPPORTED_IMAGE_TYPES = frozenset({
+    "image/png", "image/jpeg", "image/webp", "image/gif"})
 MAX_IMAGES = 4
 MAX_IMAGE_BYTES = 4 * 1024 * 1024
 DOWNLOAD_TIMEOUT_S = 10.0
 
 
-def select_image_urls(attachments) -> list[str]:
-    """挑出可下载的 inline image URL。纯函数,无 I/O。"""
-    urls: list[str] = []
+def select_images(attachments) -> list[tuple[str, str]]:
+    """挑出可下载的 inline image,返回 (url, content_type)。纯函数,无 I/O。
+
+    带出 content_type 是给 _fetch 兜底用的:响应头缺失或不可信时,
+    用这里已经校验过的声明类型,而不是无脑塞 image/png。
+    """
+    selected: list[tuple[str, str]] = []
     for attachment in attachments or []:
         content_type = (getattr(attachment, "content_type", None) or "").lower()
-        if not content_type.startswith("image/"):
-            continue                      # 同时排除 Teams 附带的 text/html
+        # 不在白名单即丢弃,顺带排除了 Teams 附带的 text/html
+        if content_type not in SUPPORTED_IMAGE_TYPES:
+            continue
         url = getattr(attachment, "content_url", None)
         if not url:
             continue
@@ -906,16 +960,16 @@ def select_image_urls(attachments) -> list[str]:
                 "skipping attachment from non-allowlisted host: %s",
                 parsed.hostname)
             continue
-        urls.append(url)
-        if len(urls) >= MAX_IMAGES:
+        selected.append((url, content_type))
+        if len(selected) >= MAX_IMAGES:
             break
-    return urls
+    return selected
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `uv run pytest channels/teams/tests/test_downloader.py -v`
-Expected: PASS(7 passed)
+Expected: PASS(10 passed)
 
 - [ ] **Step 5: 提交**
 
@@ -1035,11 +1089,23 @@ async def test_network_error_does_not_raise():
 
 
 @respx.mock
-async def test_non_image_response_content_type_normalized():
+async def test_untrustworthy_response_type_falls_back_to_declared():
+    """响应头不可信时退回附件声明的类型,而不是无脑塞 image/png ——
+    否则 GIF 会被谎报成 PNG,送进 data URL 后由 Azure OpenAI 报错。"""
     respx.get(GOOD_URL).mock(return_value=httpx.Response(
         200, content=PNG, headers={"content-type": "application/octet-stream"}))
-    files = await download(IMAGE_ATTACHMENT)
-    assert files[0].content_type == "image/png"
+    files = await download(
+        [{"contentType": "image/gif", "contentUrl": GOOD_URL}])
+    assert files[0].content_type == "image/gif"
+
+
+@respx.mock
+async def test_response_content_type_wins_when_supported():
+    respx.get(GOOD_URL).mock(return_value=httpx.Response(
+        200, content=PNG, headers={"content-type": "image/webp"}))
+    files = await download(
+        [{"contentType": "image/png", "contentUrl": GOOD_URL}])
+    assert files[0].content_type == "image/webp"
 
 
 async def test_non_teams_channel_skipped():
@@ -1088,8 +1154,8 @@ class TeamsImageDownloader(InputFileDownloader):
     async def download_files(self, context: TurnContext) -> list[InputFile]:
         if context.activity.channel_id != TEAMS_CHANNEL_ID:
             return []
-        urls = select_image_urls(context.activity.attachments)
-        if not urls:
+        images = select_images(context.activity.attachments)
+        if not images:
             return []                     # 无图不取 token
         try:
             token = await self._access_token(context)
@@ -1101,8 +1167,9 @@ class TeamsImageDownloader(InputFileDownloader):
         # follow_redirects=False:跟随会把 Authorization 带到重定向目标
         async with httpx.AsyncClient(timeout=DOWNLOAD_TIMEOUT_S,
                                      follow_redirects=False) as client:
-            for url in urls:
-                downloaded = await self._fetch(client, url, token)
+            for url, declared_type in images:
+                downloaded = await self._fetch(client, url, declared_type,
+                                               token)
                 if downloaded is not None:
                     files.append(downloaded)
         return files
@@ -1115,7 +1182,7 @@ class TeamsImageDownloader(InputFileDownloader):
             context.identity.get_token_scope())
 
     async def _fetch(self, client: httpx.AsyncClient, url: str,
-                     token: str) -> InputFile | None:
+                     declared_type: str, token: str) -> InputFile | None:
         try:
             response = await client.get(
                 url, headers={"Authorization": f"Bearer {token}"})
@@ -1135,10 +1202,12 @@ class TeamsImageDownloader(InputFileDownloader):
                            len(content))
             return None
 
+        # 响应头优先;不在白名单内则退回附件声明的类型(select_images 已校验过),
+        # 而不是无脑塞 image/png —— 那会把 GIF 谎报成 PNG。
         content_type = (response.headers.get("content-type", "")
                         .split(";")[0].strip().lower())
-        if not content_type.startswith("image/"):
-            content_type = "image/png"    # 与官方 SDK 一致的归一化
+        if content_type not in SUPPORTED_IMAGE_TYPES:
+            content_type = declared_type
         return InputFile(content=content, content_type=content_type,
                          content_url=url)
 ```
@@ -1146,7 +1215,7 @@ class TeamsImageDownloader(InputFileDownloader):
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `uv run pytest channels/teams/tests/test_downloader.py -v`
-Expected: PASS(17 passed)
+Expected: PASS(21 passed)
 
 - [ ] **Step 5: 提交**
 
