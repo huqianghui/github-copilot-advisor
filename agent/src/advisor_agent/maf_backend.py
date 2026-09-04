@@ -10,6 +10,7 @@ tool loop,对外仍暴露 MAFBackend 这个类名,并满足 AgentBackend 协议
 (async run(user_text, history) -> str)。等 agent-framework-azure-ai 转正式版后,
 可以把内部实现换成真正的 MAF ChatAgent,协议边界(AgentBackend)不需要变。
 """
+import base64
 import json
 import os
 from typing import Callable
@@ -18,8 +19,35 @@ from openai import AsyncAzureOpenAI
 
 from advisor_agent.prompts import SYSTEM_PROMPT
 from advisor_agent.tools import AdvisorTools
+from advisor_shared.messages import ImageInput
 
 _MAX_TOOL_ROUNDS = 6
+
+_NO_TEXT_PLACEHOLDER = "(用户只发了图片,无文字说明)"
+
+
+def build_user_message(user_text: str,
+                       images: list[ImageInput] | None) -> dict:
+    """构造 user message。无图时保持纯字符串 content —— 纯文本路径零行为变化。
+
+    泄漏面提示:返回值里的 data URL 含完整图片 base64。截图可能带 token/密钥
+    (见 prompt 规则 10),因此**绝不要**把返回的 messages 整体打日志。同理,
+    生产环境不要开 OPENAI_LOG=debug 或把 httpx logger 调到 DEBUG —— 那会把
+    整张图写进日志。这是图片输入新增的泄漏面,纯文本时期不存在。
+    """
+    if not images:
+        return {"role": "user", "content": user_text}
+    content: list[dict] = [
+        {"type": "text", "text": user_text or _NO_TEXT_PLACEHOLDER}]
+    for image in images:
+        b64 = base64.b64encode(image.data).decode()
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{image.mime_type};base64,{b64}",
+                          "detail": "auto"},
+        })
+    return {"role": "user", "content": content}
+
 
 _TOOL_SCHEMAS = [
     {
@@ -154,10 +182,10 @@ class MAFBackend:
         raise ValueError(f"unknown tool: {name}")
 
     async def run(self, user_text: str, history: list[dict],
-                  images: list | None = None) -> str:
+                  images: list[ImageInput] | None = None) -> str:
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages.extend(history)
-        messages.append({"role": "user", "content": user_text})
+        messages.append(build_user_message(user_text, images))
 
         for _ in range(_MAX_TOOL_ROUNDS):
             response = await self._client.chat.completions.create(
