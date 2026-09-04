@@ -80,7 +80,16 @@ Chat Completions 上带 `tools` 会直接报错,必须迁到 Responses API 或�
 
 ---
 
-## Task 0: 探测 api-version 与 vision 的兼容性
+## Task 0: 探测 api-version 与 vision 的兼容性 —— ✅ 已完成(2026-09-04)
+
+> **探测结果:通过,无需任何改动。**
+> 实测输出:`deployment=gpt-5-mini api_version=2024-10-21` → `OK: 品红色`
+> —— 模型正确识别了 1x1 像素图的颜色,且请求同时带了 `tools`。
+> 结论:默认 api-version `2024-10-21` 对 gpt-5-mini 的图片 content parts
+> 与 function calling 同时有效,`.env` / `.env.example` **不需要改**。
+> 影响:Task 3 的 `image_url` 对象格式确认可用;Task 4 的剥图降级从"预期路径"
+> 降级为"纯保险";Task 11 的 eval 图片用例具备跑通前提。
+> 以下步骤保留备查(日后换部署时可重跑)。
 
 **在写任何代码之前做掉。** 这是唯一一个可能推翻实现细节的未知项:
 默认 api-version `2024-10-21` 能否对 gpt-5-mini 同时发送图片 content parts
