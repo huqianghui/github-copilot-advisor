@@ -32,8 +32,8 @@ def build_user_message(user_text: str,
 
     泄漏面提示:返回值里的 data URL 含完整图片 base64。截图可能带 token/密钥
     (见 prompt 规则 10),因此**绝不要**把返回的 messages 整体打日志。同理,
-    生产环境不要开 OPENAI_LOG=debug 或把 httpx logger 调到 DEBUG —— 那会把
-    整张图写进日志。这是图片输入新增的泄漏面,纯文本时期不存在。
+    生产环境不要开 OPENAI_LOG=debug —— 那会把整张图写进日志。这是图片输入
+    新增的泄漏面,纯文本时期不存在。
     """
     if not images:
         return {"role": "user", "content": user_text}
