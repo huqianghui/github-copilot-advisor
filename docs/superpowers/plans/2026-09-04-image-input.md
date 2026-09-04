@@ -626,6 +626,29 @@ async def test_vision_400_retries_without_images(backend, monkeypatch):
     assert isinstance(seen[1], str)
 
 
+async def test_retry_preserves_system_and_history_order(backend, monkeypatch):
+    """剥图重试只该换掉最后一条 user message,不能动 system 或历史。
+    没有这条断言,把 messages[-1] 误写成 messages[0] 无人发现。"""
+    seen = []
+
+    async def fake_loop(messages):
+        seen.append(list(messages))
+        if isinstance(messages[-1]["content"], list):
+            raise _bad_request()
+        return "纯文本答案"
+
+    monkeypatch.setattr(backend, "_run_tool_loop", fake_loop)
+    history = [{"role": "user", "content": "上一轮"},
+               {"role": "assistant", "content": "上一轮回答"}]
+    await backend.run("看图", history,
+                      [ImageInput(data=PNG, mime_type="image/png")])
+
+    for messages in seen:
+        assert messages[0]["role"] == "system"
+        assert messages[1:3] == history        # 历史永远是纯字符串
+    assert len(seen[0]) == len(seen[1])        # 剥图是替换,不是删除
+
+
 async def test_text_only_400_is_not_swallowed(backend, monkeypatch):
     """无图时的 400 是真错误,必须抛出,交给 core 的重试与兜底。"""
     async def fake_loop(messages):
@@ -679,6 +702,19 @@ IMAGE_NOT_PROCESSED_NOTE = (
 
 审查提示:任何把这段文案改回"部署未启用图片理解""模型不支持图片"之类
 归因表述的改动,都应被驳回。
+
+**顺带在本任务清掉两处遗留**(它们都落在本任务必然要重写的区域,
+合并做一次比分两次改划算):
+
+1. **模块顶部 docstring 已过时** —— 第 10 行仍写
+   `(async run(user_text, history) -> str)`,而 `backend.py` 的协议早已是三参数。
+   改为 `(async run(user_text, history, images) -> str)`。**不要展开成完整签名**:
+   这里不是协议的定义处,`backend.py` 才是。
+2. **常量块被函数劈开** —— 现在的顺序是 `_MAX_TOOL_ROUNDS` →
+   `_NO_TEXT_PLACEHOLDER` → `build_user_message` → `_TOOL_SCHEMAS`,
+   本任务还要再加 `IMAGE_NOT_PROCESSED_NOTE`,会割得更碎。
+   把 `_TOOL_SCHEMAS` 提到 `build_user_message` **之前**,让常量连成一块。
+   纯移动,内容一字不改。
 
 把现有 `run` 的循环体整体提取为 `_run_tool_loop`,`run` 只负责组装与降级:
 
@@ -1088,6 +1124,15 @@ async def test_oversized_image_skipped():
 
 
 @respx.mock
+async def test_empty_body_skipped():
+    """空 body 的 200 若放过去,会变成空 data URL 并被 Azure OpenAI 拒,
+    白烧一次往返还误触剥图降级。"""
+    respx.get(GOOD_URL).mock(return_value=httpx.Response(
+        200, content=b"", headers={"content-type": "image/png"}))
+    assert await download(IMAGE_ATTACHMENT) == []
+
+
+@respx.mock
 async def test_network_error_does_not_raise():
     """图片是增强,不能成为新的失败源。"""
     respx.get(GOOD_URL).mock(side_effect=httpx.ConnectError("boom"))
@@ -1203,8 +1248,10 @@ class TeamsImageDownloader(InputFileDownloader):
             return None
 
         content = response.content
-        if len(content) > MAX_IMAGE_BYTES:
-            logger.warning("attachment too large (%d bytes), skipped",
+        # 空 body 的 200 也要挡:放过去会一路走到 "data:image/png;base64,"
+        # 然后由 Azure OpenAI 报 400,白烧一次往返还触发剥图降级。
+        if not content or len(content) > MAX_IMAGE_BYTES:
+            logger.warning("attachment size rejected (%d bytes), skipped",
                            len(content))
             return None
 
@@ -1221,7 +1268,7 @@ class TeamsImageDownloader(InputFileDownloader):
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `uv run pytest channels/teams/tests/test_downloader.py -v`
-Expected: PASS(21 passed)
+Expected: PASS(22 passed)
 
 - [ ] **Step 5: 提交**
 
@@ -1614,6 +1661,45 @@ from teams_adapter.downloader import TeamsImageDownloader
         file_downloaders=[TeamsImageDownloader(connection_manager)],
 ```
 
+**同一任务内追加一行运行时防线** —— `_configure_logging()`(第 23-32 行)里
+钉死 `openai` logger 的级别:
+
+```python
+def _configure_logging() -> None:
+    logging.basicConfig(level=logging.INFO)
+    # OPENAI_LOG=debug 会把请求体整个 dump,含图片 base64。此处在 openai
+    # 导入期 setup_logging() 之后覆盖,确保生产环境改环境变量也打不开。
+    logging.getLogger("openai").setLevel(logging.INFO)
+    ...                               # 其余既有配置不变
+```
+
+**为什么必须是代码而不是文档**(已核实的事实,勿再论证):
+- `openai/_base_client.py:524` 在 DEBUG 下打 `"Request options: %s"`,
+  其 `exclude` 只含 `content`、**不含 `json_data`** —— 整张图的 base64 确实进日志
+- `openai/_utils/_logs.py:23` 直接读 `OPENAI_LOG` 环境变量并 `setLevel`,
+  意味着**不改一行代码、只加一个 App Service 应用设置就能触发泄漏**
+- `logging.basicConfig(level=INFO)` 拦不住:root 是 INFO,但 handler 的 level
+  是 NOTSET,`openai` logger 自己被设成 DEBUG 后记录照样流到 handler
+
+本仓没有 linter 也没有 CI,任何依赖"审查时有人记得"的机制等于没有;
+这一行是**运行时**的,不依赖任何人记得。不要升级成自定义 log filter 或
+脱敏 formatter —— 泄漏面只有一个具名 logger、一个具名环境变量,
+一行 `setLevel` 就是精确匹配问题规模的解。
+
+对应测试(追加到 `channels/teams/tests/test_app.py`):
+
+```python
+def test_openai_logger_pinned_to_info():
+    """OPENAI_LOG=debug 会 dump 含图片 base64 的请求体,必须在启动时钉死。"""
+    import logging
+
+    import teams_adapter.__main__ as entry
+
+    logging.getLogger("openai").setLevel(logging.DEBUG)   # 模拟环境变量效果
+    entry._configure_logging()
+    assert logging.getLogger("openai").level == logging.INFO
+```
+
 `channels/teams/pyproject.toml` —— `dependencies` 列表增加(现在 `httpx` 靠
 `advisor-agent` 传递而来,直接依赖必须显式声明):
 
@@ -1790,6 +1876,30 @@ Expected: PASS,无 skip(integration 除外)
 
 ```markdown
 - 图片输入设计:`docs/superpowers/specs/2026-09-04-image-input-design.md`
+```
+
+- [ ] **Step 3b: 把容量数字记进 DEVELOPMENT.md**
+
+图片输入显著改变了单请求的内存峰值,这是**部署容量数字而非代码问题**
+(所以不加代码里的 guard —— 限额已在 `downloader.py` 这个信任边界强制执行,
+在纯函数里再加一道等于同一策略两个真值来源)。`DEVELOPMENT.md` 追加:
+
+```markdown
+## 图片输入的容量影响
+
+单个满配图片请求(4 张 × 4MB,limits 见 `channels/teams/.../downloader.py`)
+在飞行中同时驻留:
+
+| 部分 | 峰值 |
+|------|------|
+| 原始字节(`request.images`,core.handle 栈帧持有) | ~16 MB |
+| base64 字符串(`messages` 里的 data URL) | ~21 MB |
+| openai SDK 序列化的 JSON body(`httpx.Request.content`) | ~21 MB |
+| **合计** | **~58 MB / 并发请求** |
+
+aiohttp 单进程多并发,该数字乘并发数。据此设定 Teams 侧并发上限与容器内存。
+注:`AdvisorCore` 的重试是串行的,上一次 `run` 的栈帧已退出,**不叠加**内存;
+重试代价是 CPU(约 16MB 的 base64 重编码,一二十毫秒)。
 ```
 
 - [ ] **Step 4: 手工冒烟(真实 Teams 租户)**
