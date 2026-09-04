@@ -782,7 +782,7 @@ Expected: PASS(全部 agent 单元测试)
 
 ```bash
 git add agent/src/advisor_agent/maf_backend.py agent/tests/test_maf_backend.py
-git commit -m "feat(agent): degrade gracefully when deployment lacks vision support"
+git commit -m "feat(agent): strip images and retry when a request with images is rejected"
 ```
 
 ---
