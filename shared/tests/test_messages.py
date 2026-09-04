@@ -1,3 +1,6 @@
+import pytest
+from pydantic import ValidationError
+
 from advisor_shared.messages import (
     AdvisorRequest,
     AdvisorResponse,
@@ -49,3 +52,24 @@ def test_request_carries_images():
     assert req.images[0].data == b"\x89PNG"
     assert req.images[0].mime_type == "image/png"
     assert req.images[0].name == ""       # Teams inline image 无文件名
+
+
+def test_rejects_non_image_mime_type():
+    for bad in ("text/html", "../evil"):
+        with pytest.raises(ValidationError):
+            ImageInput(data=b"x", mime_type=bad)
+
+
+def test_accepts_common_image_mime_types():
+    for good in ("image/png", "image/jpeg", "image/svg+xml"):
+        assert ImageInput(data=b"x", mime_type=good).mime_type == good
+
+
+def test_image_bytes_hidden_from_repr_but_otherwise_unchanged():
+    img = ImageInput(data=b"\x89PNG-secret-token", mime_type="image/png")
+    assert "secret-token" not in repr(img)
+    assert "secret-token" not in repr(_req(images=[img]))
+    # repr 之外行为照旧:取值、相等、model_dump 都仍是原始字节
+    assert img.data == b"\x89PNG-secret-token"
+    assert img == ImageInput(data=b"\x89PNG-secret-token", mime_type="image/png")
+    assert img.model_dump()["data"] == b"\x89PNG-secret-token"
