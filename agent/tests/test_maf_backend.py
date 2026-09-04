@@ -165,13 +165,19 @@ async def test_retry_targets_user_message_even_if_loop_appended(backend,
 
 
 async def test_text_only_400_is_not_swallowed(backend, monkeypatch):
-    """无图时的 400 是真错误,必须抛出,交给 core 的重试与兜底。"""
+    """无图时的 400 是真错误,必须立刻抛出,交给 core 的重试与兜底。
+    断言调用次数,否则「立刻抛」与「重试后再抛」无法区分 —— 后者会给
+    从未发图的用户贴上图片提示。"""
+    calls = []
+
     async def fake_loop(messages):
+        calls.append(messages)
         raise _bad_request()
 
     monkeypatch.setattr(backend, "_run_tool_loop", fake_loop)
     with pytest.raises(BadRequestError):
         await backend.run("登录失败", [], None)
+    assert len(calls) == 1        # 无图时不该重试
 
 
 def test_note_does_not_attribute_a_cause():
