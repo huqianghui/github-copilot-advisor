@@ -85,8 +85,12 @@ async def test_backend_retry_then_success():
     backend = StubBackend("ok", fail_times=1)
     core = AdvisorCore(backend, InMemorySessionStore(),
                        event_sink=lambda e: None)
-    resp = await core.handle(make_request())
+    img = _png()
+    resp = await core.handle(make_request(images=[img]))
     assert resp.markdown == "ok" and len(backend.calls) == 2
+    # 重试必须复现同一请求,含图片。"图片本身导致失败"由 backend 内部剥图
+    # 降级处理(Task 4),不该让 core 盲重试去猜。
+    assert backend.images_seen == [[img], [img]]
 
 
 async def test_backend_exhausted_returns_fallback_and_skips_session():
@@ -106,7 +110,8 @@ def _png(tag=b"x"):
 
 async def test_images_forwarded_to_backend():
     backend = StubBackend()
-    core = AdvisorCore(backend, InMemorySessionStore())
+    core = AdvisorCore(backend, InMemorySessionStore(),
+                       event_sink=lambda e: None)
     img = _png()
     await core.handle(make_request(text="这是什么错误", images=[img]))
     assert backend.images_seen[0] == [img]
@@ -114,7 +119,7 @@ async def test_images_forwarded_to_backend():
 
 async def test_history_marks_images_when_text_empty():
     sessions = InMemorySessionStore()
-    core = AdvisorCore(StubBackend(), sessions)
+    core = AdvisorCore(StubBackend(), sessions, event_sink=lambda e: None)
     await core.handle(make_request(text="", images=[_png(), _png(b"y")]))
     history = await sessions.get("ck1")
     assert history[0] == {"role": "user", "content": "[图片×2]"}
@@ -122,7 +127,7 @@ async def test_history_marks_images_when_text_empty():
 
 async def test_history_keeps_text_alongside_image_marker():
     sessions = InMemorySessionStore()
-    core = AdvisorCore(StubBackend(), sessions)
+    core = AdvisorCore(StubBackend(), sessions, event_sink=lambda e: None)
     await core.handle(make_request(text="报这个错", images=[_png()]))
     history = await sessions.get("ck1")
     assert history[0]["content"] == "[图片×1] 报这个错"
@@ -131,7 +136,7 @@ async def test_history_keeps_text_alongside_image_marker():
 async def test_event_records_image_count():
     events: list[AdvisorEvent] = []
     core = AdvisorCore(StubBackend(), InMemorySessionStore(),
-                       event_sink=events.append)
+                       event_sink=collect_events(events))
     await core.handle(make_request(images=[_png()]))
     assert events[0].image_count == 1
 
