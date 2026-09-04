@@ -1921,6 +1921,25 @@ git commit -m "docs: cross-reference image input design in main spec and README"
 
 ---
 
+## 遗留观察(不属于本计划,记录以免丢失)
+
+**`_TOOL_SCHEMAS` 值得抽成独立模块,但不要在本计划里做。**
+
+Task 4 的代码质量 review 给出的判断:`maf_backend.py` 共 247 行,其中
+`_TOOL_SCHEMAS` 占 98 行(约 40%),是纯数据、与模块其余部分零耦合,
+抽走后剩约 150 行。Task 4 把它前移到 `build_user_message` 之前后,现在要
+滚过 100 行 JSON 才能读到第一个函数 —— 这让抽取更有吸引力。
+
+但那 98 行**在本计划开始之前就是 98 行**,不是本计划的贡献;
+为一次纯移动单开 commit 会跟真正的改动抢 review 预算。
+
+**建议时机**:下一个需要新增或修改工具 schema 的任务,顺手抽到
+`agent/src/advisor_agent/tool_schemas.py`。
+
+另注:`run`(组装 + 策略)/ `_run_tool_loop`(传输)这条切线很干净,
+恰好就是日后进一步拆分的自然缝 —— Task 4 的改动是往远离"该拆"临界点的
+方向走的,不是靠近。
+
 ## 完成标准
 
 - [ ] `uv run pytest` 全绿
