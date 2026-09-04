@@ -1,4 +1,4 @@
-from advisor_agent.core import FALLBACK_MESSAGE, AdvisorCore
+from advisor_agent.core import _SUMMARY_CHARS, FALLBACK_MESSAGE, AdvisorCore
 from advisor_agent.run_context import current_run
 from advisor_agent.sessions import InMemorySessionStore
 from advisor_shared.events import AdvisorEvent
@@ -32,6 +32,10 @@ class StubBackend:
 
 def collect_events(bucket):
     return bucket.append
+
+
+def _png(tag=b"x"):
+    return ImageInput(data=tag, mime_type="image/png")
 
 
 async def test_happy_path_returns_response_and_persists_session():
@@ -104,10 +108,6 @@ async def test_backend_exhausted_returns_fallback_and_skips_session():
     assert "llm down" in events[0].error
 
 
-def _png(tag=b"x"):
-    return ImageInput(data=tag, mime_type="image/png")
-
-
 async def test_images_forwarded_to_backend():
     backend = StubBackend()
     core = AdvisorCore(backend, InMemorySessionStore(),
@@ -148,3 +148,12 @@ async def test_event_summary_marks_images_when_text_empty():
                        event_sink=collect_events(events))
     await core.handle(make_request(text="", images=[_png()]))
     assert events[0].question_summary == "[图片×1]"
+
+
+async def test_event_summary_is_truncated():
+    """摘要必须截断 —— 长问题不能把整段正文灌进事件日志。"""
+    events: list[AdvisorEvent] = []
+    core = AdvisorCore(StubBackend(), InMemorySessionStore(),
+                       event_sink=collect_events(events))
+    await core.handle(make_request(text="错" * 200))
+    assert len(events[0].question_summary) == _SUMMARY_CHARS
