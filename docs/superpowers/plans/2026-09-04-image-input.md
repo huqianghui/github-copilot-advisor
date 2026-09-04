@@ -21,7 +21,29 @@
 - 单文件:`uv run pytest channels/teams/tests/test_downloader.py -v`
 - eval(需真实凭据,默认不跑):`uv run pytest -m integration agent/tests/test_eval_behavior.py`
 
-**外部前提(Task 11 之前必须确认)**:`AZURE_OPENAI_CHAT_DEPLOYMENT` 指向的部署必须是 GPT-4o / GPT-4.1 等支持 vision 的模型。若当前是纯文本部署,功能上线即走 Task 4 的降级路径。确认方式:Azure Portal → 该 OpenAI 资源 → Deployments,查看模型名。
+**模型现状(2026-09-04 已查明)**:`AZURE_OPENAI_CHAT_DEPLOYMENT=gpt-5-mini`。
+按 Microsoft Learn 的 GPT-5 能力矩阵,`gpt-5-mini (2025-08-07)` **同时支持
+image input、functions/tools 与 Chat Completions API** —— 本计划的方案 A 成立,
+无需改用 Responses API。
+
+**待验证的风险(必须在 Task 3 之前做掉,见 Task 0)**:`.env` 未设置
+`AZURE_OPENAI_API_VERSION`,因此走 `maf_backend.py` 的默认值 `2024-10-21`。
+这是 GPT-4o 时代的 GA 版本。纯文本 tool loop 目前能跑通,**不能推出**它对
+gpt-5-mini 的图片 content parts 也 OK。若 Task 0 探测失败,把 `.env` 与
+`.env.example` 的 `AZURE_OPENAI_API_VERSION` 设为 `2025-04-01-preview` 再重试。
+
+**gpt-5 系列的既有约束(现有代码已满足,改动时勿引入)**:
+- 不支持 `max_tokens`(须用 `max_completion_tokens`)、`temperature`、`top_p`、
+  `presence_penalty`、`frequency_penalty`。现有 `_run_tool_loop` 只传
+  `model` / `messages` / `tools`,**保持这样**
+- Chat Completions 的图片 part 格式是 `{"type": "image_url",
+  "image_url": {"url": ...}}`(对象),与 Responses API 的 `input_image`
+  (字符串)不同。Task 3 用的是前者,正确
+- 单请求最多 10 张图、单张 ≤ 20MB。本计划限额(4 张 / 4MB)在其内
+
+**未来升级风险(记录备查,本期不处理)**:`gpt-5.6` 及以后的模型在
+Chat Completions 上带 `tools` 会直接报错,必须迁到 Responses API 或每次显式设
+`reasoning_effort='none'`。届时受影响的是 `_run_tool_loop` 整体,与图片输入无关。
 
 **已验证的 SDK 事实**(不必重新调研):
 - `ApplicationOptions.file_downloaders: list[InputFileDownloader]` 存在,且 `AgentApplication(**kwargs)` 会透传该键
@@ -55,6 +77,107 @@
 **对 spec 的两处修正**(实现时以本计划为准):
 1. spec §6.1 称协议变更"现有测试无需改动"。实际上 `agent/tests/test_core.py` 的 `StubBackend.run` 是 2 参数签名,`core.py` 传第 3 个参数会 `TypeError`。Task 2 会以**纯追加**方式改造该 stub(保留 `calls` 为 2-tuple,新增 `images_seen`),不破坏第 55 行的 `_, history = backend.calls[0]` 解包。
 2. spec §11 称"无新增第三方依赖"。包级别确实没有新包,但 `channels/teams/pyproject.toml` 未声明 `httpx`(靠 `advisor-agent` 传递而来)。Task 10 补上显式声明。
+
+---
+
+## Task 0: 探测 api-version 与 vision 的兼容性
+
+**在写任何代码之前做掉。** 这是唯一一个可能推翻实现细节的未知项:
+默认 api-version `2024-10-21` 能否对 gpt-5-mini 同时发送图片 content parts
+与 `tools`。探测比事后返工便宜得多。
+
+**Files:** 无(临时脚本,跑完删除)
+
+- [ ] **Step 1: 写探测脚本**
+
+Create `probe_vision.py`(仓库根目录,临时文件):
+
+```python
+"""临时探测:当前 api-version + 部署能否同时吃图片与 tools。跑完删除。"""
+import asyncio
+import os
+
+from openai import AsyncAzureOpenAI
+
+# 1x1 红点 PNG,合法且最小
+ONE_PX_PNG = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8"
+              "z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+
+TOOLS = [{
+    "type": "function",
+    "function": {
+        "name": "search_solutions",
+        "description": "搜索已解决的知识库问答。",
+        "parameters": {"type": "object",
+                       "properties": {"query": {"type": "string"}},
+                       "required": ["query"]},
+    },
+}]
+
+
+async def main():
+    api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")
+    print(f"deployment={os.environ['AZURE_OPENAI_CHAT_DEPLOYMENT']} "
+          f"api_version={api_version}")
+    client = AsyncAzureOpenAI(
+        azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
+        api_key=os.environ["AZURE_OPENAI_API_KEY"],
+        api_version=api_version,
+    )
+    response = await client.chat.completions.create(
+        model=os.environ["AZURE_OPENAI_CHAT_DEPLOYMENT"],
+        messages=[{"role": "user", "content": [
+            {"type": "text", "text": "这张图是什么颜色?只回答颜色。"},
+            {"type": "image_url", "image_url": {
+                "url": f"data:image/png;base64,{ONE_PX_PNG}",
+                "detail": "auto"}},
+        ]}],
+        tools=TOOLS,
+    )
+    print("OK:", response.choices[0].message.content)
+
+
+asyncio.run(main())
+```
+
+- [ ] **Step 2: 运行探测**
+
+Run: `uv run --env-file .env python probe_vision.py`
+
+判读结果:
+
+| 输出 | 结论 | 动作 |
+|------|------|------|
+| `OK: <颜色>` | 当前 api-version 可用 | 无需改动,进 Task 1 |
+| 400 `invalid_image` / `image_url is not supported` | api-version 太老 | 进 Step 3 |
+| 400 提到 `tools` 与 reasoning 冲突 | 部署已升到 gpt-5.6+ | **停下来找负责人**,需要迁 Responses API,超出本计划范围 |
+| 401 / 404 | 凭据或部署名不对 | 先修环境,与本功能无关 |
+
+- [ ] **Step 3: 仅在 Step 2 报图片相关 400 时执行**
+
+在 `.env` 中加入(并同步到 `.env.example`,值不含机密):
+
+```
+AZURE_OPENAI_API_VERSION=2025-04-01-preview
+```
+
+重跑 Step 2 确认变为 `OK:`。若仍失败,记录完整错误信息后停下来 —— 不要
+硬着头皮往下写,方案 A 的前提已经不成立。
+
+- [ ] **Step 4: 清理**
+
+```bash
+rm probe_vision.py
+```
+
+- [ ] **Step 5: 若改了 .env.example 则提交**
+
+```bash
+git add .env.example
+git commit -m "chore: pin Azure OpenAI api-version for gpt-5-mini vision support"
+```
+
+(Step 2 直接通过、未改任何文件时,本任务无提交。)
 
 ---
 
