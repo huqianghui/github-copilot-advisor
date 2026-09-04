@@ -2,7 +2,12 @@
 import base64
 from types import SimpleNamespace
 
-from advisor_agent.maf_backend import MAFBackend, build_user_message
+import httpx
+import pytest
+from openai import BadRequestError
+
+from advisor_agent.maf_backend import (IMAGE_NOT_PROCESSED_NOTE, MAFBackend,
+                                       build_user_message)
 from advisor_agent.prompts import SYSTEM_PROMPT
 from advisor_shared.messages import ImageInput
 
@@ -73,3 +78,104 @@ async def test_run_assembles_system_history_then_multimodal_user(monkeypatch):
     assert messages[1:3] == history          # 历史永远是纯字符串
     assert isinstance(messages[3]["content"], list)
     assert messages[3]["content"][1]["type"] == "image_url"
+
+
+def _bad_request() -> BadRequestError:
+    request = httpx.Request("POST", "https://x.openai.azure.com/chat")
+    return BadRequestError("image input not supported",
+                           response=httpx.Response(400, request=request),
+                           body=None)
+
+
+@pytest.fixture
+def backend(monkeypatch):
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://x.openai.azure.com")
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "k")
+    monkeypatch.setenv("AZURE_OPENAI_CHAT_DEPLOYMENT", "gpt-5-mini")
+    return MAFBackend(tools=None, channel_id_provider=lambda: "19:c",
+                      is_group_provider=lambda: False)
+
+
+async def test_vision_400_retries_without_images(backend, monkeypatch):
+    seen = []
+
+    async def fake_loop(messages):
+        seen.append(messages[-1]["content"])
+        if isinstance(messages[-1]["content"], list):
+            raise _bad_request()
+        return "先检查网络代理"
+
+    monkeypatch.setattr(backend, "_run_tool_loop", fake_loop)
+    out = await backend.run("看图", [], [ImageInput(data=PNG, mime_type="image/png")])
+    assert "先检查网络代理" in out
+    assert IMAGE_NOT_PROCESSED_NOTE in out
+    assert len(seen) == 2                      # 第一次带图,第二次纯文本
+    assert isinstance(seen[1], str)
+
+
+async def test_retry_preserves_system_and_history_order(backend, monkeypatch):
+    """剥图重试只该换掉最后一条 user message,不能动 system 或历史。
+    没有这条断言,把 messages[-1] 误写成 messages[0] 无人发现。"""
+    seen = []
+
+    async def fake_loop(messages):
+        seen.append(list(messages))
+        if isinstance(messages[-1]["content"], list):
+            raise _bad_request()
+        return "纯文本答案"
+
+    monkeypatch.setattr(backend, "_run_tool_loop", fake_loop)
+    history = [{"role": "user", "content": "上一轮"},
+               {"role": "assistant", "content": "上一轮回答"}]
+    await backend.run("看图", history,
+                      [ImageInput(data=PNG, mime_type="image/png")])
+
+    for messages in seen:
+        assert messages[0]["role"] == "system"
+        assert messages[1:3] == history        # 历史永远是纯字符串
+    assert len(seen[0]) == len(seen[1])        # 剥图是替换,不是删除
+
+
+async def test_retry_targets_user_message_even_if_loop_appended(backend,
+                                                                monkeypatch):
+    """_run_tool_loop 会往 messages 里 append 助手消息与工具结果。若这些 append
+    落在 run 自己的列表上,messages[-1] 就不再是那条 user message —— 剥图改错
+    位置,既没剥掉图,又切断了 tool_calls 与 tool 结果的配对,重试必然再 400。
+    """
+    seen = []
+
+    async def fake_loop(messages):
+        seen.append(list(messages))
+        if isinstance(messages[-1]["content"], list):
+            messages.append({
+                "role": "assistant", "content": None,
+                "tool_calls": [{"id": "c1", "type": "function",
+                                "function": {"name": "web_search",
+                                             "arguments": "{}"}}]})
+            messages.append({"role": "tool", "tool_call_id": "c1",
+                             "content": "{}"})
+            raise _bad_request()
+        return "纯文本答案"
+
+    monkeypatch.setattr(backend, "_run_tool_loop", fake_loop)
+    await backend.run("看图", [], [ImageInput(data=PNG, mime_type="image/png")])
+
+    assert seen[1][-1] == {"role": "user", "content": "看图"}
+    assert len(seen[1]) == len(seen[0])
+
+
+async def test_text_only_400_is_not_swallowed(backend, monkeypatch):
+    """无图时的 400 是真错误,必须抛出,交给 core 的重试与兜底。"""
+    async def fake_loop(messages):
+        raise _bad_request()
+
+    monkeypatch.setattr(backend, "_run_tool_loop", fake_loop)
+    with pytest.raises(BadRequestError):
+        await backend.run("登录失败", [], None)
+
+
+def test_note_does_not_attribute_a_cause():
+    """400 的成因(不支持 vision / 格式不符 / 动图 GIF)代码分辨不了,
+    归因即误诊。这个测试钉住「不猜原因」这条约束。"""
+    for forbidden in ("部署", "未启用", "不支持", "模型"):
+        assert forbidden not in IMAGE_NOT_PROCESSED_NOTE

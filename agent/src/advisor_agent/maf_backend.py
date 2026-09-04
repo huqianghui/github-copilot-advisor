@@ -7,47 +7,30 @@ agent-framework-openai / agent-framework-azure-ai 这两个可选连接器包里
 pre-release,且已在 Task 1 从 agent/pyproject.toml 移除)。因此这里直接用已安装
 的 openai SDK(AsyncAzureOpenAI,OpenAI API 兼容)实现一个等价的 function-calling
 tool loop,对外仍暴露 MAFBackend 这个类名,并满足 AgentBackend 协议
-(async run(user_text, history) -> str)。等 agent-framework-azure-ai 转正式版后,
+(async run(user_text, history, images) -> str)。等 agent-framework-azure-ai 转正式版后,
 可以把内部实现换成真正的 MAF ChatAgent,协议边界(AgentBackend)不需要变。
 """
 import base64
 import json
+import logging
 import os
 from typing import Callable
 
-from openai import AsyncAzureOpenAI
+from openai import AsyncAzureOpenAI, BadRequestError
 
 from advisor_agent.prompts import SYSTEM_PROMPT
 from advisor_agent.tools import AdvisorTools
 from advisor_shared.messages import ImageInput
 
+logger = logging.getLogger(__name__)
+
 _MAX_TOOL_ROUNDS = 6
 
 _NO_TEXT_PLACEHOLDER = "(用户只发了图片,无文字说明)"
 
-
-def build_user_message(user_text: str,
-                       images: list[ImageInput] | None) -> dict:
-    """构造 user message。无图时保持纯字符串 content —— 纯文本路径零行为变化。
-
-    泄漏面提示:返回值里的 data URL 含完整图片 base64。截图可能带 token/密钥
-    (见 prompt 规则 10),因此**绝不要**把返回的 messages 整体打日志。同理,
-    生产环境不要开 OPENAI_LOG=debug —— 那会把整张图写进日志。这是图片输入
-    新增的泄漏面,纯文本时期不存在。
-    """
-    if not images:
-        return {"role": "user", "content": user_text}
-    content: list[dict] = [
-        {"type": "text", "text": user_text or _NO_TEXT_PLACEHOLDER}]
-    for image in images:
-        b64 = base64.b64encode(image.data).decode()
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:{image.mime_type};base64,{b64}",
-                          "detail": "auto"},
-        })
-    return {"role": "user", "content": content}
-
+IMAGE_NOT_PROCESSED_NOTE = (
+    "(注:这次没能处理你发送的图片,以上回答未参考图片内容。"
+    "可以把图中的关键信息贴成文字,我再帮你看。)")
 
 _TOOL_SCHEMAS = [
     {
@@ -149,6 +132,29 @@ _TOOL_SCHEMAS = [
 ]
 
 
+def build_user_message(user_text: str,
+                       images: list[ImageInput] | None) -> dict:
+    """构造 user message。无图时保持纯字符串 content —— 纯文本路径零行为变化。
+
+    泄漏面提示:返回值里的 data URL 含完整图片 base64。截图可能带 token/密钥
+    (见 prompt 规则 10),因此**绝不要**把返回的 messages 整体打日志。同理,
+    生产环境不要开 OPENAI_LOG=debug —— 那会把整张图写进日志。这是图片输入
+    新增的泄漏面,纯文本时期不存在。
+    """
+    if not images:
+        return {"role": "user", "content": user_text}
+    content: list[dict] = [
+        {"type": "text", "text": user_text or _NO_TEXT_PLACEHOLDER}]
+    for image in images:
+        b64 = base64.b64encode(image.data).decode()
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{image.mime_type};base64,{b64}",
+                          "detail": "auto"},
+        })
+    return {"role": "user", "content": content}
+
+
 class MAFBackend:
     def __init__(self, tools: AdvisorTools,
                  channel_id_provider: Callable[[], str],
@@ -186,7 +192,22 @@ class MAFBackend:
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages.extend(history)
         messages.append(build_user_message(user_text, images))
+        try:
+            # 传副本:_run_tool_loop 会往列表里 append 助手消息与工具结果。若让
+            # 它写进这里的 messages,下面的 messages[-1] 就不再是那条 user
+            # message —— 剥图会改错位置,还会切断 tool_calls 与 tool 结果的配对。
+            return await self._run_tool_loop(list(messages))
+        except BadRequestError:
+            if not images:
+                raise            # 无图时的 400 是真错误,交给 core 兜底
+            # 不记录成因:400 可能是部署不支持 vision、格式不受支持、动图 GIF……
+            # 这里分辨不了,日志只陈述发生了什么。
+            logger.warning("vision request rejected, retrying without images")
+            messages[-1] = build_user_message(user_text, None)
+            answer = await self._run_tool_loop(messages)
+            return f"{answer}\n\n{IMAGE_NOT_PROCESSED_NOTE}"
 
+    async def _run_tool_loop(self, messages: list[dict]) -> str:
         for _ in range(_MAX_TOOL_ROUNDS):
             response = await self._client.chat.completions.create(
                 model=self._deployment,
