@@ -322,7 +322,7 @@ class StubBackend:
         return self.reply
 ```
 
-文件末尾追加三个新测试:
+文件末尾追加四个新测试:
 
 ```python
 def _png(tag=b"x"):
