@@ -87,6 +87,15 @@ def _bad_request() -> BadRequestError:
                            body=None)
 
 
+def _tool_call() -> SimpleNamespace:
+    return SimpleNamespace(id="c1", function=SimpleNamespace(
+        name="web_search", arguments='{"query":"x"}'))
+
+
+async def _ok() -> str:
+    return "{}"
+
+
 @pytest.fixture
 def backend(monkeypatch):
     monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://x.openai.azure.com")
@@ -162,6 +171,34 @@ async def test_retry_targets_user_message_even_if_loop_appended(backend,
 
     assert seen[1][-1] == {"role": "user", "content": "看图"}
     assert len(seen[1]) == len(seen[0])
+
+
+async def test_400_after_a_successful_tool_round(backend, monkeypatch):
+    """不打桩 _run_tool_loop:真实 loop 第 1 轮工具调用 append 之后,第 2 轮才 400。
+
+    上面四个测试都在 _run_tool_loop 这个 seam 上打桩,于是「真实 loop 会变异
+    传入的列表」这一前提由假 loop 自己扮演,永远自洽。这条测试驱动真实 loop
+    (只打桩 create),把那个前提本身验证一遍,顺带覆盖 loop 的工具调用分支。
+    """
+    sent = []
+
+    async def fake_create(*, model, messages, tools):
+        sent.append(list(messages))
+        has_image = any(isinstance(m.get("content"), list) for m in messages)
+        if not has_image:
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content="纯文本答案", tool_calls=None))])
+        if len(messages) == 2:            # 第 1 轮:先要一次工具调用
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content=None, tool_calls=[_tool_call()]))])
+        raise _bad_request()              # 第 2 轮(已 append 完)才拒
+
+    monkeypatch.setattr(backend._client.chat.completions, "create", fake_create)
+    monkeypatch.setattr(backend, "_dispatch", lambda name, args: _ok())
+    out = await backend.run("看图", [], [ImageInput(data=PNG, mime_type="image/png")])
+    assert out == f"纯文本答案\n\n{IMAGE_NOT_PROCESSED_NOTE}"
+    assert [m["role"] for m in sent[-1]] == ["system", "user"]   # 副本被丢弃,不含 tool 残留
+    assert sent[-1][-1]["content"] == "看图"
 
 
 async def test_text_only_400_is_not_swallowed(backend, monkeypatch):
