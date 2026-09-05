@@ -157,6 +157,11 @@ async def test_usage_not_configured_returns_guidance(tmp_path):
         "19:zzz", False, "billing_mode", None))   # defaults 无 org 配置
     assert out["status"] == "not_configured"
     assert "PAT" in out["guidance"]
+    # 权限项必须跟着端点走:AI credits 用量端点要 Administration read。
+    # 指引里写 billing read 会让客户建一个在新端点上 403 的 token,
+    # 而那个 403 在下面的 except 里被吞成一句含糊的"权限不足"。
+    assert "Administration" in out["guidance"]
+    assert "billing read" not in out["guidance"]
 
 
 async def test_usage_privacy_blocked_in_group(tmp_path, monkeypatch):

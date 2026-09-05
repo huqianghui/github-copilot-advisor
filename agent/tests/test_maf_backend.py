@@ -6,9 +6,10 @@ import httpx
 import pytest
 from openai import BadRequestError
 
-from advisor_agent.maf_backend import (IMAGE_NOT_PROCESSED_NOTE, MAFBackend,
-                                       build_user_message)
+from advisor_agent.maf_backend import (_TOOL_SCHEMAS, IMAGE_NOT_PROCESSED_NOTE,
+                                       MAFBackend, build_user_message)
 from advisor_agent.prompts import SYSTEM_PROMPT
+from advisor_agent.usage import _QUESTION_TYPES
 from advisor_shared.messages import ImageInput
 
 PNG = b"\x89PNG\r\n\x1a\n"
@@ -223,3 +224,27 @@ def test_note_does_not_attribute_a_cause():
     IMAGE_NOT_PROCESSED_NOTE 旁边的注释里。"""
     for forbidden in ("部署", "未启用", "不支持", "模型"):
         assert forbidden not in IMAGE_NOT_PROCESSED_NOTE
+
+
+def _usage_schema() -> dict:
+    return next(s["function"] for s in _TOOL_SCHEMAS
+                if s["function"]["name"] == "copilot_usage_lookup")
+
+
+def test_usage_schema_enum_matches_client_question_types():
+    """两处枚举漂移会静默坏掉整个工具:schema 里留着一个 client 不认的值,
+    模型照着 schema 选它 → client 抛 ValueError → tools 层吞成一句
+    「查询失败:可能是 token 权限不足」。用户看到的是一个错误的归因,
+    而不是一个报错。所以这里把两处钉死在一起。"""
+    enum = _usage_schema()["parameters"]["properties"]["question_type"]["enum"]
+    assert set(enum) == _QUESTION_TYPES
+    assert "premium_usage" not in enum      # 2026-06-01 已退役
+
+
+def test_usage_schema_description_maps_the_retired_term():
+    """模型只看 schema description 决定调不调工具。用户仍会说 premium
+    requests —— 描述里不提这个词,旧词提问就选不中这个工具。"""
+    description = _usage_schema()["description"]
+    assert "credits_usage" in description
+    assert "AI credits" in description
+    assert "premium requests" in description

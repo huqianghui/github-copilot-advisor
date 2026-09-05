@@ -114,7 +114,9 @@ _TOOL_SCHEMAS = [
             "name": "copilot_usage_lookup",
             "description": (
                 "查询本组织 Copilot 计费/用量真实数据(需组织已授权)。"
-                "question_type:billing_mode / seats_summary / premium_usage / "
+                "question_type:billing_mode / seats_summary / credits_usage"
+                "(AI credits 用量与金额;用户说 premium requests/高级请求这类"
+                "旧词时也用它 —— 该计费概念已被 AI credits 取代)/ "
                 "user_usage(个人明细,仅限 1:1 私聊)。"
             ),
             "parameters": {
@@ -123,7 +125,7 @@ _TOOL_SCHEMAS = [
                     "question_type": {
                         "type": "string",
                         "enum": ["billing_mode", "seats_summary",
-                                 "premium_usage", "user_usage"],
+                                 "credits_usage", "user_usage"],
                     },
                     "username": {
                         "type": "string",
