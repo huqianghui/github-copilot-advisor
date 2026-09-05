@@ -1,6 +1,6 @@
 # channels/teams/src/teams_adapter/extract.py
 """Teams activity → AdvisorRequest:纯函数,不依赖 Bot SDK 对象(spec 8.2)。"""
-from advisor_shared.messages import AdvisorRequest
+from advisor_shared.messages import AdvisorRequest, ImageInput
 
 
 def _bot_mentioned(activity: dict, bot_id: str) -> bool:
@@ -28,7 +28,8 @@ def strip_mentions(text: str, entities: list[dict], bot_id: str) -> str:
     return text.strip()
 
 
-def to_advisor_request(activity: dict, bot_id: str) -> AdvisorRequest:
+def to_advisor_request(activity: dict, bot_id: str,
+                       images: list[ImageInput] | None = None) -> AdvisorRequest:
     conv = activity.get("conversation") or {}
     is_group = conv.get("conversationType") != "personal"
     channel_id = (
@@ -44,4 +45,10 @@ def to_advisor_request(activity: dict, bot_id: str) -> AdvisorRequest:
         user_id=sender.get("id", ""),
         user_name=sender.get("name", ""),
         is_group=is_group,
+        images=list(images or []),
     )
+
+
+def is_empty(request: AdvisorRequest) -> bool:
+    """纯图片场景下 text 剥离 mention 后可能为空;两者皆空才算无内容。"""
+    return not request.text and not request.images
