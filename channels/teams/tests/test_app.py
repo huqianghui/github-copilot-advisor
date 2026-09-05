@@ -186,3 +186,19 @@ def test_openai_logger_pinned_to_info():
     logging.getLogger("openai").setLevel(logging.DEBUG)   # 模拟环境变量效果
     entry._configure_logging()
     assert logging.getLogger("openai").level == logging.INFO
+
+
+def test_main_activates_the_openai_logger_pin(monkeypatch):
+    """防线必须真的被启动路径激活 —— 只证明 _configure_logging 有效还不够。
+    断言的是结果(logger 级别),不是"某个函数被调用过"。"""
+    import logging
+
+    import teams_adapter.__main__ as entry
+
+    monkeypatch.setattr(entry, "build_agent_app", lambda: (None, None, None))
+    monkeypatch.setattr(entry, "create_app", lambda *a: None)
+    monkeypatch.setattr(entry.web, "run_app", lambda *a, **k: None)
+
+    logging.getLogger("openai").setLevel(logging.DEBUG)   # 模拟 OPENAI_LOG=debug
+    entry.main()
+    assert logging.getLogger("openai").level == logging.INFO
