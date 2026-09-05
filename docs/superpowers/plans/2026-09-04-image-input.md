@@ -1220,8 +1220,15 @@ class TeamsImageDownloader(InputFileDownloader):
         async with httpx.AsyncClient(timeout=DOWNLOAD_TIMEOUT_S,
                                      follow_redirects=False) as client:
             for url, declared_type in images:
-                downloaded = await self._fetch(client, url, declared_type,
-                                               token)
+                # 消除校验器/取用器差分:select_images 校验的是 urlparse(url)
+                # 的结果,而 httpx/yarl 会对原始字符串**重新解析**。两个解析器
+                # 对同一字符串理解不同时,校验就形同虚设。实测两类输入存在差分
+                # (URL 内嵌 CRLF、前导空白),今日均 fail-closed —— httpx 抛
+                # InvalidURL、yarl 把 CRLF 百分号编码后 host 不变 —— 但那是
+                # 依赖库当前行为带来的运气,不是设计保证。用已校验过的解析结果
+                # 重新序列化,让校验与取用看到同一个 URL。
+                downloaded = await self._fetch(client, urlparse(url).geturl(),
+                                               declared_type, token)
                 if downloaded is not None:
                     files.append(downloaded)
         return files
