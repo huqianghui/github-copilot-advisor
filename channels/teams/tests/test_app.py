@@ -188,6 +188,45 @@ def test_openai_logger_pinned_to_info():
     assert logging.getLogger("openai").level == logging.INFO
 
 
+def test_app_log_level_applies_even_when_root_already_has_a_handler():
+    """OPENAI_LOG 一设,openai 就在**导入期**通过 _basic_config() 给 root 装了
+    handler。CPython 的 logging.basicConfig 里,level 的赋值在
+    `if len(root.handlers) == 0` 分支内 —— root 已有 handler 时它提前返回,
+    level 根本没应用(实测:root 停在 WARNING)。
+
+    后果很讽刺:运维为排查图片问题去开 OPENAI_LOG,会**同时**丢掉
+    teams_adapter.bot 的逐消息遥测和 advisor_agent.core 的 advisor_event
+    审计行 —— 带 image_count 的正是后者,正是他要看的东西。
+
+    上面的 test_openai_logger_pinned_to_info 抓不到这个:它用直接 setLevel
+    模拟环境变量,绕过了"装 handler"这个副作用,而副作用才是致病的那一半。
+    所以这里必须真的把 root 置成"已有 handler"的状态再调 —— 假协作者太简单
+    正是这条缺陷躲过一整轮测试的原因。
+
+    断言落在业务 logger 的 isEnabledFor 上,而不只是 root.level:
+    前者才是"这条日志到底出不出得来"。
+    """
+    import logging
+
+    import teams_adapter.__main__ as entry
+
+    root = logging.getLogger()
+    saved_handlers, saved_level = root.handlers[:], root.level
+    try:
+        # 模拟 openai 导入期 _basic_config() 的效果:root 上已有 handler,
+        # 且 level 还是默认的 WARNING
+        root.handlers = [logging.StreamHandler()]
+        root.setLevel(logging.WARNING)
+
+        entry._configure_logging()
+
+        assert root.level == logging.INFO
+        assert logging.getLogger("teams_adapter.bot").isEnabledFor(logging.INFO)
+        assert logging.getLogger("advisor_agent.core").isEnabledFor(logging.INFO)
+    finally:
+        root.handlers, root.level = saved_handlers, saved_level
+
+
 def test_main_activates_the_openai_logger_pin(monkeypatch):
     """防线必须真的被启动路径激活 —— 只证明 _configure_logging 有效还不够。
     断言的是结果(logger 级别),不是"某个函数被调用过"。"""
