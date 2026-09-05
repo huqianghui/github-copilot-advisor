@@ -38,10 +38,13 @@ def _configure_logging() -> None:
     # 导入期 setup_logging() 之后覆盖,确保生产环境改环境变量也打不开。
     logging.getLogger("openai").setLevel(logging.INFO)
     ms = logging.getLogger("microsoft_agents")
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
-    ms.addHandler(handler)
+    # 幂等:原先无条件 addHandler,每调一次就多挂一个 handler、日志多打一行。
+    # main() 只跑一次时无害,但测试会反复调用它,重复挂载是真实的。
+    if not ms.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+        ms.addHandler(handler)
     ms.setLevel(logging.INFO)
     ms.propagate = False
 

@@ -241,3 +241,22 @@ def test_main_activates_the_openai_logger_pin(monkeypatch):
     logging.getLogger("openai").setLevel(logging.DEBUG)   # 模拟 OPENAI_LOG=debug
     entry.main()
     assert logging.getLogger("openai").level == logging.INFO
+
+
+def test_configure_logging_is_idempotent():
+    """原先无条件 addHandler,每调一次就多挂一个 handler、日志多打一行。
+    main() 只跑一次时无害,但测试会反复调用它 —— 断言的是 handler 数量
+    不随调用次数增长,而不是"某个分支被走到"。"""
+    import logging
+
+    import teams_adapter.__main__ as entry
+
+    ms = logging.getLogger("microsoft_agents")
+    saved = list(ms.handlers)
+    try:
+        ms.handlers = []
+        for _ in range(3):
+            entry._configure_logging()
+        assert len(ms.handlers) == 1
+    finally:
+        ms.handlers = saved
