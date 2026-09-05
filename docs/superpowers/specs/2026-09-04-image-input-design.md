@@ -278,8 +278,30 @@ assistant 回答写入会话历史,这就是决策 3 中"图片信息的历史�
 只说明"图中含敏感信息已略过"。
 
 理由:截图本身已经在群里,群成员都看得到,复述不构成对群成员的新泄漏;
-但 agent 把 token 转成**文本**会让它进入会话历史、`AdvisorEvent.question_summary`
-以及 Application Insights 日志 —— 这是图片输入新增的泄漏面,原本不存在。
+但 agent 把 token 转成**文本**会让它进入**会话历史** —— `core.py` 把
+`response.markdown`(含复述)写进 `SessionStore`。这是图片输入新增的泄漏面,
+原本不存在。
+
+规则 10 的作用域还须覆盖**工具参数**:规则 9 要求把图中错误文本作为
+`search_solutions` 的 query 主体,而 query 会被原样 POST 给 Tavily / Brave
+(`search/web.py`)—— 那是第三方 egress。只禁止"复述到回答里"堵不住这条。
+
+### 7.1 规则 10 保护范围的准确边界(2026-09-05 经代码核实修正)
+
+早先本节称该泄漏面有三处 sink,**其中两处不成立**,记录以免后人误信:
+
+| Sink | 是否被规则 10 保护 | 依据 |
+|------|--------------------|------|
+| 会话历史 | ✅ 是 | `core.py` 把 `response.markdown` 写进 `SessionStore` |
+| `AdvisorEvent.question_summary` | ❌ **否** | 它取自 `marked_text`,而 `marked_text` 构造自 `request.text` —— **用户自己打的字**,模型的复述永远到不了 |
+| Application Insights 日志 | ❌ **否** | `response.markdown` 全仓无任何 logger 调用记录它;`_log_event` 只 dump `AdvisorEvent` |
+
+**由此暴露一条 prompt 层结构上无法覆盖的路径**:用户若把密钥**打字**进消息,
+它会直接进入 `question_summary` 与 App Insights,与规则 10 无关 ——
+该字段的来源是用户输入而非模型输出。
+
+这条路径**在图片输入之前就存在**,不是本功能引入的,因此不在本计划范围内。
+若要处理,需在 `core.py` 构造 `question_summary` 时做脱敏,属独立任务。
 
 ## 8. 会话历史
 
