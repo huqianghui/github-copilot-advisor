@@ -80,6 +80,28 @@ async def test_credits_usage_sends_required_api_version_header():
 
 
 @respx.mock
+async def test_credits_request_keeps_auth_alongside_per_request_version_header():
+    """三个头必须**同时**在场:credits 是唯一一个既带 client 级 headers
+    (Accept + Authorization)又带 per-request headers(版本头)的请求。
+
+    httpx 对两级 headers 是合并而非替换,所以现状是对的 —— 但这条不变式此前
+    没有任何测试钉住。它失效的方式是静默的:Authorization 一旦被顶掉,请求变成
+    401,而 tools.py 的 except 会把它吞成一句"可能是 token 权限不足或已过期"。
+    客户于是拿到一个**自我掩盖的错误诊断**,被指向去查 PAT scope,而真正的
+    原因在这一行 —— 与刚在 PAT scope 上修过的是同一种坑。
+
+    三者写在一条测试里而不是拆开,是因为要断言的是"合并"这一个行为:
+    单独测版本头抓不到 auth 丢失,单独测 auth 抓不到版本头丢失。
+    """
+    route = mock_credits()
+    await CopilotUsageClient().lookup("credits_usage", "acme", "tok")
+    headers = route.calls.last.request.headers
+    assert headers["Authorization"] == "Bearer tok"          # client 级
+    assert headers["Accept"] == "application/vnd.github+json"  # client 级
+    assert headers["X-GitHub-Api-Version"] == "2026-03-10"   # per-request
+
+
+@respx.mock
 async def test_credits_usage_sums_net_quantity_across_all_items():
     mock_credits()
     out = await CopilotUsageClient().lookup("credits_usage", "acme", "tok")
