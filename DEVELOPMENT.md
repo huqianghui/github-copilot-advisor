@@ -1,6 +1,7 @@
 # Development
 
-This repo is a `uv` workspace with two members: `shared` and `ingestion`.
+This repo is a `uv` workspace with four members: `shared`, `ingestion`,
+`agent` and `channels/teams`.
 
 ## Setup
 
@@ -9,9 +10,9 @@ uv sync --all-packages
 ```
 
 Plain `uv sync` only installs the root project — it will **not** install the
-`shared` and `ingestion` workspace member packages into the venv, so their
-imports (`ingestion.*`, `advisor_shared.*`) will fail. Always use
-`--all-packages`.
+workspace member packages into the venv, so their imports
+(`advisor_shared.*`, `ingestion.*`, `advisor_agent.*`, `teams_adapter.*`)
+will fail. Always use `--all-packages`.
 
 ## Corporate networks
 
