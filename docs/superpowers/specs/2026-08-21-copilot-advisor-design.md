@@ -303,6 +303,9 @@ Teams 客户端(@提及 / 1:1)
 - conversation_key(Teams adapter 私有推导规则):直接取 Teams conversation.id ——
   channel 回帖时其值为 `"{channel_id};messageid={根消息ID}"`,天然同串共享会话;1:1 即会话 id
 - 本地开发:dev tunnel / Bot Framework Emulator / 测试租户
+- 图片输入:支持 Teams inline image(报错截图/配置截图/纯图片),
+  详见 `2026-09-04-image-input-design.md`。图片不进会话历史,
+  靠 system prompt 规则 9 的复述承载
 
 ## 9. 升级流程与联系人配置 ✅(已确认)
 
@@ -371,6 +374,8 @@ channels:
 | ingestion 单源失败 | 隔离,其他源继续;摘要报告标红,exit code 非 0 供告警 |
 | LLM 提炼失败(单条) | 跳过并记录,不中断批次 |
 | 会话存储丢失 | 优雅降级为单轮问答 |
+| 图片下载失败/超时 | 跳过该图以文本继续;无图存活且文本为空则提示改贴文字 |
+| 带图请求被拒(400) | MAFBackend 内剥图重试一次,回答附不归因的未处理说明 |
 
 ### 10.2 可观测性(v1 不自建控制台,用 Azure 原生栈)
 
