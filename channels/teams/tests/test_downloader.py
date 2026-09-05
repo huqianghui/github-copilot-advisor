@@ -8,6 +8,7 @@ import pytest
 import respx
 from microsoft_agents.activity import Activity
 
+from teams_adapter.bot import _activity_to_dict, _raw_image_count
 from teams_adapter.downloader import (
     MAX_IMAGE_BYTES,
     MAX_IMAGES,
@@ -119,6 +120,56 @@ def test_content_type_is_normalized_to_lowercase():
     assert select_images(attachments_activity(
         [{"contentType": "IMAGE/PNG", "contentUrl": GOOD_URL}]).attachments
     ) == [(GOOD_URL, "image/png")]
+
+
+def test_every_downloadable_attachment_is_also_counted_as_a_raw_image():
+    """跨接缝(Task 7 downloader ↔ Task 9 bot):select_images 愿意下载的每一张,
+    _raw_image_count 都必须数进去。
+
+    两侧口径本就不等价,而且必须不等价:_raw_image_count 要把"下载器拒了的图"
+    也算成未能获取(image/svg+xml、非白名单 host 都属此列),所以它数得比
+    select_images 多。真正的不变式是单向包含 —— **能下的一定被数到**。
+
+    包含关系一旦破,skipped = raw_images - len(images) 就会算出 0:图片全灭时
+    agent 照常回答,用户以为截图被看过了(谎报);纯图片消息更会因
+    raw_images == 0 走 is_empty 提前返回,一个字都不回。
+
+    唯一能违反它的输入是 image/ 前缀带大写 —— select_images 比对白名单前先
+    .lower()(即上一条 test_content_type_is_normalized_to_lowercase 钉住的契约),
+    而裸 startswith("image/") 不认。所以批次里必须有大写样本。
+
+    断言刻意让两个函数**互相**对照,而不是各自跟"预期几张"这类常量比:
+    后者形同虚设 —— 同时收窄两侧照样全绿。这也是为什么此处不写
+    len(downloadable) == 3 之类的数字。
+    """
+    # 大写样本排在最前:MAX_IMAGES 从尾部截断,排后面会被截掉,
+    # 这条用例就退化成只测小写了。可下载数(3)刻意留在 MAX_IMAGES 之下。
+    content_types = [
+        "IMAGE/PNG",        # 大写 —— 下载器收,裸 startswith 的计数器漏掉
+        "Image/Jpeg",       # 混合大小写,同上
+        "image/png",        # 小写基线:两侧本来就一致
+        "image/svg+xml",    # 是图片但 Azure OpenAI 读不了 → 数得到、下不了
+        "IMAGE/BMP",        # 同上,且大写:计数器漏它同样会少报
+        "text/html",        # 压根不是图片 → 两侧都不该收
+        "APPLICATION/PDF",
+    ]
+    attachments = [{"contentType": ct, "contentUrl": f"{GOOD_URL}/{i}"}
+                   for i, ct in enumerate(content_types)]
+    activity = attachments_activity(attachments)
+
+    downloadable = {url for url, _ in select_images(activity.attachments)}
+    # _raw_image_count 只给出一个 int,逐张问它才能还原成可与 URL 集合比对的形状
+    counted = {a["contentUrl"] for a in attachments
+               if _raw_image_count(_activity_to_dict(attachments_activity([a])))}
+
+    # 上面那次逐张分解只有在 _raw_image_count 可加时才等价于整批调用;
+    # 先把这一点钉住,否则下面的集合比较可能建立在错误的还原上
+    assert _raw_image_count(_activity_to_dict(activity)) == len(counted)
+    # 核心:接缝不变式,两个函数互相对照
+    assert downloadable <= counted, downloadable - counted
+    # 防退化:批次真的把大写样本喂到了 downloader 这一侧并被接受 ——
+    # 否则上面的包含关系可以靠"downloadable 为空"廉价成立
+    assert f"{GOOD_URL}/0" in downloadable
 
 
 @pytest.mark.parametrize("host", ["smba.trafficmanager.net",

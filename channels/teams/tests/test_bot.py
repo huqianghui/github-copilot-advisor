@@ -194,6 +194,62 @@ async def test_non_image_input_files_are_not_forwarded():
     assert core.requests[0].text == "登录失败"
 
 
+async def test_uppercase_mime_survives_the_raw_count_minus_images_arithmetic():
+    """_to_image_inputs 与 _raw_image_count 必须同口径 —— skipped 是两者相减。
+
+    downloader 那侧已钉死"大写 MIME 是合法、可下载的图片"
+    (test_downloader.py::test_content_type_is_normalized_to_lowercase),而
+    input_files 是 SDK 的通用附件管线,换个 downloader 就可能原样带着
+    "IMAGE/PNG" 进来。两侧口径一旦不一致,那个减法就会说谎,且方向相反:
+      - 只有 _to_image_inputs 漏大写 → skipped=1,谎称"另有 1 张未能获取",
+        可图明明取到了,而且它压根没进 core(少报 + 真丢图);
+      - 只有 _raw_image_count 漏大写 → skipped=0,图片全灭也不吭声(谎报)。
+    所以这条与 test_downloader.py 里那条跨接缝用例是一对,各钉一个方向;
+    单独留任何一条,另一侧的 .lower() 都能被"清理"掉而全绿(实测过)。
+
+    断言 mime_type 是小写而非原样,还钉住了另一条实测约束:
+    ImageInput 的正则 ^image/[\\w.+-]+$ 里 image/ 是字面量,所以不能只拿
+    .lower() 做判断、再把原值传进去 —— mime_type="IMAGE/PNG" 会
+    ValidationError,而这个调用在 on_message 的 try 之外,直接杀死整个 turn。
+    """
+    core = StubCore()
+    handler = register_handlers(_agent_app(), core)
+    activity = group_activity()
+    activity.attachments = [
+        Attachment(content_type="IMAGE/PNG", content_url="https://x/1")]
+    state = _state_with_files(
+        InputFile(content=b"P", content_type="IMAGE/PNG", content_url=None))
+    await handler(FakeTurnContext(activity), state)
+    assert [(i.data, i.mime_type) for i in core.requests[0].images] == [
+        (b"P", "image/png")]
+    assert core.requests[0].text == "登录失败"    # 一张没丢 ⇒ 不许挂尾巴
+
+
+async def test_input_file_with_empty_content_is_skipped_not_fatal():
+    """SDK 的 InputFile 是**无校验的 dataclass**,content=None 能被构造出来;
+    交给 ImageInput.data 会抛 ValidationError。而 _to_image_inputs 的调用在
+    on_message 的 try 之外 —— 抛出去就越过 fallback 杀死整个 turn:
+    没有回复、没有 FALLBACK_MESSAGE。今天不出事只是因为 _fetch 拒绝空 body,
+    那是下载器的实现细节,不是这一层的保证,换个 downloader 就没了。
+
+    行为选的是"跳过"而不是"走 fallback":空 content 等价于这张图没取到,
+    跳过后它会被算进 skipped,用户收到"另有 1 张未能获取"这句诚实的提示,
+    正文照样得到回答;走 fallback 则连正文的答案一起丢掉。
+    """
+    core = StubCore()
+    handler = register_handlers(_agent_app(), core)
+    activity = group_activity()
+    activity.attachments = [_image_attachment("https://x/1"),
+                            _image_attachment("https://x/2")]
+    state = _state_with_files(
+        InputFile(content=None, content_type="image/png", content_url=None),
+        InputFile(content=b"P", content_type="image/png", content_url=None))
+    ctx = FakeTurnContext(activity)
+    await handler(ctx, state)
+    assert [i.data for i in core.requests[0].images] == [b"P"]
+    assert core.requests[0].text == "登录失败(另有 1 张图片未能获取)"
+
+
 async def test_text_only_message_still_has_no_images():
     """回归:无附件时行为与改动前一致。"""
     core = StubCore()
