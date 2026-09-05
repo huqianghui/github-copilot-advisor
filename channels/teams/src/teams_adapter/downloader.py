@@ -5,14 +5,21 @@
   1. 精确 host 白名单,host 不在其中一律跳过,不发起任何请求
      —— 由本文件的 select_images 落实,已生效
   2. 不跟随重定向 —— 跟随会把 Authorization 带到重定向目标
-     —— 尚未实现,由 Task 7 的 _fetch 落实
+     —— 由 TeamsImageDownloader 的 follow_redirects=False 落实,已生效
   3. 401/403 后绝不自动重试加 token —— 这正是该漏洞的成因
-     —— 尚未实现,由 Task 7 的 _fetch 落实
-本文件目前只有第 1 条:它是纯函数,不发起任何网络请求。
+     —— 由 _fetch 落实(非 200 一律放弃,不重试),已生效
+select_images 是纯函数,不发起任何网络请求;唯一出网的地方是 _fetch。
 本模块刻意不支持 file upload 附件(SharePoint downloadUrl),见 spec §12。
 """
 import logging
 from urllib.parse import urlparse
+
+import httpx
+from microsoft_agents.hosting.core import TurnContext
+from microsoft_agents.hosting.core.app.input_file import (
+    InputFile,
+    InputFileDownloader,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,3 +67,78 @@ def select_images(attachments) -> list[tuple[str, str]]:
         if len(selected) >= MAX_IMAGES:
             break
     return selected
+
+
+class TeamsImageDownloader(InputFileDownloader):
+    """下载 Teams inline image。由 AgentApplication 的 file_downloaders 管线调用,
+    结果写入 state.temp.input_files。"""
+
+    def __init__(self, connection_manager):
+        self._connection_manager = connection_manager
+
+    async def download_files(self, context: TurnContext) -> list[InputFile]:
+        if context.activity.channel_id != TEAMS_CHANNEL_ID:
+            return []
+        images = select_images(context.activity.attachments)
+        if not images:
+            return []                     # 无图不取 token
+        try:
+            token = await self._access_token(context)
+        except Exception:
+            logger.exception("failed to acquire bot token for attachments")
+            return []
+
+        files: list[InputFile] = []
+        # follow_redirects=False:跟随会把 Authorization 带到重定向目标
+        async with httpx.AsyncClient(timeout=DOWNLOAD_TIMEOUT_S,
+                                     follow_redirects=False) as client:
+            for url, declared_type in images:
+                # 消除校验器/取用器差分:select_images 校验的是 urlparse(url)
+                # 的结果,而 httpx/yarl 会对原始字符串**重新解析**。两个解析器
+                # 对同一字符串理解不同时,校验就形同虚设。实测两类输入存在差分
+                # (URL 内嵌 CRLF、前导空白),今日均 fail-closed,但那是依赖库
+                # 当前行为带来的运气,不是设计保证。
+                downloaded = await self._fetch(client, urlparse(url).geturl(),
+                                               declared_type, token)
+                if downloaded is not None:
+                    files.append(downloaded)
+        return files
+
+    async def _access_token(self, context: TurnContext) -> str:
+        provider = self._connection_manager.get_token_provider_from_activity(
+            context.identity, context.activity)
+        return await provider.get_access_token(
+            context.identity.get_token_audience(),
+            context.identity.get_token_scope())
+
+    async def _fetch(self, client: httpx.AsyncClient, url: str,
+                     declared_type: str, token: str) -> InputFile | None:
+        try:
+            response = await client.get(
+                url, headers={"Authorization": f"Bearer {token}"})
+        except Exception:
+            logger.warning("attachment download failed: %s", url, exc_info=True)
+            return None
+
+        if response.status_code != 200:
+            # 绝不在 401/403 后重试加 token(GHSA-7vwx-582j-j332)
+            logger.warning("attachment download status=%s url=%s",
+                           response.status_code, url)
+            return None
+
+        content = response.content
+        # 空 body 的 200 也要挡:放过去会一路走到 "data:image/png;base64,"
+        # 然后由 Azure OpenAI 报 400,白烧一次往返还触发剥图降级。
+        if not content or len(content) > MAX_IMAGE_BYTES:
+            logger.warning("attachment size rejected (%d bytes), skipped",
+                           len(content))
+            return None
+
+        content_type = (response.headers.get("content-type", "")
+                        .split(";")[0].strip().lower())
+        if content_type not in SUPPORTED_IMAGE_TYPES:
+            # 响应头不可信时退回 select_images 已校验过的声明类型,
+            # 而不是无脑塞 image/png —— 那会把 GIF 谎报成 PNG。
+            content_type = declared_type
+        return InputFile(content=content, content_type=content_type,
+                         content_url=url)

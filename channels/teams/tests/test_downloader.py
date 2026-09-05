@@ -3,10 +3,17 @@
 
 只覆盖纯函数的选取逻辑;实际下载(重定向、超时、大小上限、token)属 Task 7。
 """
+import httpx
 import pytest
+import respx
 from microsoft_agents.activity import Activity
 
-from teams_adapter.downloader import MAX_IMAGES, select_images
+from teams_adapter.downloader import (
+    MAX_IMAGE_BYTES,
+    MAX_IMAGES,
+    TeamsImageDownloader,
+    select_images,
+)
 
 GOOD_URL = "https://smba.trafficmanager.net/amer/v3/attachments/1/views/original"
 EVIL_URL = "https://evil.example.com/steal"
@@ -131,3 +138,156 @@ def test_accepts_every_supported_type_on_every_allowed_host(host, content_type):
     assert select_images(attachments_activity(
         [{"contentType": content_type, "contentUrl": url}]).attachments
     ) == [(url, content_type)]
+
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 32
+
+
+class StubIdentity:
+    def get_token_audience(self):
+        return "https://api.botframework.com"
+
+    def get_token_scope(self):
+        return ["https://api.botframework.com/.default"]
+
+
+class StubProvider:
+    async def get_access_token(self, resource_url, scopes, force_refresh=False):
+        return "TOKEN"
+
+
+class StubConnectionManager:
+    def get_token_provider_from_activity(self, identity, activity):
+        return StubProvider()
+
+
+class FakeContext:
+    def __init__(self, activity):
+        self.activity = activity
+        self.identity = StubIdentity()
+
+
+def downloader() -> TeamsImageDownloader:
+    return TeamsImageDownloader(StubConnectionManager())
+
+
+async def download(attachments: list[dict], channel_id="msteams"):
+    activity = attachments_activity(attachments)
+    activity.channel_id = channel_id
+    return await downloader().download_files(FakeContext(activity))
+
+
+IMAGE_ATTACHMENT = [{"contentType": "image/png", "contentUrl": GOOD_URL}]
+
+
+@respx.mock
+async def test_downloads_with_bearer_token():
+    route = respx.get(GOOD_URL).mock(return_value=httpx.Response(
+        200, content=PNG, headers={"content-type": "image/png"}))
+    files = await download(IMAGE_ATTACHMENT)
+    assert len(files) == 1
+    assert files[0].content == PNG
+    assert files[0].content_type == "image/png"
+    assert route.calls[0].request.headers["authorization"] == "Bearer TOKEN"
+
+
+@respx.mock
+async def test_never_requests_non_allowlisted_host():
+    """安全回归:非白名单 host 一次请求都不能发出。"""
+    route = respx.get(EVIL_URL).mock(return_value=httpx.Response(200, content=PNG))
+    files = await download([{"contentType": "image/png", "contentUrl": EVIL_URL}])
+    assert files == []
+    assert route.called is False
+
+
+@respx.mock
+async def test_does_not_follow_redirects():
+    """安全回归:跟随重定向会把 Authorization 带到重定向目标。"""
+    first = respx.get(GOOD_URL).mock(return_value=httpx.Response(
+        302, headers={"location": EVIL_URL}))
+    evil = respx.get(EVIL_URL).mock(return_value=httpx.Response(200, content=PNG))
+    files = await download(IMAGE_ATTACHMENT)
+    assert files == []
+    assert first.called is True
+    assert evil.called is False
+
+
+@respx.mock
+async def test_401_is_not_retried():
+    """安全回归:401 后重试加 token 正是 GHSA-7vwx-582j-j332 的成因。"""
+    route = respx.get(GOOD_URL).mock(return_value=httpx.Response(401))
+    files = await download(IMAGE_ATTACHMENT)
+    assert files == []
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_oversized_image_skipped():
+    respx.get(GOOD_URL).mock(return_value=httpx.Response(
+        200, content=b"0" * (MAX_IMAGE_BYTES + 1),
+        headers={"content-type": "image/png"}))
+    assert await download(IMAGE_ATTACHMENT) == []
+
+
+@respx.mock
+async def test_empty_body_skipped():
+    """空 body 的 200 若放过去,会变成空 data URL 并被 Azure OpenAI 拒,
+    白烧一次往返还误触剥图降级。"""
+    respx.get(GOOD_URL).mock(return_value=httpx.Response(
+        200, content=b"", headers={"content-type": "image/png"}))
+    assert await download(IMAGE_ATTACHMENT) == []
+
+
+@respx.mock
+async def test_network_error_does_not_raise():
+    """图片是增强,不能成为新的失败源。"""
+    respx.get(GOOD_URL).mock(side_effect=httpx.ConnectError("boom"))
+    assert await download(IMAGE_ATTACHMENT) == []
+
+
+@respx.mock
+async def test_unusable_response_content_type_falls_back_to_declared():
+    """响应头不可信时用 select_images 已校验过的声明类型,
+    不能无脑塞 image/png —— 那会把 GIF 谎报成 PNG。"""
+    respx.get(GOOD_URL).mock(return_value=httpx.Response(
+        200, content=PNG, headers={"content-type": "application/octet-stream"}))
+    files = await download([{"contentType": "image/gif", "contentUrl": GOOD_URL}])
+    assert files[0].content_type == "image/gif"
+
+
+@respx.mock
+async def test_non_teams_channel_skipped():
+    """非 msteams 频道一次请求都不发。
+
+    断言必须落在"有没有发出请求"上,只断言返回 [] 抓不到东西:不挂
+    @respx.mock 时,去掉频道守卫会真的去打 smba.trafficmanager.net,而
+    连不通(被 _fetch 的 except 吞掉)和 401(非 200 分支)都返回 [],
+    测试照样全绿。实测:去掉守卫后该用例真的发出了带 Bearer 的请求、
+    收到线上 401,仍然 PASSED —— 顺带把 token 递给了真实网络。
+    """
+    route = respx.get(GOOD_URL).mock(return_value=httpx.Response(
+        200, content=PNG, headers={"content-type": "image/png"}))
+    assert await download(IMAGE_ATTACHMENT, channel_id="webchat") == []
+    assert route.called is False
+
+
+async def test_no_attachments_makes_no_token_call():
+    """无图消息不取 token。
+
+    观测点必须是"取 token 这一步有没有被调用",不能靠假 connection manager
+    抛异常来表达:AssertionError 也是 Exception,会被 _access_token 外面的
+    try/except 吞掉,返回同样的 [],于是"有短路"与"无短路"两条分支产生
+    完全相同的可观测结果(实测:去掉短路后 28 passed,变异存活)。
+    """
+    token_calls = []
+
+    class RecordingConnectionManager:
+        def get_token_provider_from_activity(self, identity, activity):
+            token_calls.append(activity)
+            return StubProvider()
+
+    activity = attachments_activity([])
+    files = await TeamsImageDownloader(
+        RecordingConnectionManager()).download_files(FakeContext(activity))
+    assert files == []
+    assert token_calls == []
