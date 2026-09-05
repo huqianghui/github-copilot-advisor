@@ -66,9 +66,13 @@ cases:
     expected_stage_in: [kb_hit, live_hit, web, generic_advice]
     expect_answer_contains_any: ["认证", "登录", "Authentication"]
     reply_language: zh
+  # 刻意不设 reply_language:纯图片消息没有"提问语言",而设计决策 9 的
+  # "回答语言跟随提问语言"在此无定义。截图又是英文 settings.json,
+  # 模型没有理由用中文答 —— 断言 zh 会把正确回答判失败。
+  # 且 is_mostly_chinese 是 han > latin * 0.5,而正确的中文回答要引用
+  # github.copilot.enable 加一段 JSON,latin 很重,即便真用中文也可能翻车。
   - id: image-config-screenshot-no-text
     text: ""
     images: [fixtures/config_screenshot.png]
     expected_stage_in: [kb_hit, live_hit, web, generic_advice]
     expect_answer_contains_any: ["github.copilot.enable", "配置", "settings"]
-    reply_language: zh
