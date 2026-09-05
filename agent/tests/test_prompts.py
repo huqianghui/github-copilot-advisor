@@ -30,13 +30,11 @@ def test_prompt_mentions_usage_lookup_rule():
 
 
 def test_prompt_has_image_handling_rule():
-    from advisor_agent.prompts import SYSTEM_PROMPT
     assert "复述" in SYSTEM_PROMPT
     assert "search_solutions 的 query 主体" in SYSTEM_PROMPT
 
 
 def test_prompt_forbids_echoing_secrets_from_images():
-    from advisor_agent.prompts import SYSTEM_PROMPT
     for word in ("token", "API key", "cookie"):
         assert word in SYSTEM_PROMPT
     assert "已略过" in SYSTEM_PROMPT
