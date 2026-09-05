@@ -388,3 +388,24 @@ async def test_no_attachments_makes_no_token_call():
         RecordingConnectionManager()).download_files(FakeContext(activity))
     assert files == []
     assert token_calls == []
+
+
+async def test_malformed_url_does_not_escape_as_an_exception():
+    """download_files 必须永不抛 —— SDK 那侧没有任何网接着。
+
+    agent_application.py 的 _handle_file_downloads 是裸
+    `await file_downloader.download_files(context)`,外层 _on_turn 只
+    `except ApplicationError`,所以 ValueError / AttributeError / httpx.* 会一路
+    穿透到 aiohttp。后果不是"这张图没下到",而是整个 turn 死掉:没有回复、
+    没有 FALLBACK_MESSAGE、没有 typing 指示器,连 turn_state.save() 都被跳过 ——
+    比图片丢失严重得多,而且从用户视角完全静默。
+
+    'https://[abc' 是实测挑的:Attachment 对 content_url 不做任何校验照单全收,
+    urlparse 到它就抛 ValueError('Invalid IPv6 URL')。select_images 里那段
+    "永不抛异常"的注释守的是 urlparse(None) —— 守不住格式错误的字符串。
+
+    断言必须是"返回 []"而不是 pytest.raises 的反面:静默吞掉异常但返回 None
+    会让 SDK 的 input_files.extend(None) 再炸一次,等于没修。
+    """
+    assert await download([{"contentType": "image/png",
+                            "contentUrl": "https://[abc"}]) == []

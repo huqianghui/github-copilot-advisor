@@ -90,6 +90,27 @@ class TeamsImageDownloader(InputFileDownloader):
         self._connection_manager = connection_manager
 
     async def download_files(self, context: TurnContext) -> list[InputFile]:
+        """SDK 不保护这个方法:agent_application.py 的 _handle_file_downloads 是
+        裸 `await file_downloader.download_files(context)`,而外层 _on_turn 只
+        `except ApplicationError` —— ValueError / AttributeError / httpx.* 都会
+        穿透到 aiohttp。后果不是"这张图没下到",而是整个 turn 死掉:没有回复、
+        没有 FALLBACK_MESSAGE、没有 typing 指示器,连 turn_state.save() 都被跳过。
+
+        本文件开头声称"图片处理永不抛异常"(spec §5.3),那句话此前只由
+        select_images 里对 url 为空的短路守着,守不住格式错误的字符串:
+        Attachment 对 content_url 不做任何校验,而 urlparse('https://[abc')
+        抛 ValueError('Invalid IPv6 URL')(两者均已实测)。这层 except 就是
+        那句不变式的实现,不是可有可无的防御性代码。
+        """
+        try:
+            return await self._download_all(context)
+        except Exception:
+            # 兜底,不是替代:_access_token 那处的内层 except 保留着,
+            # 它给的是"取 token 失败"这条精确日志,这里只知道"某处炸了"。
+            logger.exception("image download failed, continuing without images")
+            return []
+
+    async def _download_all(self, context: TurnContext) -> list[InputFile]:
         if context.activity.channel_id != TEAMS_CHANNEL_ID:
             return []
         images = select_images(context.activity.attachments)
