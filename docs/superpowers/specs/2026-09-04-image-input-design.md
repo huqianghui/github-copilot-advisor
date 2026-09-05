@@ -283,8 +283,20 @@ assistant 回答写入会话历史,这就是决策 3 中"图片信息的历史�
 原本不存在。
 
 规则 10 的作用域还须覆盖**工具参数**:规则 9 要求把图中错误文本作为
-`search_solutions` 的 query 主体,而 query 会被原样 POST 给 Tavily / Brave
+`search_solutions` 的 query 主体,而 query 会被原样送给 Tavily / Brave
 (`search/web.py`)—— 那是第三方 egress。只禁止"复述到回答里"堵不住这条。
+
+两条 provider 路径的暴露程度不同,**Brave 更糟**:
+
+| Provider | query 位置 | 暴露面 |
+|----------|-----------|--------|
+| Tavily | POST body(`json={"query": ...}`) | provider 端日志 |
+| Brave | **URL query string**(`params={"q": ...}`) | provider 日志 **+ 沿途所有代理的访问日志** |
+
+本产品的用户恰恰坐在企业出口代理之后(规则 6 存在的全部理由就是这个),
+所以 Brave 那条路径上,密钥会额外落进客户自己的代理日志。这也让规则 10
+末句 `会让它进入会话历史与日志` 里的"日志"二字**有了真实指代** ——
+在工具 query 纳入作用域之前,那半句其实是没有代码依据的。
 
 ### 7.1 规则 10 保护范围的准确边界(2026-09-05 经代码核实修正)
 
