@@ -3,8 +3,12 @@
 
 安全约束(GHSA-7vwx-582j-j332 —— Teams 附件下载器泄漏 bot bearer token):
   1. 精确 host 白名单,host 不在其中一律跳过,不发起任何请求
+     —— 由本文件的 select_images 落实,已生效
   2. 不跟随重定向 —— 跟随会把 Authorization 带到重定向目标
+     —— 尚未实现,由 Task 7 的 _fetch 落实
   3. 401/403 后绝不自动重试加 token —— 这正是该漏洞的成因
+     —— 尚未实现,由 Task 7 的 _fetch 落实
+本文件目前只有第 1 条:它是纯函数,不发起任何网络请求。
 本模块刻意不支持 file upload 附件(SharePoint downloadUrl),见 spec §12。
 """
 import logging
@@ -38,6 +42,12 @@ def select_images(attachments) -> list[tuple[str, str]]:
         if content_type not in SUPPORTED_IMAGE_TYPES:
             continue
         url = getattr(attachment, "content_url", None)
+        # 这行不只是省一次 urlparse:本函数没有 try/except,而 spec §5.3 要求
+        # 图片处理永不抛异常。urlparse(None) 不报错,返回 hostname=None 的
+        # ParseResultBytes,眼下靠下游 scheme 检查短路挡住;将来若有人把 host
+        # 判断改成 parsed.hostname.endswith(...) 之类先解引用的写法,None 会
+        # 变成 AttributeError 并连累整个 turn。测试覆盖不到这条(去掉它现有
+        # 用例依然全绿),所以别当它冗余删掉。
         if not url:
             continue
         parsed = urlparse(url)

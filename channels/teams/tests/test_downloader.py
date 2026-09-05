@@ -1,5 +1,9 @@
 # channels/teams/tests/test_downloader.py
-"""TeamsImageDownloader:筛选、白名单与下载安全(图片输入 spec §5)。"""
+"""select_images:附件筛选、格式白名单与 host 白名单(图片输入 spec §5)。
+
+只覆盖纯函数的选取逻辑;实际下载(重定向、超时、大小上限、token)属 Task 7。
+"""
+import pytest
 from microsoft_agents.activity import Activity
 
 from teams_adapter.downloader import MAX_IMAGES, select_images
@@ -43,21 +47,29 @@ def test_rejects_non_https_scheme():
     assert urls_for([{"contentType": "image/png", "contentUrl": plain}]) == []
 
 
-def test_rejects_lookalike_host_suffix():
-    """trafficmanager.net 是共享命名空间,后缀匹配会放进第三方域名。
+def test_rejects_lookalike_host_bypasses():
+    """host 必须精确相等。trafficmanager.net 是共享命名空间,
+    任何"沾边就放行"的写法都会把攻击者可注册的域名放进来。
 
-    四个变体各钉死一种错误写法,少一个都会漏:
-      1. endswith("trafficmanager.net") —— 只有 evil.trafficmanager.net 能证伪
-      2. endswith("smba.trafficmanager.net") —— 缺点边界,evilsmba 能混进来
-      3. "trafficmanager.net" in host —— 子串匹配
-      4. 用 netloc 而非 hostname —— userinfo 段可伪装成白名单 host
-    注意 1 和 2 都不认 attacker.com 那条(它以 attacker.com 结尾),
-    所以只靠第 3 条无法区分精确相等与后缀匹配。
+    下面四个样本是按变异实测挑的,注释即实测结果(勿凭直觉改):
+      S1 evil.trafficmanager.net
+         杀 host.endswith("trafficmanager.net")、"tm.net" in host
+      S2 evilsmba.trafficmanager.net —— 唯一能杀 endswith("smba.trafficmanager.net")
+         的样本:它以该串结尾却缺少点边界
+      S3 smba.trafficmanager.net.attacker.com —— 唯一能杀前缀匹配
+         any(host.startswith(h)) 的样本。attacker.com 可被任意注册,
+         这正是 GHSA-7vwx-582j-j332 泄漏 token 的形状。
+         注意:前面加 "evil-" 会让它不再以 smba.trafficmanager.net 开头,
+         前缀变异就跟着拒绝它,这条样本也就白写了 —— 别加前缀。
+      S4 smba.trafficmanager.net@evil.com
+         杀 netloc.startswith(h) 及在 netloc/整个 URL 上做子串匹配的写法
+    S2、S3 各自唯一钉死一种变异,删不得;S1、S4 对上述变异集属冗余,
+    保留是为了覆盖没枚举到的相邻写法,成本只有两行。
     """
     for lookalike in (
         "https://evil.trafficmanager.net/x",
         "https://evilsmba.trafficmanager.net/x",
-        "https://evil-smba.trafficmanager.net.attacker.com/x",
+        "https://smba.trafficmanager.net.attacker.com/x",
         "https://smba.trafficmanager.net@evil.com/x",
     ):
         assert urls_for(
@@ -70,7 +82,10 @@ def test_skips_attachment_without_url():
 
 
 def test_caps_image_count():
-    many = [{"contentType": "image/png", "contentUrl": GOOD_URL}] * 10
+    # 输入量随 MAX_IMAGES 走:写死 10 的话,一旦有人把 MAX_IMAGES 提到 10,
+    # 就变成喂 10 个断言 10 个,截断逻辑不再被覆盖且没有测试变红。
+    many = ([{"contentType": "image/png", "contentUrl": GOOD_URL}]
+            * (MAX_IMAGES + 3))
     assert len(urls_for(many)) == MAX_IMAGES
 
 
@@ -97,3 +112,22 @@ def test_content_type_is_normalized_to_lowercase():
     assert select_images(attachments_activity(
         [{"contentType": "IMAGE/PNG", "contentUrl": GOOD_URL}]).attachments
     ) == [(GOOD_URL, "image/png")]
+
+
+@pytest.mark.parametrize("host", ["smba.trafficmanager.net",
+                                  "api.botframework.com"])
+@pytest.mark.parametrize("content_type", ["image/png", "image/jpeg",
+                                          "image/webp", "image/gif"])
+def test_accepts_every_supported_type_on_every_allowed_host(host, content_type):
+    """收窄白名单是 fail-closed,不会被上面任何拒绝性用例抓到 ——
+    删掉 api.botframework.com 或 image/gif 全绿。这条把两张白名单钉成
+    双向断言,免得将来一次"清理"静默打掉真实用户的图片。
+
+    这里的 host 与 content_type 必须写死字面量,不能用 sorted(ALLOWED_HOSTS)
+    之类从被测常量取值:那样收窄常量只会少生成几个用例,测试照样全绿,
+    等于没测(实测过,删 image/gif 是 16 passed 而非变红)。
+    """
+    url = f"https://{host}/v3/attachments/1/views/original"
+    assert select_images(attachments_activity(
+        [{"contentType": content_type, "contentUrl": url}]).attachments
+    ) == [(url, content_type)]
