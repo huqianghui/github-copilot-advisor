@@ -8,7 +8,7 @@ import pytest
 import yaml
 
 from advisor_shared.events import AdvisorEvent
-from advisor_shared.messages import AdvisorRequest
+from advisor_shared.messages import AdvisorRequest, ImageInput
 
 pytestmark = pytest.mark.integration
 
@@ -33,10 +33,27 @@ def is_mostly_chinese(text: str) -> bool:
     return han > latin * 0.5
 
 
-def make_request(text: str) -> AdvisorRequest:
+FIXTURES_ROOT = Path(__file__).parent
+
+
+def load_images(case) -> list[ImageInput]:
+    """加载用例声明的截图夹具;缺图时 skip 而非 fail(截图须人工提供,见 fixtures/README.md)。"""
+    images = []
+    for rel_path in case.get("images") or []:
+        path = FIXTURES_ROOT / rel_path
+        if not path.exists():
+            pytest.skip(f"missing image fixture: {path}")
+        images.append(ImageInput(data=path.read_bytes(),
+                                 mime_type="image/png",
+                                 name=path.name))
+    return images
+
+
+def make_request(text: str, images: list[ImageInput] | None = None) -> AdvisorRequest:
     return AdvisorRequest(text=text, conversation_key=f"eval-{hash(text)}",
                           channel_id="19:eval", user_id="u",
-                          user_name="eval", is_group=True)
+                          user_name="eval", is_group=True,
+                          images=images or [])
 
 
 @pytest.mark.parametrize("case", CASES, ids=[c["id"] for c in CASES])
@@ -49,8 +66,10 @@ async def test_eval_case(case):
 
     turns = case.get("multi_turn") or [case["text"]]
     key = f"eval-{case['id']}"
-    for text in turns:
-        req = make_request(text)
+    images = load_images(case)
+    for index, text in enumerate(turns):
+        # 图片只附在第一轮,与真实用户行为一致(后续轮靠会话历史里的文字复述)
+        req = make_request(text, images if index == 0 else None)
         req = req.model_copy(update={"conversation_key": key})
         resp = await core.handle(req)
 
@@ -60,6 +79,11 @@ async def test_eval_case(case):
         assert case["expect_tool_called"] in events[-1].tool_latencies_ms
     if case.get("expect_mention"):
         assert resp.mentions or "@" in resp.markdown or events[-1].mentioned_human
+    keywords = case.get("expect_answer_contains_any") or []
+    if keywords:
+        lowered = resp.markdown.lower()
+        assert any(k.lower() in lowered for k in keywords), \
+            f"none of {keywords} in reply: {resp.markdown[:300]}"
     if case.get("reply_language") == "zh":
         assert is_mostly_chinese(resp.markdown), resp.markdown[:200]
     elif case.get("reply_language") == "en":

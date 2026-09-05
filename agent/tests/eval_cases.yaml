@@ -59,3 +59,16 @@ cases:
     expected_stage_in: [kb_hit, live_hit, web, generic_advice]
     expect_tool_called: copilot_usage_lookup
     reply_language: zh
+  # 图片输入(2026-09-04):断言模型真实读出图中文本并接入检索瀑布
+  - id: image-auth-error-screenshot
+    text: "这是什么问题?怎么解决"
+    images: [fixtures/error_screenshot.png]
+    expected_stage_in: [kb_hit, live_hit, web, generic_advice]
+    expect_answer_contains_any: ["认证", "登录", "Authentication"]
+    reply_language: zh
+  - id: image-config-screenshot-no-text
+    text: ""
+    images: [fixtures/config_screenshot.png]
+    expected_stage_in: [kb_hit, live_hit, web, generic_advice]
+    expect_answer_contains_any: ["github.copilot.enable", "配置", "settings"]
+    reply_language: zh
