@@ -1,5 +1,8 @@
+import asyncio
 import json
 from pathlib import Path
+
+import pytest
 
 from advisor_agent.escalation import EscalationConfig
 from advisor_agent.run_context import new_run
@@ -72,15 +75,23 @@ class StubUsage:
         return self.result
 
 
+class RaisingUsage:
+    def __init__(self, exc):
+        self.exc = exc
+
+    async def lookup(self, question_type, org, token, username=None):
+        raise self.exc
+
+
 def make_tools(tmp_path, combined_payload=None, web=(list(), 0),
-               diagnostics=None, usage_result=None):
+               diagnostics=None, usage_result=None, usage=None):
     p = tmp_path / "e.yaml"
     p.write_text(ESCALATION_YAML, encoding="utf-8")
     payload = combined_payload or {"no_results": True, "results": []}
     return AdvisorTools(StubCombined(payload), StubWeb(web[0], web[1]),
                         EscalationConfig.load(p),
                         diagnostics or StubDiagnostics(),
-                        StubUsage(usage_result))
+                        usage or StubUsage(usage_result))
 
 
 async def test_search_solutions_sets_kb_hit_stage_and_citations(tmp_path):
@@ -151,7 +162,7 @@ async def test_network_diagnostics_records_latency_and_returns_payload(
 
 
 async def test_usage_not_configured_returns_guidance(tmp_path):
-    new_run()
+    run = new_run()
     tools = make_tools(tmp_path)
     out = json.loads(await tools.copilot_usage_lookup(
         "19:zzz", False, "billing_mode", None))   # defaults 无 org 配置
@@ -162,22 +173,54 @@ async def test_usage_not_configured_returns_guidance(tmp_path):
     # 而那个 403 在下面的 except 里被吞成一句含糊的"权限不足"。
     assert "Administration" in out["guidance"]
     assert "billing read" not in out["guidance"]
+    # early return 也必须记账:没配置不等于没被调用。
+    assert "copilot_usage_lookup" in run.tool_latencies_ms
 
 
 async def test_usage_privacy_blocked_in_group(tmp_path, monkeypatch):
     monkeypatch.setenv("ORG_TOKEN_TEST", "tok")
-    new_run()
+    run = new_run()
     tools = make_tools(tmp_path)
     out = json.loads(await tools.copilot_usage_lookup(
         "19:abc", True, "user_usage", "alice"))   # 群聊查个人 → 拦截
     assert out["status"] == "privacy_blocked"
+    # 隐私门禁这条最不能漏:它一旦不记账,遥测里就完全看不到"有人在群里问过
+    # 个人用量、被挡下了",运营会误判成没人问过(spec 10.2)。
+    assert "copilot_usage_lookup" in run.tool_latencies_ms
 
 
 async def test_usage_ok_path_calls_client(tmp_path, monkeypatch):
     monkeypatch.setenv("ORG_TOKEN_TEST", "tok")
-    new_run()
+    run = new_run()
     tools = make_tools(tmp_path, usage_result={"plan_type": "business"})
     out = json.loads(await tools.copilot_usage_lookup(
         "19:abc", True, "billing_mode", None))    # 群聊查汇总 → 允许
     assert out["status"] == "ok"
     assert out["data"]["plan_type"] == "business"
+    assert "copilot_usage_lookup" in run.tool_latencies_ms
+
+
+async def test_usage_client_error_still_records_latency(tmp_path, monkeypatch):
+    """下游异常被 except 吞成 status=error,记账仍要发生。"""
+    monkeypatch.setenv("ORG_TOKEN_TEST", "tok")
+    run = new_run()
+    tools = make_tools(tmp_path, usage=RaisingUsage(RuntimeError("boom")))
+    out = json.loads(await tools.copilot_usage_lookup(
+        "19:abc", True, "billing_mode", None))
+    assert out["status"] == "error"
+    assert "copilot_usage_lookup" in run.tool_latencies_ms
+
+
+async def test_usage_cancelled_mid_lookup_still_records_latency(
+        tmp_path, monkeypatch):
+    """CancelledError 是 BaseException,不被 except Exception 接住,会穿出去。
+
+    真实场景:Teams 请求超时/用户断开时任务被取消。工具**已经被调用过**,
+    遥测必须留下痕迹 —— 这条钉住记账走 finally 而不是 else。
+    """
+    monkeypatch.setenv("ORG_TOKEN_TEST", "tok")
+    run = new_run()
+    tools = make_tools(tmp_path, usage=RaisingUsage(asyncio.CancelledError()))
+    with pytest.raises(asyncio.CancelledError):
+        await tools.copilot_usage_lookup("19:abc", True, "billing_mode", None)
+    assert "copilot_usage_lookup" in run.tool_latencies_ms
