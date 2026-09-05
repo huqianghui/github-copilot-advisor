@@ -27,10 +27,38 @@ def require_env():
         pytest.skip(f"missing env: {missing}")
 
 
+# 语言中立的片段:它们的字符构成取决于"在讨论什么技术",而不是"作者用哪种语言写作"。
+# 把它们计进去,衡量的是回答有多技术,不是回答用了什么语言。
+_CODE_BLOCK = re.compile(r"```.*?```", re.S)
+_INLINE_CODE = re.compile(r"`[^`]*`")
+_MD_LINK_TARGET = re.compile(r"\]\([^)]*\)")  # 只剥目标,保留作者写的链接文字
+# URL 若用 \S+ 收尾,会把紧跟其后的中文一起吃掉 —— 中文句子在 URL 后不加空格,
+# ".../mcp。配置完成后重启编辑器即可生效。" 实测被吃掉 16 个汉字里的 14 个。
+_BARE_URL = re.compile(r"https?://[^\s一-鿿，。、；:：！？（）《》「」“”]+")
+
+
+def _prose_only(text: str) -> str:
+    """剥掉语言中立的内容:代码块、行内代码、markdown 链接目标、裸 URL。"""
+    for pattern in (_CODE_BLOCK, _INLINE_CODE, _MD_LINK_TARGET, _BARE_URL):
+        text = pattern.sub(" ", text)
+    return text
+
+
 def is_mostly_chinese(text: str) -> bool:
-    han = len(re.findall(r"[一-鿿]", text))
-    latin = len(re.findall(r"[a-zA-Z]", text))
-    return han > latin * 0.5
+    """比较**语素**而非字符:汉字一字一语素,拉丁一词一语素。
+
+    旧实现 `han > latin * 0.5` 是字符对字符,`GitHub Copilot`(2 语素但 14 字符)
+    足以压掉 7 个汉字,于是无可争议的中文技术回答被判成英文 —— mcp-config
+    用例就是这样三跑二败的(实测 han=699、latin=1472,阈值 736,差 37 个字符)。
+
+    已知边界:汉字数超过英文词数的英文回答仍会被判成中文。实测真实英文回答
+    han=0、latin_words≈410,离该边界很远;test_language_heuristic.py 用一条
+    引用了 4 段中文报错的英文回答(han=100、latin_words=172)钉住这个方向。
+    """
+    prose = _prose_only(text)
+    han = len(re.findall(r"[一-鿿]", prose))
+    latin_words = len(re.findall(r"[a-zA-Z]+", prose))
+    return han > latin_words
 
 
 FIXTURES_ROOT = Path(__file__).parent
