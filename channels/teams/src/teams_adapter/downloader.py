@@ -58,10 +58,23 @@ def select_images(attachments) -> list[tuple[str, str]]:
         if not url:
             continue
         parsed = urlparse(url)
-        if parsed.scheme != "https" or parsed.hostname not in ALLOWED_HOSTS:
+        # userinfo 必须拒绝,而不只是查 hostname:白名单查的是 hostname,
+        # httpx 消费的是 netloc,userinfo 正好夹在两者之间,且 geturl()
+        # 不会把它去掉 —— 所以下面那行 geturl() 也归一化不掉这条轴。
+        # 放行 https://attacker:secret@smba.trafficmanager.net/... 的后果:
+        # httpx 会拿 userinfo 造 BasicAuth 顶掉我们的 Authorization
+        # (实测发出的是 Basic YXR0YWNrZXI6c2VjcmV0),于是攻击者可以
+        # 确定性地让任意图片下载失败(图片压制原语);同时这段
+        # 攻击者可控的 user:pass 会原样进 WARNING 日志和 InputFile.content_url。
+        if (parsed.scheme != "https" or parsed.hostname not in ALLOWED_HOSTS
+                or parsed.username or parsed.password):
+            # 只打 hostname,绝不打原始 URL:userinfo 分支里的 user:pass
+            # 是攻击者可控的,原样进日志等于把它抄进我们的运维系统。
+            # 也因此这条文案不能说死"host 不在白名单" —— userinfo 那条的
+            # hostname 恰恰是白名单内的,那样写会把排障引到错误方向。
             logger.warning(
-                "skipping attachment from non-allowlisted host: %s",
-                parsed.hostname)
+                "skipping attachment, url rejected by scheme/host/userinfo "
+                "checks; host=%s", parsed.hostname)
             continue
         selected.append((url, content_type))
         if len(selected) >= MAX_IMAGES:
@@ -129,9 +142,14 @@ class TeamsImageDownloader(InputFileDownloader):
         content = response.content
         # 空 body 的 200 也要挡:放过去会一路走到 "data:image/png;base64,"
         # 然后由 Azure OpenAI 报 400,白烧一次往返还触发剥图降级。
-        if not content or len(content) > MAX_IMAGE_BYTES:
-            logger.warning("attachment size rejected (%d bytes), skipped",
-                           len(content))
+        # 两种情况分开打日志:合并成一条会打出 "size rejected (0 bytes)"
+        # 这种自相矛盾的文案,且都缺 URL,与上面的状态码告警关联不起来。
+        if not content:
+            logger.warning("attachment has empty body, skipped: %s", url)
+            return None
+        if len(content) > MAX_IMAGE_BYTES:
+            logger.warning("attachment too large (%d bytes), skipped: %s",
+                           len(content), url)
             return None
 
         content_type = (response.headers.get("content-type", "")

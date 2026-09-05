@@ -202,9 +202,16 @@ async def test_never_requests_non_allowlisted_host():
 
 @respx.mock
 async def test_does_not_follow_redirects():
-    """安全回归:跟随重定向会把 Authorization 带到重定向目标。"""
+    """安全回归:跟随重定向会把 Authorization 带到重定向目标。
+
+    302 带 body 是刻意的:body 为空时 files == [] 会被空 body 守卫满足,
+    与状态码检查是否严格无关 —— 把 != 200 放宽成 >= 400 照样全绿。
+    带上 body 之后,这条断言才真正压在状态码上:被攻陷的白名单 host
+    返回一个带 body 的 3xx 不能被当成图片收下。
+    """
     first = respx.get(GOOD_URL).mock(return_value=httpx.Response(
-        302, headers={"location": EVIL_URL}))
+        302, headers={"location": EVIL_URL, "content-type": "image/png"},
+        content=PNG))
     evil = respx.get(EVIL_URL).mock(return_value=httpx.Response(200, content=PNG))
     files = await download(IMAGE_ATTACHMENT)
     assert files == []
@@ -246,6 +253,59 @@ async def test_network_error_does_not_raise():
 
 
 @respx.mock
+async def test_rejects_userinfo_in_url():
+    """带 userinfo 的 URL 一律拒绝,且一次请求都不发。
+
+    urlparse('https://attacker:secret@smba.trafficmanager.net/...').hostname
+    就是 smba.trafficmanager.net,单查 hostname 会放行它。但白名单查的是
+    hostname、httpx 消费的是 netloc,userinfo 夹在两者之间,而
+    geturl() **保留** userinfo,所以那次归一化也盖不住这条轴。
+
+    放行的实际后果(已实测):httpx 拿 userinfo 造 BasicAuth 顶掉我们的头,
+    发出的是 `Authorization: Basic YXR0YWNrZXI6c2VjcmV0` —— 攻击者由此获得
+    一个确定性的图片压制原语(任意图片必然 401),并把自己可控的 user:pass
+    写进我们的 WARNING 日志和 InputFile.content_url。
+    """
+    userinfo_url = ("https://attacker:secret@smba.trafficmanager.net"
+                    "/amer/v3/attachments/1/views/original")
+    attachment = [{"contentType": "image/png", "contentUrl": userinfo_url}]
+    # httpx 归一化后会剥掉 userinfo,所以这条路由正是它会打中的目标
+    route = respx.get(GOOD_URL).mock(return_value=httpx.Response(
+        200, content=PNG, headers={"content-type": "image/png"}))
+    assert urls_for(attachment) == []
+    assert await download(attachment) == []
+    assert route.called is False
+
+
+@respx.mock
+async def test_normalizes_url_before_handing_to_httpx():
+    """把 select_images 校验过的字符串归一化后再交给 httpx。
+
+    校验器/取用器差分:select_images 校验 urlparse 的结果,httpx 会对原始
+    字符串重新解析。前导空白就是实测存在的一例 ——
+    httpx.URL('  https://smba…').host 是 ''(请求打不出去),而
+    urlparse(...).geturl() 归一化后 host 正确。少了那次 geturl(),这张
+    合法图片会静默失败;更要紧的是,这条差分轴一旦没有测试钉住,
+    将来一次"清理"就会把归一化删掉而全绿。
+    """
+    route = respx.get(GOOD_URL).mock(return_value=httpx.Response(
+        200, content=PNG, headers={"content-type": "image/png"}))
+    files = await download(
+        [{"contentType": "image/png", "contentUrl": "  " + GOOD_URL}])
+    assert len(files) == 1
+    assert route.called is True
+
+
+@respx.mock
+async def test_response_content_type_wins_when_supported():
+    """响应头在白名单内时优先于声明类型 —— 声明可能过时,实际字节才算数。"""
+    respx.get(GOOD_URL).mock(return_value=httpx.Response(
+        200, content=PNG, headers={"content-type": "image/jpeg"}))
+    files = await download([{"contentType": "image/png", "contentUrl": GOOD_URL}])
+    assert files[0].content_type == "image/jpeg"
+
+
+@respx.mock
 async def test_unusable_response_content_type_falls_back_to_declared():
     """响应头不可信时用 select_images 已校验过的声明类型,
     不能无脑塞 image/png —— 那会把 GIF 谎报成 PNG。"""
@@ -256,6 +316,43 @@ async def test_unusable_response_content_type_falls_back_to_declared():
 
 
 @respx.mock
+@respx.mock
+async def test_one_failed_image_does_not_drop_the_others():
+    """一张图失败不能连累其余的,也不能只下第一张就收工。
+
+    在此之前所有下载用例都只喂一张图,于是整个循环语义没有被钉住:
+    实测"失败即 break"与"成功一张即 break"两种写法都能 31 passed 全绿。
+    前者让一次瞬时故障吃掉后面的图(违背"图片是增强,不能成为新的失败源"),
+    后者让 MAX_IMAGES=4 形同虚设 —— 两者都静默丢图,用户无从察觉。
+
+    样本刻意排成 [失败, 成功, 成功]:失败排在最前,才能同时判别这两种
+    break;若把失败放在最后,两种写法都会给出相同的可观测结果。
+    """
+    base = "https://smba.trafficmanager.net/amer/v3/attachments"
+    first, second, third = f"{base}/1", f"{base}/2", f"{base}/3"
+    respx.get(first).mock(return_value=httpx.Response(404))
+    for url in (second, third):
+        respx.get(url).mock(return_value=httpx.Response(
+            200, content=PNG, headers={"content-type": "image/png"}))
+
+    files = await download([{"contentType": "image/png", "contentUrl": u}
+                            for u in (first, second, third)])
+    assert [f.content_url for f in files] == [second, third]
+
+
+@respx.mock
+async def test_response_content_type_with_parameters_is_parsed():
+    """content-type 带参数是常见形态,必须剥掉 ";charset=..." 再比对。
+
+    不剥的话 "image/png; charset=utf-8" 落不进白名单,会悄悄退回声明类型 ——
+    此处声明的是 gif,于是一张 PNG 被标成 image/gif 发给 Azure OpenAI。
+    """
+    respx.get(GOOD_URL).mock(return_value=httpx.Response(
+        200, content=PNG, headers={"content-type": "image/png; charset=utf-8"}))
+    files = await download([{"contentType": "image/gif", "contentUrl": GOOD_URL}])
+    assert files[0].content_type == "image/png"
+
+
 async def test_non_teams_channel_skipped():
     """非 msteams 频道一次请求都不发。
 
