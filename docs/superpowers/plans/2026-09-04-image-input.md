@@ -1929,6 +1929,55 @@ git commit -m "docs: cross-reference image input design in main spec and README"
 
 ---
 
+## 后续任务(Task 7 审查产出,均已验证成本,不阻塞本计划)
+
+### 后续 A:流式截断 + 下载总预算(两者是同一处改动)
+
+**问题一:大小上限是读完之后才判的。** `client.get()` 把整个 body 读进内存,
+`len(content) > MAX_IMAGE_BYTES` 是事后检查。白名单 host 若被攻陷可用超大
+body 打内存。
+
+**问题二:`DOWNLOAD_TIMEOUT_S` 不是总预算。** `httpx.Timeout(10.0)` 是
+**每阶段/每次读取**的超时,不是每请求的总时长。慢速滴送的服务器能把一个
+turn 拖住任意久 —— 所以最坏情况**无界**,不是原先估计的 4 × 10s = 40s。
+这同时削弱了问题一"有 10s 超时兜底"的缓解说法。
+
+**已验证的成本**(审查时做过原型,不是估计):`client.stream()` +
+`aiter_bytes()` 增量截断约 10 行,**现有 10 个 respx 测试全部无需修改**即可通过
+(`httpx.Response(200, content=…)` 的 mock 对 `client.stream` 透明)。
+只需新增一个用例:body 超尺寸且 `Content-Length` 缺失或撒谎。
+
+注意:只加 `Content-Length` 预检查(3 行)**不够** —— 省略该头或用 chunked
+编码即可绕过。
+
+**并行化不是答案。** `asyncio.gather` 只会把"无界串行"变成"无界并行",
+尾延迟仍无界。正解是**总预算**,而本仓已有该惯用法:
+`agent/src/advisor_agent/search/combined.py` 的 `SEARCH_BUDGET_SECONDS = 8.0`
++ `asyncio.wait({...}, timeout=budget)` + 取消未完成者。最佳形态是
+**gather 套在 budget 里**(同 host、同 client、共享连接池,并行几乎免费),
+若只能选一个就选 budget。
+
+用户侧无需额外工作:Task 9 的 `bot.py` 丢弃计数已经会告知
+"另有 N 张图片未能获取",预算超时导致的丢弃天然被覆盖。
+
+### 后续 B:禁止单元测试打真实网络的 conftest
+
+**已两次实证**:Task 7 的 M6 里,一条单元测试向生产端点
+`smba.trafficmanager.net` 发出带 `Authorization: Bearer` 的请求、收到线上 401、
+然后 PASSED。仓库**没有任何 `conftest.py`**;`pyproject.toml` 的
+`addopts = "-m 'not integration'"` 是**选择过滤器,不是沙箱**,拦不住这个。
+
+**推荐形态**:autouse fixture 阻断 `socket.socket.connect`,对没有
+`integration` marker 的测试生效。**不要用全局 respx 拦截** —— 会与本仓
+已在用的、逐测试的 `@respx.mock` router 打架。放行 loopback。
+
+**风险**:影响 4 个 project / 180 个测试,但**一次运行即可发现全部影响**,
+且它打破的任何测试按定义都是在偷偷碰网络的测试 —— 那正是要暴露的东西。
+本仓网络环境特殊(企业镜像、公共 CDN 被 sinkhole),需注意。
+
+**时机**:尽快做,但**独立提交**,不要让 4 个 project 的影响面记在图片输入
+这个改动头上。
+
 ## 遗留观察(不属于本计划,记录以免丢失)
 
 **`_TOOL_SCHEMAS` 值得抽成独立模块,但不要在本计划里做。**
