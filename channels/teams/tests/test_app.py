@@ -138,3 +138,51 @@ async def test_sdk_rejection_logs_reason_without_activity_body(
     assert resp.status == 400
     assert "Activity must have type and conversation.id" in caplog.text
     assert "sensitive message" not in caplog.text
+
+
+def test_agent_app_wires_image_downloader(monkeypatch):
+    """装配断言:AgentApplication 必须拿到 TeamsImageDownloader。
+
+    stub 的形状是实测出来的:AgentApplication 会读 authorization.connection_manager
+    (agent_application.py:186),authorization 为 None 时又会要求显式
+    connection_manager,所以两者都必须是有属性的对象,不能用裸 object()。
+    """
+    import teams_adapter.__main__ as entry
+    from teams_adapter.downloader import TeamsImageDownloader
+
+    class StubConnectionManager:
+        def get_default_connection_configuration(self):
+            return {}
+
+    stub_cm = StubConnectionManager()
+
+    class StubAuthorization:
+        connection_manager = stub_cm
+
+    monkeypatch.setattr(entry, "load_configuration_from_env", lambda env: {})
+    monkeypatch.setattr(entry, "MsalConnectionManager", lambda **_: stub_cm)
+    monkeypatch.setattr(entry, "CloudAdapter", lambda **_: None)
+    monkeypatch.setattr(entry, "Authorization",
+                        lambda *a, **k: StubAuthorization())
+    monkeypatch.setattr(entry, "build_advisor", lambda channel_name: object())
+
+    agent_app, _, _ = entry.build_agent_app()
+    downloaders = agent_app._options.file_downloaders
+    assert len(downloaders) == 1
+    assert isinstance(downloaders[0], TeamsImageDownloader)
+    # 光有 isinstance 判别不出装配是否真的通电:TeamsImageDownloader(None)
+    # 同样满足上面两条断言,但运行期 _access_token 会 AttributeError,被
+    # download_files 的 except Exception 吞掉,每张图静默丢弃 —— 变异实测存活。
+    # 所以必须钉住它拿到的正是本次构造出的 connection_manager。
+    assert downloaders[0]._connection_manager is stub_cm
+
+
+def test_openai_logger_pinned_to_info():
+    """OPENAI_LOG=debug 会 dump 含图片 base64 的请求体,必须在启动时钉死。"""
+    import logging
+
+    import teams_adapter.__main__ as entry
+
+    logging.getLogger("openai").setLevel(logging.DEBUG)   # 模拟环境变量效果
+    entry._configure_logging()
+    assert logging.getLogger("openai").level == logging.INFO

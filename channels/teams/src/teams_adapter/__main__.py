@@ -18,10 +18,14 @@ from microsoft_agents.hosting.core import (
 from advisor_agent.factory import build_advisor
 from teams_adapter.app import create_app
 from teams_adapter.bot import register_handlers
+from teams_adapter.downloader import TeamsImageDownloader
 
 
 def _configure_logging() -> None:
     logging.basicConfig(level=logging.INFO)
+    # OPENAI_LOG=debug 会把请求体整个 dump,含图片 base64。此处在 openai
+    # 导入期 setup_logging() 之后覆盖,确保生产环境改环境变量也打不开。
+    logging.getLogger("openai").setLevel(logging.INFO)
     ms = logging.getLogger("microsoft_agents")
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter(
@@ -43,6 +47,7 @@ def build_agent_app():
         authorization=authorization,
         start_typing_timer=False,       # behavior-preserving:handler 手动发 typing
         remove_recipient_mention=False,  # behavior-preserving:extract.strip_mentions 唯一剥离来源
+        file_downloaders=[TeamsImageDownloader(connection_manager)],
         **config,
     )
     core = build_advisor(channel_name="teams")
