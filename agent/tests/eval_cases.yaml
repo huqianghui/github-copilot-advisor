@@ -68,9 +68,9 @@ cases:
     reply_language: zh
   # 刻意不设 reply_language:纯图片消息没有"提问语言",而设计决策 9 的
   # "回答语言跟随提问语言"在此无定义。截图又是英文 settings.json,
-  # 模型没有理由用中文答 —— 断言 zh 会把正确回答判失败。
-  # 且 is_mostly_chinese 是 han > latin * 0.5,而正确的中文回答要引用
-  # github.copilot.enable 加一段 JSON,latin 很重,即便真用中文也可能翻车。
+  # 模型没有理由用中文答 —— 断言任一语言都是在断言一个未定义的属性。
+  # (原先此处还列了 is_mostly_chinese 对 latin 敏感这条理由,该缺陷已于
+  #  2026-09-05 修复 —— 现在比较的是语素而非字符。但上面那条理由独立成立。)
   - id: image-config-screenshot-no-text
     text: ""
     images: [fixtures/config_screenshot.png]
