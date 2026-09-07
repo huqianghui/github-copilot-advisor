@@ -4,6 +4,7 @@ import asyncio
 import logging
 
 from advisor_agent.search.models import SearchResult
+from advisor_agent.search.telemetry import SearchTrace
 
 logger = logging.getLogger(__name__)
 
@@ -19,13 +20,22 @@ class CombinedSearch:
 
     async def search_solutions(self, query: str,
                                product_area: str | None = None) -> dict:
-        kb_task = asyncio.create_task(
-            self.kb.search(query, product_area=product_area))
-        live_task = asyncio.create_task(self.live.search(query))
-        done, pending = await asyncio.wait(
-            {kb_task, live_task}, timeout=self.budget)
+        kb_trace = SearchTrace("kb", "azure_ai_search", self.budget)
+        live_trace = SearchTrace("github-live", "github", self.budget)
+        kb_task = asyncio.create_task(kb_trace.run(
+            self.kb.search(query, product_area=product_area)))
+        live_task = asyncio.create_task(live_trace.run(self.live.search(query)))
+        traces = {kb_task: kb_trace, live_task: live_trace}
+        try:
+            done, pending = await asyncio.wait(traces, timeout=self.budget)
+        finally:
+            for task in traces:
+                if not task.done():
+                    task.cancel()
+            # Finish cancellation before emitting the event, including on interruption.
+            await asyncio.gather(*traces, return_exceptions=True)
         for task in pending:
-            task.cancel()
+            traces[task].mark_budget_timeout()
 
         def collect(task) -> list[SearchResult]:
             if task not in done:

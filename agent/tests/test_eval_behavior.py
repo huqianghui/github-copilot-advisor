@@ -2,6 +2,7 @@
 prompt/工具描述每次改动必跑:uv run pytest -m integration agent/tests/test_eval_behavior.py"""
 import os
 import re
+import time
 from pathlib import Path
 
 import pytest
@@ -85,7 +86,7 @@ def make_request(text: str, images: list[ImageInput] | None = None) -> AdvisorRe
 
 
 @pytest.mark.parametrize("case", CASES, ids=[c["id"] for c in CASES])
-async def test_eval_case(case):
+async def test_eval_case(case, eval_turns: list[dict]):
     from advisor_agent.factory import build_advisor, set_current_channel_id
     events: list[AdvisorEvent] = []
     core = build_advisor(channel_name="eval")
@@ -99,7 +100,22 @@ async def test_eval_case(case):
         # 图片只附在第一轮,与真实用户行为一致(后续轮靠会话历史里的文字复述)
         req = make_request(text, images if index == 0 else None)
         req = req.model_copy(update={"conversation_key": key})
-        resp = await core.handle(req)
+        turn = {
+            "question": req.text,
+            "images": [image.name for image in req.images],
+            "response": None,
+            "events": [],
+        }
+        eval_turns.append(turn)
+        event_start = len(events)
+        started_at = time.monotonic()
+        try:
+            resp = await core.handle(req)
+            turn["response"] = resp.model_dump(mode="json")
+        finally:
+            turn["duration_seconds"] = time.monotonic() - started_at
+            turn["events"] = [
+                event.model_dump(mode="json") for event in events[event_start:]]
 
     assert events[-1].stage in case["expected_stage_in"], \
         f"stage={events[-1].stage}, want {case['expected_stage_in']}"

@@ -6,5 +6,6 @@ superpowers-plugin
 .venv/
 *.egg-info/
 .pytest_cache/
+agent/tests/output/
 .state/
 agent/escalation.yaml

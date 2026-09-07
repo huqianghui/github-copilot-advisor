@@ -95,5 +95,6 @@ class AdvisorCore:
             mentioned_human=bool(run.mentions),
             image_count=len(request.images),
             error=error if answer is None else None,
+            search_attempts=run.search_attempts,
         ))
         return response

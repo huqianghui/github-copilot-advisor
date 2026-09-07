@@ -3,6 +3,7 @@
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 
+from advisor_shared.events import SearchAttempt
 from advisor_shared.messages import MentionDirective
 
 
@@ -13,6 +14,7 @@ class RunContext:
     citations_seen: list[dict] = field(default_factory=list)
     tool_latencies_ms: dict[str, int] = field(default_factory=dict)
     failover_count: int = 0
+    search_attempts: list[SearchAttempt] = field(default_factory=list)
 
 
 current_run: ContextVar[RunContext] = ContextVar("current_run")

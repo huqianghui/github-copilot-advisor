@@ -151,6 +151,9 @@ PY
 
 **所以:部署后要主动验证,不要等报错。**
 
+行为回归报告现在会在每轮事件的 `search_attempts` 中记录各检索分支的结果、
+超时和错误类型,可据此区分这些情况;工具输出和原有兜底逻辑保持不变。
+
 ---
 
 ## 5. 灌完后的验证
@@ -189,6 +192,44 @@ PY
 ```bash
 uv run --env-file .env pytest -m integration agent/tests/test_eval_behavior.py -v
 ```
+
+每次运行结束会自动生成 `agent/tests/output/<UTC时间戳>.json`
+(例如 `20260906T015321_238000Z.json`),终端会显示报告路径。该目录已加入
+`.gitignore`,历史报告不会覆盖,也不会自动清理。
+
+报告包含运行起止时间、退出码、逐用例状态与耗时、预期条件、失败/跳过原因,
+以及每轮问题、完整回复(含引用和 @人信息)、执行事件。图片仅记录文件名,
+不保存原始字节或 base64;问答文本本身仍可能包含敏感信息,分享报告前请检查。
+缺环境变量或截图而跳过、用例收集失败时也会保存报告;使用 `-x` 提前停止时,
+后续选中但未执行的用例标为 `not_run`。没有选中行为评估用例且无该文件的
+收集错误时不生成报告,不影响普通单元测试。
+
+### 查看检索链路是否走通
+
+每轮的 `events[].search_attempts` 记录 KB/GitHub 实时检索的每次调用,
+以及 Web 每个 provider 的每次尝试。重复调用不会覆盖旧记录,新一轮重新计数。
+这些是服务调用级记录,不展开 SDK 内部的 HTTP 重试。
+
+| 字段 | 含义 |
+|---|---|
+| `source` | `kb` / `github-live` / `web` |
+| `provider` | `azure_ai_search` / `github` / `tavily` / `brave`;未配置 Web provider 时为 `null` |
+| `status` | `success` 有结果;`empty` 正常返回但无结果;`timeout` 超时;`error` 异常;`not_configured` 未配置;`cancelled` 被取消 |
+| `result_count` | 本次分支/provider 的结果条数;失败、超时、未配置时为 `null`,不是 `0` |
+| `duration_ms` | 该分支/provider 的实际耗时,不是组合检索整体耗时 |
+| `timeout_seconds` | 组合检索预算或 Web provider 的外层超时限制 |
+| `error_type` | 异常类型,如 `HTTPStatusError`、`HttpResponseError`、`ConnectTimeout` |
+| `http_status` / `error_code` | 可获取的 HTTP 状态码和服务错误码,如 `403`、`429`、`CannotSearchWithoutSearchableFields` |
+
+KB 的计数是经过语义分数过滤后的结果数,耗时包含问题 embedding 和 AI Search
+检索。各来源计数发生在合并去重及回复引用截断之前,不等于最终引用条数。
+`empty` 表示调用正常结束,但没有可用命中;`success` 且 `result_count > 0`
+才表示拿到了可用结果。Web 是否成功应看具体 provider 的这些字段,
+不能仅凭最终 `stage = web` 或 `failover_count = 0`。
+
+检索错误不会写入原始异常消息、请求 URL、响应体或密钥;报告保留错误类型、
+HTTP 状态码及格式受限的服务错误码用于排查。`error = null` 仍只表示本轮
+Agent 没有整体失败,不代表每次检索都成功。旧报告没有这些数据,需重新运行生成。
 
 ---
 
