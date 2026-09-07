@@ -231,12 +231,30 @@ corporate egress/proxy/firewall。因此定位为"排除性证据 + 客户自测
 
 覆盖占比最高的 P0 主题(Credits/计费 24%)。只读 GitHub API:
 `/orgs/{org}/copilot/billing`(seat 总量/计费模式)、`/orgs/{org}/copilot/billing/seats`
-(成员 seat 明细)、`/orgs/{org}/settings/billing/usage`(premium requests 用量)。
+(成员 seat 明细)、`/organizations/{org}/settings/billing/ai_credit/usage`
+(AI credits 用量,需 `X-GitHub-Api-Version: 2026-03-10`)。
 
+> **注意前缀不一致**:Copilot API 挂在 `/orgs/{org}/`,而 billing usage API
+> 挂在 `/organizations/{org}/`。两者不可互换,写错直接 404。
+
+- **计费口径(2026-06-01 起)**:usage-based billing 取代 request-based
+  billing,计量单位是 **AI credits**(按 token 计费,1 credit = $0.01 USD),
+  **premium request units 已退役**。credits 在计费实体层**池化**,不是每人
+  一份配额;计费范围为 Chat、CLI、cloud agent、Spaces、Spark、第三方 coding
+  agent,**代码补全与 next edit 不计费**。旧的 request-based 文档已移到
+  `request-based-billing-legacy/`,仅适用于 2026-06-01 前订阅年付 Pro/Pro+ 的
+  遗留个人用户 —— 企业客户(Business/Enterprise)全部已迁移,故工具层
+  **不保留 premium request 兼容分支**
+- **响应聚合**:`usageItems` 聚合为 `total_credits`(∑`netQuantity`)、
+  `total_amount_usd`(∑`netAmount`)、`by_model`(按 model 分项,credits 降序)
+  以及原样回传的 `time_period`。取 `net*` 而非 `gross*`(net 是折扣后的实际
+  计费量,与账单一致);**不按 product 过滤** —— credits 是池化的,Copilot 之外
+  的消耗同样吃掉同一份额度,只报 Copilot 会给出比账单小的数字
 - **token 归属**:查客户 org 需客户授权。按 channel 配置 `github_org` +
   `org_token_env`(环境变量名,存客户 org 的只读 fine-grained PAT)。
   **配置了就查真实数字;未配置返回 not_configured,LLM 转为指引:
-  需贵组织 org admin 创建只读 PAT(billing/copilot read)并交给运营方配置**
+  需贵组织 org admin 创建只读 PAT(Copilot read + Administration read,
+  后者是 AI credits 用量端点要求的权限)并交给运营方配置**
 - **隐私规则**:org 级汇总可在群里答;指向具体个人的明细只在 1:1 私聊答
   (代码层判断 is_group 拦截,非仅靠 prompt)
 - **只读铁律**:工具层只实现 GET;建议客户 token 只授 read 权限,双保险
@@ -251,8 +269,10 @@ corporate egress/proxy/firewall。因此定位为"排除性证据 + 客户自测
 5. 回答语言跟随提问;引用永远带原始 url;不确定就说不确定,不编造
 6. 问题涉及超时/登录失败/断连/Authorization error → 在 search_solutions 之后
    主动调用 network_diagnostics,把探测证据合进回答(从"给建议"升级为"给证据")
-7. 计费/额度/seat 类问题:概念性解答走 search_solutions;涉及"我们组织的实际
-   数字"时调 copilot_usage_lookup;群聊中只给 org 级汇总,个人明细引导私聊
+7. 计费/额度/AI credits/seat 类问题:概念性解答走 search_solutions;涉及"我们
+   组织的实际数字"时调 copilot_usage_lookup;群聊中只给 org 级汇总,个人明细
+   引导私聊。用户用 "premium requests" 等已退役的旧词提问时,映射到 AI credits
+   照常查询并说明术语已更名,不假装旧概念还在
 8. 版本/兼容性类问题(插件版本、IDE 兼容):web_search 查询词带
    "marketplace"/"plugin",优先引用 marketplace.visualstudio.com /
    plugins.jetbrains.com / github.com releases 的结果
@@ -303,6 +323,9 @@ Teams 客户端(@提及 / 1:1)
 - conversation_key(Teams adapter 私有推导规则):直接取 Teams conversation.id ——
   channel 回帖时其值为 `"{channel_id};messageid={根消息ID}"`,天然同串共享会话;1:1 即会话 id
 - 本地开发:dev tunnel / Bot Framework Emulator / 测试租户
+- 图片输入:支持 Teams inline image(报错截图/配置截图/纯图片),
+  详见 `2026-09-04-image-input-design.md`。图片不进会话历史,
+  靠 system prompt 规则 9 的复述承载
 
 ## 9. 升级流程与联系人配置 ✅(已确认)
 
@@ -313,7 +336,9 @@ Teams 客户端(@提及 / 1:1)
   追加探测 `https://github.com/enterprises/{slug}`
 - `github_org` + `org_token_env`:copilot_usage_lookup 用;org_token_env 是
   **环境变量名**(如 `ORG_TOKEN_CUSTOMER_A`),token 本体永远只在环境变量里,
-  不进配置文件。两字段齐全才启用用量查询,否则工具返回 not_configured
+  不进配置文件。两字段齐全才启用用量查询,否则工具返回 not_configured。
+  该 PAT 需要的只读权限:**Copilot read**(seat 与计费模式)+
+  **Administration read**(AI credits 用量端点要求的权限,见 §7.2 工具5)
 
 ```yaml
 defaults:                        # 无 channel 匹配时兜底
@@ -366,11 +391,25 @@ channels:
 |---|---|
 | AI Search 不可用 | search_solutions 降级为仅 github_live_search;全失败则如实告知+通用建议 |
 | web provider 失败 | failover 链依次尝试;全挂跳过该级进通用建议 |
-| Azure OpenAI 限流/超时 | 指数退避重试 2 次;仍失败回复固定道歉文案(adapter 兜底,不静默) |
+| Azure OpenAI 限流/超时 | 重试只在 openai SDK 一层:总 2 次尝试(`max_retries=1`)、指数退避、遵守 `Retry-After`、只重试 429/5xx/连接错误。core 不重试(见下)。仍失败回复固定道歉文案(adapter 兜底,不静默) |
 | GitHub API 限流 | ingestion:退避+断点续传(水位不推进);live search:跳过不阻塞 |
 | ingestion 单源失败 | 隔离,其他源继续;摘要报告标红,exit code 非 0 供告警 |
 | LLM 提炼失败(单条) | 跳过并记录,不中断批次 |
 | 会话存储丢失 | 优雅降级为单轮问答 |
+| 图片下载失败/超时 | 跳过该图以文本继续;无图存活且文本为空则提示改贴文字 |
+| 带图请求被拒(400) | MAFBackend 内剥图重试一次,回答附不归因的未处理说明 |
+
+**重试为什么只留一层。** `AdvisorCore` 曾经也重试(`_MAX_ATTEMPTS = 2`),与 SDK
+的重试相乘,最坏要打 6 次连接。两层里该留的是 SDK 那层:它区分可重试的状态码、
+遵守 `Retry-After`、做指数退避;core 那层是 `except Exception` 盲重试,而且重跑的是
+**整个 tool loop** —— `search_solutions` / `web_search` 会被重复执行,产生重复的
+GitHub API 调用与重复的 web search 计费。故 `_MAX_ATTEMPTS = 1`(不重试)。
+
+**连接超时。** openai SDK 默认 `connect=5.0`,而实测本环境到 Azure OpenAI 的成功
+连接耗时中位数约 8s、最大 10.9s —— 默认值会在连接本来能建立时提前放弃。现改为
+`connect=15.0`(`read`/`write`/`pool` 保持默认 600,那是 LLM 生成时间)。策略定义在
+`factory.build_openai_client()`,chat 与 embedding 两个 client 共用。
+最坏路径:1(core)× 2(SDK 尝试)× 15s = **~30s** 后回兜底文案。
 
 ### 10.2 可观测性(v1 不自建控制台,用 Azure 原生栈)
 

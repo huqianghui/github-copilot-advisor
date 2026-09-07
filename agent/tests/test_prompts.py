@@ -27,3 +27,33 @@ def test_prompt_mentions_network_diagnostics_rule():
 
 def test_prompt_mentions_usage_lookup_rule():
     assert "copilot_usage_lookup" in SYSTEM_PROMPT
+
+
+def test_prompt_uses_current_billing_concept():
+    """规则 8 讲的必须是 AI credits,不是已退役的 premium requests。"""
+    assert "AI credits" in SYSTEM_PROMPT
+    assert "credits_usage" in SYSTEM_PROMPT
+
+
+def test_prompt_maps_the_retired_term_instead_of_dropping_it():
+    """旧词必须留在 prompt 里 —— 但只能以"映射到 AI credits"的身份出现。
+
+    这是字符串绊线,不是语义守卫:它挡得住"把旧词整段删掉"(那样模型遇到
+    premium requests 提问会当成陌生概念),也挡得住"仍把旧词当现行概念描述"
+    (靠 已退役/取代 这两个词)。挡不住措辞正确但含义写反的改写 ——
+    真正验证这条规则的是 eval_cases.yaml 的 usage-credits-legacy-term。
+    """
+    assert "premium request" in SYSTEM_PROMPT
+    assert "退役" in SYSTEM_PROMPT
+    assert "取代" in SYSTEM_PROMPT
+
+
+def test_prompt_has_image_handling_rule():
+    assert "复述" in SYSTEM_PROMPT
+    assert "search_solutions 的 query 主体" in SYSTEM_PROMPT
+
+
+def test_prompt_forbids_echoing_secrets_from_images():
+    for word in ("token", "API key", "cookie"):
+        assert word in SYSTEM_PROMPT
+    assert "已略过" in SYSTEM_PROMPT

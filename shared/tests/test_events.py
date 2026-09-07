@@ -20,3 +20,10 @@ def test_event_rejects_unknown_stage():
     with pytest.raises(ValueError):
         AdvisorEvent(conversation_key="k", channel="teams",
                      question_summary="q", stage="nope")
+
+
+def test_event_image_count_defaults_to_zero_and_serializes():
+    event = AdvisorEvent(conversation_key="c", channel="teams",
+                         question_summary="q", stage="kb_hit")
+    assert event.image_count == 0
+    assert '"image_count":0' in event.to_log_line()

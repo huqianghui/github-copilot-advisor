@@ -14,6 +14,7 @@ class AdvisorEvent(BaseModel):
     tool_latencies_ms: dict[str, int] = {}
     failover_count: int = 0
     mentioned_human: bool = False
+    image_count: int = 0
     error: str | None = None
 
     def to_log_line(self) -> str:

@@ -92,33 +92,47 @@ class AdvisorTools:
                                    username: str | None = None) -> str:
         """查询本组织 Copilot 计费与用量的真实数据。
         question_type:billing_mode(计费模式/seat 总量)、seats_summary、
-        premium_usage(premium requests 用量)、user_usage(个人明细,仅限私聊)。"""
+        credits_usage(AI credits 用量与金额;用户用 premium requests 这类旧词
+        提问时同样用它)、user_usage(个人明细,仅限私聊)。"""
         run = current_run.get()
-        entry = self._escalation.channel_entry(channel_id)
-        token = os.environ.get(entry.org_token_env, "") \
-            if entry and entry.org_token_env else ""
-        if not (entry and entry.github_org and token):
-            return json.dumps({
-                "status": "not_configured",
-                "guidance": ("未配置贵组织的查询授权。请组织的 org admin 创建"
-                             "只读 fine-grained PAT(Copilot read + billing "
-                             "read 权限),交给支持团队配置后即可直接查询;"
-                             "也可自行访问 GitHub Settings → Copilot → Usage 查看。"),
-            }, ensure_ascii=False)
-        if is_group and question_type == "user_usage":
-            return json.dumps({
-                "status": "privacy_blocked",
-                "message": "个人用量明细涉及隐私,请与我 1:1 私聊查询。",
-            }, ensure_ascii=False)
         start = time.monotonic()
         try:
-            data = await self._usage.lookup(
-                question_type, entry.github_org, token, username)
-            result = {"status": "ok", "data": data}
-        except Exception as e:
-            result = {"status": "error",
-                      "message": f"查询失败:{type(e).__name__}。"
-                                 "可能是 token 权限不足或已过期。"}
-        run.tool_latencies_ms["copilot_usage_lookup"] = int(
-            (time.monotonic() - start) * 1000)
-        return json.dumps(result, ensure_ascii=False)
+            entry = self._escalation.channel_entry(channel_id)
+            token = os.environ.get(entry.org_token_env, "") \
+                if entry and entry.org_token_env else ""
+            if not (entry and entry.github_org and token):
+                return json.dumps({
+                    "status": "not_configured",
+                    # 权限项跟着端点走:AI credits 用量端点要的是 organization
+                    # "Administration" (read),不是 billing read。写错客户会建
+                    # 一个在新端点上 403 的 token,而 403 在这里被吞成一句
+                    # "权限不足"。
+                    "guidance": ("未配置贵组织的查询授权。请组织的 org admin 创建"
+                                 "只读 fine-grained PAT(Copilot read + "
+                                 "Administration read 权限,后者用于查 AI "
+                                 "credits 用量),交给支持团队配置后即可直接查询;"
+                                 "也可自行访问 GitHub Settings → Copilot → "
+                                 "Usage 查看。"),
+                }, ensure_ascii=False)
+            if is_group and question_type == "user_usage":
+                return json.dumps({
+                    "status": "privacy_blocked",
+                    "message": "个人用量明细涉及隐私,请与我 1:1 私聊查询。",
+                }, ensure_ascii=False)
+            try:
+                data = await self._usage.lookup(
+                    question_type, entry.github_org, token, username)
+                result = {"status": "ok", "data": data}
+            except Exception as e:
+                result = {"status": "error",
+                          "message": f"查询失败:{type(e).__name__}。"
+                                     "可能是 token 权限不足或已过期。"}
+            return json.dumps(result, ensure_ascii=False)
+        finally:
+            # 记账必须无条件:not_configured / privacy_blocked 同样是"这个工具被
+            # 调用过"的事实。tool_latencies_ms 是 AdvisorEvent 里唯一记录工具被
+            # 调用的字段(spec 10.2),漏记会让隐私门禁在遥测里彻底隐形 —— 运营
+            # 会以为没人问过个人用量,实际是问过、被挡了。放在 finally 而不是每个
+            # return 前补一行:下一个加分支的人不可能再忘。
+            run.tool_latencies_ms["copilot_usage_lookup"] = int(
+                (time.monotonic() - start) * 1000)

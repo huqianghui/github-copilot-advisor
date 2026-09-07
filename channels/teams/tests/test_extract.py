@@ -1,5 +1,7 @@
 # channels/teams/tests/test_extract.py
+from advisor_shared.messages import ImageInput
 from teams_adapter.extract import (
+    is_empty,
     should_respond,
     strip_mentions,
     to_advisor_request,
@@ -79,3 +81,35 @@ def test_to_advisor_request_personal():
     assert req.is_group is False
     assert req.conversation_key == "a:1to1conv"
     assert req.channel_id == "a:1to1conv"   # 1:1 无 channel,退化为会话 id
+
+
+def test_to_advisor_request_defaults_to_no_images():
+    assert to_advisor_request(group_activity(), BOT_ID).images == []
+
+
+def test_to_advisor_request_carries_images():
+    # 多张且逐张可区分:单张样本无法区分"全量透传"与"只取第一张"
+    # (images[:1] 变异体会存活);顺序承重,同时挡住反转与去重。
+    imgs = [
+        ImageInput(data=b"PNG1", mime_type="image/png", name="a.png"),
+        ImageInput(data=b"JPG2", mime_type="image/jpeg", name="b.jpg"),
+        ImageInput(data=b"PNG3", mime_type="image/png", name="c.png"),
+    ]
+    req = to_advisor_request(group_activity(), BOT_ID, imgs)
+    assert req.images == imgs
+
+
+def test_is_empty_true_for_no_text_no_image():
+    req = to_advisor_request(group_activity(text="<at>Advisor</at>"), BOT_ID)
+    assert req.text == ""
+    assert is_empty(req) is True
+
+
+def test_is_empty_false_when_image_present():
+    req = to_advisor_request(group_activity(text="<at>Advisor</at>"), BOT_ID,
+                             [ImageInput(data=b"PNG", mime_type="image/png")])
+    assert is_empty(req) is False
+
+
+def test_is_empty_false_when_text_present():
+    assert is_empty(to_advisor_request(group_activity(), BOT_ID)) is False

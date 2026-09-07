@@ -7,19 +7,35 @@ agent-framework-openai / agent-framework-azure-ai 这两个可选连接器包里
 pre-release,且已在 Task 1 从 agent/pyproject.toml 移除)。因此这里直接用已安装
 的 openai SDK(AsyncAzureOpenAI,OpenAI API 兼容)实现一个等价的 function-calling
 tool loop,对外仍暴露 MAFBackend 这个类名,并满足 AgentBackend 协议
-(async run(user_text, history) -> str)。等 agent-framework-azure-ai 转正式版后,
+(async run(user_text, history, images) -> str)。等 agent-framework-azure-ai 转正式版后,
 可以把内部实现换成真正的 MAF ChatAgent,协议边界(AgentBackend)不需要变。
 """
+import base64
 import json
+import logging
 import os
 from typing import Callable
 
-from openai import AsyncAzureOpenAI
+from openai import AsyncAzureOpenAI, BadRequestError
 
 from advisor_agent.prompts import SYSTEM_PROMPT
 from advisor_agent.tools import AdvisorTools
+from advisor_shared.messages import ImageInput
+
+logger = logging.getLogger(__name__)
 
 _MAX_TOOL_ROUNDS = 6
+
+_NO_TEXT_PLACEHOLDER = "(用户只发了图片,无文字说明)"
+
+# 措辞刻意只说结果、不说原因。400 至少三种成因 —— 部署不支持 vision、图片格式
+# 不受支持、动图 GIF(content-type 就是 image/gif,上游 allow-list 挡不住)——
+# 代码分辨不了,写死任何一个都是猜。猜错是粘性的:用户被告知"看不了图"就不再
+# 发图,功能静默死掉。改这段前请确认新措辞仍然只陈述结果。
+# 注意 test_note_does_not_attribute_a_cause 只挡几个已知词,挡不住语义。
+IMAGE_NOT_PROCESSED_NOTE = (
+    "(注:这次没能处理你发送的图片,以上回答未参考图片内容。"
+    "可以把图中的关键信息贴成文字,我再帮你看。)")
 
 _TOOL_SCHEMAS = [
     {
@@ -98,7 +114,9 @@ _TOOL_SCHEMAS = [
             "name": "copilot_usage_lookup",
             "description": (
                 "查询本组织 Copilot 计费/用量真实数据(需组织已授权)。"
-                "question_type:billing_mode / seats_summary / premium_usage / "
+                "question_type:billing_mode / seats_summary / credits_usage"
+                "(AI credits 用量与金额;用户说 premium requests/高级请求这类"
+                "旧词时也用它 —— 该计费概念已被 AI credits 取代)/ "
                 "user_usage(个人明细,仅限 1:1 私聊)。"
             ),
             "parameters": {
@@ -107,7 +125,7 @@ _TOOL_SCHEMAS = [
                     "question_type": {
                         "type": "string",
                         "enum": ["billing_mode", "seats_summary",
-                                 "premium_usage", "user_usage"],
+                                 "credits_usage", "user_usage"],
                     },
                     "username": {
                         "type": "string",
@@ -121,14 +139,41 @@ _TOOL_SCHEMAS = [
 ]
 
 
+def build_user_message(user_text: str,
+                       images: list[ImageInput] | None) -> dict:
+    """构造 user message。无图时保持纯字符串 content —— 纯文本路径零行为变化。
+
+    泄漏面提示:返回值里的 data URL 含完整图片 base64。截图可能带 token/密钥
+    (见 prompt 规则 10),因此**绝不要**把返回的 messages 整体打日志。同理,
+    生产环境不要开 OPENAI_LOG=debug —— 那会把整张图写进日志。这是图片输入
+    新增的泄漏面,纯文本时期不存在。
+    """
+    if not images:
+        return {"role": "user", "content": user_text}
+    content: list[dict] = [
+        {"type": "text", "text": user_text or _NO_TEXT_PLACEHOLDER}]
+    for image in images:
+        b64 = base64.b64encode(image.data).decode()
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{image.mime_type};base64,{b64}",
+                          "detail": "auto"},
+        })
+    return {"role": "user", "content": content}
+
+
 class MAFBackend:
     def __init__(self, tools: AdvisorTools,
                  channel_id_provider: Callable[[], str],
-                 is_group_provider: Callable[[], bool]):
+                 is_group_provider: Callable[[], bool],
+                 client: AsyncAzureOpenAI | None = None):
         self._tools = tools
         self._channel_id = channel_id_provider
         self._is_group = is_group_provider
-        self._client = AsyncAzureOpenAI(
+        # 生产由 factory.build_openai_client() 注入(实测校准的 connect 超时 +
+        # 收敛后的重试)。省略时自建一个 SDK 默认配置的 client,只够测试用 ——
+        # 测试全程 monkeypatch 掉 .create,不碰网络,所以超时策略与其无关。
+        self._client = client or AsyncAzureOpenAI(
             azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
             api_key=os.environ["AZURE_OPENAI_API_KEY"],
             api_version=os.environ.get("AZURE_OPENAI_API_VERSION",
@@ -153,11 +198,30 @@ class MAFBackend:
                 arguments["question_type"], arguments.get("username"))
         raise ValueError(f"unknown tool: {name}")
 
-    async def run(self, user_text: str, history: list[dict]) -> str:
+    async def run(self, user_text: str, history: list[dict],
+                  images: list[ImageInput] | None = None) -> str:
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages.extend(history)
-        messages.append({"role": "user", "content": user_text})
+        messages.append(build_user_message(user_text, images))
+        try:
+            # 传副本:_run_tool_loop 会往列表里 append 助手消息与工具结果。若让
+            # 它写进这里的 messages,下面的 messages[-1] 就不再是那条 user
+            # message —— 剥图会改错位置,还会切断 tool_calls 与 tool 结果的配对。
+            return await self._run_tool_loop(list(messages))
+        except BadRequestError:
+            if not images:
+                raise            # 无图时的 400 是真错误,交给 core 兜底
+            # 日志同样不归因:这个分支对带图时的**任何** 400 都触发,
+            # content_filter、context_length_exceeded 也都是 400。写死 "vision
+            # rejected" 会让 on-call 从日志里读出「vision 部署挂了」——把同一种
+            # 误诊搬到运维侧。图片张数是安全的(计数不是内容)且有排查价值。
+            logger.warning("400 on a request carrying %d image(s); retrying without them",
+                           len(images))
+            messages[-1] = build_user_message(user_text, None)
+            answer = await self._run_tool_loop(messages)
+            return f"{answer}\n\n{IMAGE_NOT_PROCESSED_NOTE}"
 
+    async def _run_tool_loop(self, messages: list[dict]) -> str:
         for _ in range(_MAX_TOOL_ROUNDS):
             response = await self._client.chat.completions.create(
                 model=self._deployment,

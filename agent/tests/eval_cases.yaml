@@ -54,8 +54,37 @@ cases:
     expect_tool_called: network_diagnostics
     reply_language: zh
   # 新工具:用量查询(未配置 token 的 channel → 指引)
-  - id: usage-premium-numbers
+  # 两条用例覆盖两条不同的路径,不要合并成一条:
+  # 下面这条用当前术语提问,断言"问实际数字 → 调工具"这条基本路径通;
+  # 再下面那条用已退役的旧词提问,断言 prompt 规则 8 的旧词映射生效 ——
+  # 只留新词等于把这次迁移最容易回归的地方(用户仍在说 premium requests)
+  # 变成没有测试的区域。
+  - id: usage-credits-numbers
+    text: "帮我看下我们组织这个月 AI credits 用了多少?"
+    expected_stage_in: [kb_hit, live_hit, web, generic_advice]
+    expect_tool_called: copilot_usage_lookup
+    reply_language: zh
+  # 旧词提问:premium requests 已于 2026-06-01 退役,但用户会照旧这么问。
+  # 期望模型把它映射到 credits_usage 去查,而不是当成一个查不到的概念。
+  - id: usage-credits-legacy-term
     text: "帮我看下我们组织这个月 premium requests 用了多少?"
     expected_stage_in: [kb_hit, live_hit, web, generic_advice]
     expect_tool_called: copilot_usage_lookup
     reply_language: zh
+  # 图片输入(2026-09-04):断言模型真实读出图中文本并接入检索瀑布
+  - id: image-auth-error-screenshot
+    text: "这是什么问题?怎么解决"
+    images: [fixtures/error_screenshot.png]
+    expected_stage_in: [kb_hit, live_hit, web, generic_advice]
+    expect_answer_contains_any: ["认证", "登录", "Authentication"]
+    reply_language: zh
+  # 刻意不设 reply_language:纯图片消息没有"提问语言",而设计决策 9 的
+  # "回答语言跟随提问语言"在此无定义。截图又是英文 settings.json,
+  # 模型没有理由用中文答 —— 断言任一语言都是在断言一个未定义的属性。
+  # (原先此处还列了 is_mostly_chinese 对 latin 敏感这条理由,该缺陷已于
+  #  2026-09-05 修复 —— 现在比较的是语素而非字符。但上面那条理由独立成立。)
+  - id: image-config-screenshot-no-text
+    text: ""
+    images: [fixtures/config_screenshot.png]
+    expected_stage_in: [kb_hit, live_hit, web, generic_advice]
+    expect_answer_contains_any: ["github.copilot.enable", "配置", "settings"]
