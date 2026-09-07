@@ -32,6 +32,7 @@ uv run --env-file .env python -m teams_adapter  # 启动 Teams bot(见 docs/team
 - 设计 spec:`docs/superpowers/specs/2026-08-21-copilot-advisor-design.md`
 - 图片输入设计:`docs/superpowers/specs/2026-09-04-image-input-design.md`
 - **已知问题清单**:[docs/known-issues.md](docs/known-issues.md)
+- AI Search 索引配置与灌数:[docs/search-index-setup.md](docs/search-index-setup.md)
 - 实现计划:`docs/superpowers/plans/`
 - 开发环境(workspace 安装、企业网络代理):`DEVELOPMENT.md`
 - Teams 联调:`docs/teams-setup.md`
