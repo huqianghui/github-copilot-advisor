@@ -37,10 +37,18 @@ searchable 字段: 【空】
 **更根本的是**:本产品的核心设计是「**KB 优先**,GitHub live 补充,web 兜底」
 (主 spec §3 升级瀑布),而 **KB 那一半从未被真实验证过**。
 
-**修法**:`uv run --env-file .env python -m ingestion run`
+**2026-09-07 进展**:坏索引已删除并由 ingestion 用正确的 12 字段 schema
+重建(5 个 searchable + `content_vector` 向量字段)。**schema 问题已解决。**
 
-**阻塞**:会消耗 GitHub API 配额、产生 Azure OpenAI embedding 费用、
-真的写索引。**属于环境决策,需要人拍板。**
+**但内容会残缺** —— 见 §2:7 个数据源里只有 3 个真的能出数据
+(cli-issues、cli-discussions、community)。覆盖面最大的三个 `microsoft/*`
+源被企业策略拒绝,`copilot-faq` 的过滤条件永远不匹配。
+
+**所以"KB 优先"这条设计仍然没有被完整验证** —— 现在能验证的是
+"KB 能命中 cli/community 的内容",而不是 spec §4 设想的全部覆盖面。
+判读 eval 的 `kb_hit` 时要记得这个边界。
+
+索引配置与重建步骤见 [`docs/search-index-setup.md`](search-index-setup.md)。
 
 ### 1.2 `usage-credits-legacy-term` 是一条绿着说谎的测试 —— 已实证
 
@@ -122,7 +130,7 @@ search 语义。**需要先查证再动。**
 写着「**群聊中保持简洁:先给结论/方案,细节收进编号步骤**」。
 
 **双重代价**:群聊里刷屏是 UX 问题;同时长回答是本次 80 秒总耗时的主要成分
-(见 5.2)。
+(见 6.2)。
 
 **注意**:内容本身是对的、可执行的 —— 问题是**篇幅**,不是质量。修的时候
 不要把有用的排查步骤删掉,而是压缩表述、把细节收进折叠或引用。
@@ -130,9 +138,85 @@ search 语义。**需要先查证再动。**
 
 ---
 
-## 2. 测试基础设施
+## 2. 数据源与灌数
 
-### 2.1 没有任何机制阻止单元测试打真实网络 —— 已两次实证
+2026-09-07 首次全量灌数时逐源实测。**7 个源里只有 3 个真的能出数据。**
+
+### 2.1 三个 `microsoft/*` 源被企业策略拒绝 —— 已实证
+
+```
+GET /repos/microsoft/vscode/issues -> 403
+message: The 'Microsoft Open Source' enterprise forbids access via a
+         fine-grained personal access tokens if the token's lifetime
+         is greater than 8 days.
+```
+
+**不是限流** —— 查过 `core: 5000/5000` 配额是满的。是 Microsoft Open Source
+企业策略禁止有效期 > 8 天的 fine-grained PAT。
+
+影响 `vscode-copilot-issues`、`vscode-copilot-release`、`intellij-copilot`
+三个源 —— **恰好是设计里覆盖面最大的三个**(spec §4 数据源清单)。
+
+**待决**:
+- 换 ≤8 天有效期的 fine-grained PAT —— 能解锁,但每 8 天要换一次,运维成本高
+- 换 classic PAT —— 策略消息只点名 fine-grained,classic 是否可行**未验证**
+- 接受 `microsoft/*` 不可用 —— 知识库只覆盖 cli + community
+
+### 2.2 `copilot-faq` 的 `answered: true` 永远不匹配 —— 已实证
+
+```
+githubcopilotfaq/copilotfaq: 57 条 discussions
+有采纳答案(answer 非空): 0 条
+分类: 使用技巧汇总(25) 使用问题汇总(18) 最新功能更新(9) General(5)
+      —— 四个分类全部 isAnswerable=False
+```
+
+**结构性,不是偶然**:GitHub 在 `isAnswerable=False` 的分类下**根本不允许标记
+采纳答案**,所以 `answer` 恒为 null。`sources.yaml` 里的
+`filters: { answered: true }` 在这个 repo 上永远匹配 0 条。
+
+**这个过滤用错了地方**:那些分类名(使用技巧汇总、使用问题汇总)说明它是
+**人工策展的 FAQ 合集** —— 内容本身就是答案,不存在"提问 → 采纳"的形态。
+`answered` 作为质量门槛是为"社区问答"设计的,不适用于策展内容。
+
+**建议**(未实施,改变入库内容,需拍板):去掉该源的 `answered` 过滤。
+57 条策展 FAQ 恰恰是知识库最想要的东西。
+
+### 2.3 `teams-qa` 无本地数据 —— 已实证
+
+`sources.yaml` 指向 `./data/teams_qa/`,该目录不存在,产出 0 条。
+spec §4 说这是"群内已解决问答(人工整理)",属于**尚未开展的工作**,不是缺陷。
+
+### 2.4 ingestion 全程无进度输出 —— 已查证
+
+`pipeline.run_pipeline()` **跑完全部源才返回**,`__main__` 才打摘要;
+`logger.info("source %s done")` 也**只在单个源完成时**触发一次。
+中途没有任何进度信号,而首次全量可能跑几十分钟。
+
+叠加两件事让它更难判断:
+- 文档只在**每满 50 条**才 upsert(`_UPSERT_BATCH = 50`),所以索引文档数
+  长时间停在 0 是**正常**的
+- 重定向到文件时 stdout 有缓冲,输出文件在结束前是空的
+
+**结果**:唯一可用的进度信号是轮询索引文档数,而它还有 50 条的粒度延迟。
+排查一次"是不是卡住了"花了约 15 分钟。
+
+**修法方向**:逐源开始/结束打日志,或每个 upsert 批次打一行。
+
+### 2.5 `ensure_index()` 不更新已存在索引的 schema —— 已实证
+
+撞到 409 直接静默返回。对着一个 schema 不对的索引跑 ingestion,会**跑完
+GitHub 抓取与 embedding(花掉配额和钱)最后写进一个字段不全的索引**。
+
+已在 [`docs/search-index-setup.md`](search-index-setup.md) §3 写明"schema 不对
+必须先删"的操作步骤。**代码未改** —— 让 `ensure_index` 检测 schema 漂移并
+报错(而非静默)是更好的做法,但那是行为变更,需单独评估。
+
+---
+
+## 3. 测试基础设施
+
+### 3.1 没有任何机制阻止单元测试打真实网络 —— 已两次实证
 
 一条单元测试向生产端点 `smba.trafficmanager.net` 发出带
 `Authorization: Bearer` 的请求、收到线上 401、然后 **PASSED**。
@@ -151,12 +235,12 @@ marker 的测试生效;放行 loopback。**不要用全局 respx 拦截** ——
 
 ---
 
-## 3. 可观测性:工具记账不一致
+## 4. 可观测性:工具记账不一致
 
 `AdvisorEvent.tool_latencies_ms` 是运营判断「哪些工具被调用了、值不值得留」的
 **唯一数据来源**(主 spec §10.2)。当前它的语义在不同工具间不一致。
 
-### 3.1 `escalate_to_human` 完全不记账 —— 已实证
+### 4.1 `escalate_to_human` 完全不记账 —— 已实证
 
 `tool_latencies_ms` 在该函数里出现 **0 次**。没有 `start`,没有写入。
 它只能通过 `run.stage = "escalated"` 被间接观测 —— 这正是
@@ -165,7 +249,7 @@ marker 的测试生效;放行 loopback。**不要用全局 respx 拦截** ——
 **按驱动 `copilot_usage_lookup` 修复的同一条逻辑,这个工具在"哪些工具被调用了"
 的数据里是完全隐形的。**
 
-### 3.2 三个兄弟工具的异常路径漏记 —— 已查证
+### 4.2 三个兄弟工具的异常路径漏记 —— 已查证
 
 `search_solutions`(第 31 行)、`web_search`(第 49 行)、
 `network_diagnostics`(第 86 行)都是 `start` 在前、**成功路径**无条件记账,
@@ -173,7 +257,7 @@ marker 的测试生效;放行 loopback。**不要用全局 respx 拦截** ——
 
 对比:`copilot_usage_lookup` 已于 `ff3c782` 改为 `try/finally`。
 
-### 3.3 `copilot_usage_lookup` 的延迟指标现在混淆 —— 已查证
+### 4.3 `copilot_usage_lookup` 的延迟指标现在混淆 —— 已查证
 
 `not_configured` 与 `privacy_blocked` 分支记 ~0ms,真实 API 调用记 ~800ms,
 **同一个 key**。「是否被调用」的信号是对的(那是修复的目的),但主 spec §10.2 的
@@ -185,11 +269,11 @@ marker 的测试生效;放行 loopback。**不要用全局 respx 拦截** ——
 
 ---
 
-## 4. 图片功能的收尾项
+## 5. 图片功能的收尾项
 
 功能已完成并经真机冒烟发现并修复了一个致命 bug(见 §6)。以下是剩余项。
 
-### 4.1 SDK 管线端到端测试缺失 —— 已实证
+### 5.1 SDK 管线端到端测试缺失 —— 已实证
 
 `file_downloaders` 写入 `state.temp.input_files` 那段管线:
 装配测试用 stub、接线测试手工塞 `input_files`,**中间那段没有任何测试**。
@@ -204,7 +288,7 @@ marker 的测试生效;放行 loopback。**不要用全局 respx 拦截** ——
 
 **修法**:一个走 `agent_app._on_turn` + stub downloader 的测试能同时覆盖三条。
 
-### 4.2 下载没有总时间预算,大小上限事后才判 —— 已查证
+### 5.2 下载没有总时间预算,大小上限事后才判 —— 已查证
 
 `httpx.Timeout(10.0)` 是**每阶段/每次读取**的超时,不是每请求总时长。
 慢速滴送的服务器能把一个 turn 拖住**任意久**(最坏情况**无界**,不是
@@ -217,7 +301,7 @@ marker 的测试生效;放行 loopback。**不要用全局 respx 拦截** ——
 正解是**总预算**,本仓 `search/combined.py` 已有该惯用法
 (`SEARCH_BUDGET_SECONDS` + `asyncio.wait(timeout=...)`)。
 
-### 4.3 `httpx2` logger 未钉死 —— 已查证
+### 5.3 `httpx2` logger 未钉死 —— 已查证
 
 `OPENAI_LOG=debug` 会把 `httpx2` logger 也设成 DEBUG,而
 `_configure_logging()` 只钉了 `openai`。
@@ -225,7 +309,7 @@ marker 的测试生效;放行 loopback。**不要用全局 respx 拦截** ——
 **今天无泄漏** —— 已核实 `httpx2/_client.py` 只有两处 `logger.info`,
 内容是 method/url/status,**无请求体**。但 pin 有洞。
 
-### 4.4 `_to_image_inputs` 对 `image/*` 的潜在 turn-kill —— reported
+### 5.4 `_to_image_inputs` 对 `image/*` 的潜在 turn-kill —— reported
 
 `bot.py` 的 `_to_image_inputs` 用 `startswith("image/")`,会放行 `image/*`,
 而 `ImageInput` 的 pattern 拒绝它 → `ValidationError` → 该调用**在 `try` 之外**
@@ -234,7 +318,7 @@ marker 的测试生效;放行 loopback。**不要用全局 respx 拦截** ——
 **当前不可达**(我们的 downloader 自 `bc5dcb6` 起不再产出通配符),
 但若日后 SDK 管线里加了第二个 `InputFileDownloader`,这条就活了。
 
-### 4.5 两张 eval fixture 缺失 —— **已由真机冒烟回答,建议关闭**
+### 5.5 两张 eval fixture 缺失 —— **已由真机冒烟回答,建议关闭**
 
 `agent/tests/fixtures/README.md` 要求的两张截图未放置,对应用例自动 skip。
 
@@ -250,7 +334,7 @@ OCR(红色横幅全文),并额外注意到了 Agent 下拉框的 "Fetching…" �
 
 两条用例保持 skip 即可。若日后 `detail` 参数或图片预处理有改动,再回来补。
 
-### 4.6 日志正确性无法被单元测试覆盖 —— 已接受的缺口
+### 5.6 日志正确性无法被单元测试覆盖 —— 已接受的缺口
 
 `bc5dcb6` 的变异 4(删掉新加的两条日志)**存活**。实现者刻意**没有**加
 `caplog` 断言,理由是那只能钉住日志**文本**,改个措辞就红,还会让人误以为
@@ -258,9 +342,9 @@ OCR(红色横幅全文),并额外注意到了 Agent 下拉框的 "Fetching…" �
 
 ---
 
-## 5. 环境
+## 6. 环境
 
-### 5.1 Azure OpenAI 间歇性 ConnectTimeout —— 已实证,**部分缓解**
+### 6.1 Azure OpenAI 间歇性 ConnectTimeout —— 已实证,**部分缓解**
 
 真机冒烟时 `httpcore2.ConnectTimeout` 打到 chat completions 端点,
 重试两次都超时,落到 `FALLBACK_MESSAGE`。
@@ -298,7 +382,7 @@ Azure OpenAI endpoint 的出口路径。在此之前,冒烟"失败一次"不足�
 **2026-09-07 复测**:配置修复后冒烟成功,chat completions 连续三次 200 OK
 (一次 0.41s 重试后成功)。**缓解有效。** 但 35% 硬失败率仍在。
 
-### 5.2 单轮总耗时 80 秒 —— 已实证
+### 6.2 单轮总耗时 80 秒 —— 已实证
 
 2026-09-07 冒烟:12:13:41 收到消息 → 12:15:01 发出回复,**80 秒**。
 主 spec §8.2 的设计预期是 **5-15 秒**。
@@ -315,7 +399,7 @@ Azure OpenAI endpoint 的出口路径。在此之前,冒烟"失败一次"不足�
 
 ---
 
-## 6. 零碎
+## 7. 零碎
 
 - **`_TOOL_SCHEMAS` 值得抽成独立模块** —— `maf_backend.py` 247 行里它占 98 行
   纯数据。建议等下一个需要动 schema 的任务顺手做,不值得为纯移动单开 commit。
@@ -326,7 +410,7 @@ Azure OpenAI endpoint 的出口路径。在此之前,冒烟"失败一次"不足�
 
 ---
 
-## 7. 方法论备忘:被实测推翻过的诊断
+## 8. 方法论备忘:被实测推翻过的诊断
 
 本项目中已有多次"看似合理的推断被实测推翻"。记录在此,提醒下次先观测再下结论。
 
@@ -337,6 +421,8 @@ Azure OpenAI endpoint 的出口路径。在此之前,冒烟"失败一次"不足�
 | 「规则 10 保护三处 sink」 | **错**。逐个对代码查:`question_summary` 取自用户输入、`response.markdown` 全仓无 logger 记录。**只有一处成立** |
 | 「`httpx.Timeout(10)` 是每请求超时,最坏 40s」 | **错**。是每阶段超时,最坏**无界** |
 | 「`billing-escalate-quota` 是既有失败」 | **错**。基线上通过 |
+| 「三个源 403 是 GitHub 限流」 | **错**。配额 5000/5000 满的;真因是企业禁止长期 fine-grained PAT |
+| 「ingestion 卡住了 / LLM 调用在超时」 | **错**。实测 client 4/5 成功;真相是首批 50 条未满 + 三个源被拒 |
 | 「GitHub 422 是限定符占了 161/256 预算」 | **错**。14 字符的检索词照样 422 |
 | 「GitHub 422 是检索词超 256 字符」 | **错**。真因是缺 `is:issue`,与长度无关 |
 | 「按 `len()` 截到 256 就安全」 | **错**。空格消耗 3 配额,40 词英文 len=230 实耗 308,仍 422 |
@@ -347,6 +433,10 @@ Azure OpenAI endpoint 的出口路径。在此之前,冒烟"失败一次"不足�
 GitHub 422 那三条尤其值得记:**真因就写在响应体的一行 JSON 里**
 (`Query must include 'is:issue'`),而我连续两次都是盯着长度数字做推断,
 **没有去取响应体**。取一次的成本远低于两轮错误诊断。
+
+**同一个错误在 403 上又犯了一次**:看到三个源 403,第一反应是"限流",
+而真因同样写在响应消息里(企业禁止长期 fine-grained PAT),配额其实是满的。
+**"读响应体"这个动作的成本接近于零,而跳过它的代价是整轮错误排查。**
 
 第三条(空格算 3)还说明另一件事:**即使方向对了,凭直觉选的具体数值也可能是错的**。
 那条规则是靠 20+ 个真实样本拟合出来的,并用 4 次盲预测验证(4/4 命中)——
@@ -362,6 +452,17 @@ GitHub 422 那三条尤其值得记:**真因就写在响应体的一行 JSON 里
    只喂 PNG 时"正确嗅探"与"无脑返回 png"结果相同
 
 **第五类由真机冒烟暴露**:**所有夹具都是我们自己写的形状,没有一个是外部系统
-真实发送的形状**。Teams 发的是 `image/*`(字面通配符),而我们所有测试都用
-具体类型 —— 250 个单元测试、两轮深度审查、16 个变异体全部漏掉,
-一次真机冒烟一次抓到。
+真实发送的形状**。
+
+这一类已经出现**四次**,每次都是"我们对外部系统的假设错了",每次都被 mock
+完美掩盖,每次都是真机/真 API 一碰就露:
+
+| 我们的假设 | 实际 | 被什么发现 |
+|---|---|---|
+| Teams 附件 contentType 是具体类型 | 是 `image/*` 通配符 | 真机冒烟 |
+| GitHub search `state:open` 就够 | 必须含 `is:issue`,否则 **100% 422** | 真 API |
+| `copilotfaq` discussions 有采纳答案 | 分类 `isAnswerable=False`,恒为 0 | 真 API |
+| `GITHUB_TOKEN` 能访问 `microsoft/*` | 企业禁止长期 fine-grained PAT | 真 API |
+
+**共同点**:单元测试全绿,因为它们验证的是"我们以为对方会怎么回应"。
+**对外部契约的假设,只能用真实调用证伪。**
