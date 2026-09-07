@@ -165,11 +165,15 @@ def build_user_message(user_text: str,
 class MAFBackend:
     def __init__(self, tools: AdvisorTools,
                  channel_id_provider: Callable[[], str],
-                 is_group_provider: Callable[[], bool]):
+                 is_group_provider: Callable[[], bool],
+                 client: AsyncAzureOpenAI | None = None):
         self._tools = tools
         self._channel_id = channel_id_provider
         self._is_group = is_group_provider
-        self._client = AsyncAzureOpenAI(
+        # 生产由 factory.build_openai_client() 注入(实测校准的 connect 超时 +
+        # 收敛后的重试)。省略时自建一个 SDK 默认配置的 client,只够测试用 ——
+        # 测试全程 monkeypatch 掉 .create,不碰网络,所以超时策略与其无关。
+        self._client = client or AsyncAzureOpenAI(
             azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
             api_key=os.environ["AZURE_OPENAI_API_KEY"],
             api_version=os.environ.get("AZURE_OPENAI_API_VERSION",

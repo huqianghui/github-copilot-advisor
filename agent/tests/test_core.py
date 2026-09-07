@@ -85,16 +85,23 @@ async def test_citations_and_mentions_from_run_context():
     assert events[0].mentioned_human is True
 
 
-async def test_backend_retry_then_success():
+async def test_core_does_not_retry_backend():
+    """core 不再重试 —— 重试是 openai SDK 的职责(见 factory._MAX_RETRIES)。
+
+    `fail_times=1` 是刻意选的判别值:旧的"重试 2 次"行为会在第二次成功、
+    返回 "ok";现在必须一次就放弃并走兜底。core 这层的重试重跑的是整个
+    tool loop,会重复执行 search_solutions / web_search —— 重复的 GitHub API
+    调用和重复的 web search 计费,盲重试付不起这个代价。
+    """
+    events: list[AdvisorEvent] = []
     backend = StubBackend("ok", fail_times=1)
     core = AdvisorCore(backend, InMemorySessionStore(),
-                       event_sink=lambda e: None)
-    img = _png()
-    resp = await core.handle(make_request(images=[img]))
-    assert resp.markdown == "ok" and len(backend.calls) == 2
-    # 重试必须复现同一请求,含图片。"图片本身导致失败"由 backend 内部剥图
-    # 降级处理(Task 4),不该让 core 盲重试去猜。
-    assert backend.images_seen == [[img], [img]]
+                       event_sink=collect_events(events))
+    resp = await core.handle(make_request(images=[_png()]))
+    assert len(backend.calls) == 1
+    assert resp.markdown == FALLBACK_MESSAGE
+    # 单次失败也要如实上报 —— 不重试不等于把错误吞掉。
+    assert "llm down" in events[0].error
 
 
 async def test_backend_exhausted_returns_fallback_and_skips_session():

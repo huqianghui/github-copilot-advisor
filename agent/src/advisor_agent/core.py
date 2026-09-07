@@ -19,7 +19,12 @@ logger = logging.getLogger(__name__)
 FALLBACK_MESSAGE = ("抱歉,我这边暂时出了点问题,请稍后重试。"
                     "如果持续失败,请联系群里的支持人员。")
 
-_MAX_ATTEMPTS = 2
+# 1 = 不重试。重试全部下沉到 openai SDK(区分可重试状态码、遵守 Retry-After、
+# 指数退避);这一层的 `except Exception` 是盲重试,而且重跑的是整个 tool loop
+# —— search_solutions / web_search 会被重复执行,既贵又有重复副作用(重复的
+# GitHub API 调用、重复的 web search 计费)。两层叠乘还会把最坏等待推到
+# 6 次连接 × 15s,对 Teams 用户不可接受。
+_MAX_ATTEMPTS = 1
 _MAX_CITATIONS = 5
 _SUMMARY_CHARS = 80
 
