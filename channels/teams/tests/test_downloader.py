@@ -6,6 +6,7 @@
 import httpx
 import pytest
 import respx
+from advisor_shared.messages import ImageInput
 from microsoft_agents.activity import Activity
 
 from teams_adapter.bot import _activity_to_dict, _raw_image_count
@@ -101,16 +102,48 @@ def test_handles_none_attachments():
     assert select_images(None) == []
 
 
-def test_rejects_formats_azure_openai_cannot_read():
-    """SVG/BMP/TIFF 过不了 Azure OpenAI。放行它们会让请求在 API 层报 400,
-    进而触发剥图降级 —— 用户收到的将是与真实原因无关的提示。"""
+def test_accepts_teams_wildcard_content_type():
+    """真实 Teams 内联图片的 contentType 是**字面通配符** image/*。
+
+    这是生产事故的直接回归:此前的精确白名单 `content_type in
+    SUPPORTED_IMAGE_TYPES` 把它拒了,于是每一张内联图片都下不来,而 bot.py 的
+    _raw_image_count(裸 startswith)照样数到 1 —— 用户永远只收到
+    "(另有 1 张图片未能获取)",功能在生产环境从未工作过。
+
+    整套夹具此前只喂具体类型(image/png、image/jpeg),样本里根本没有
+    真实世界的那一类,所以 34 个用例全绿也判别不出这个 bug。
+
+    官方文档(bots-filesv4)明说要子串匹配而非相等:Teams 在下发时自己也
+    不知道确切格式,真实格式藏在同时下发的 text/html 附件的 itemscope 里。
+    """
+    assert urls_for([{"contentType": "image/*", "contentUrl": GOOD_URL}]) == [
+        GOOD_URL]
+
+
+def test_wildcard_acceptance_is_not_a_blanket_image_prefix_match():
+    """放行 image/* 不等于退回 startswith("image/")。
+
+    与上一条配对:只有这两条同时在,才既钉住"通配符必须收"、又钉住
+    "具体的不支持格式仍要拒"。SVG 是可执行脚本格式,不该转发;BMP/TIFF
+    过不了 Azure OpenAI,放行会让请求在 API 层报 400 → 触发剥图降级 ——
+    用户收到"这次没能处理你发送的图片",而功能其实好好的,只是格式不对。
+
+    这些类型**已经自报了自己是什么**,不必等下载,所以仍然在这一层拒掉,
+    还省一次出网;通配符没有自报,才需要推迟到 _fetch 看真实字节。
+    """
     for bad in ("image/svg+xml", "image/bmp", "image/tiff",
                 "image/vnd.microsoft.icon"):
-        assert urls_for([{"contentType": bad, "contentUrl": GOOD_URL}]) == []
+        assert urls_for([{"contentType": bad, "contentUrl": GOOD_URL}]) == [], bad
 
 
 def test_returns_content_type_alongside_url():
-    """content_type 要带出去:_fetch 在响应头不可信时拿它兜底。"""
+    """content_type 要带出去,但只用于日志 —— 不是 _fetch 的类型兜底。
+
+    兜底那条路已经拆掉了:真实内联图片的声明类型是 image/*,而 ImageInput 的
+    ^image/[\\w.+-]+$ 不认 *(实测 ValidationError),bot.py 的 _to_image_inputs
+    又在 try 之外调用,兜回声明类型会打死整个 turn。见
+    test_never_yields_a_wildcard_content_type。
+    """
     assert select_images(attachments_activity(
         [{"contentType": "image/jpeg", "contentUrl": GOOD_URL}]).attachments
     ) == [(GOOD_URL, "image/jpeg")]
@@ -142,10 +175,12 @@ def test_every_downloadable_attachment_is_also_counted_as_a_raw_image():
     后者形同虚设 —— 同时收窄两侧照样全绿。这也是为什么此处不写
     len(downloadable) == 3 之类的数字。
     """
-    # 大写样本排在最前:MAX_IMAGES 从尾部截断,排后面会被截掉,
-    # 这条用例就退化成只测小写了。可下载数(3)刻意留在 MAX_IMAGES 之下。
+    # 大写样本与 image/* 排在最前:MAX_IMAGES 从尾部截断,排后面会被截掉,
+    # 这条用例就退化成只测小写、只测具体类型了。可下载数正好是 MAX_IMAGES,
+    # 截断只会让 downloadable 变小,单向包含照样成立,不会假绿。
     content_types = [
         "IMAGE/PNG",        # 大写 —— 下载器收,裸 startswith 的计数器漏掉
+        "image/*",          # 真实 Teams 内联图片的形态:两侧都必须收
         "Image/Jpeg",       # 混合大小写,同上
         "image/png",        # 小写基线:两侧本来就一致
         "image/svg+xml",    # 是图片但 Azure OpenAI 读不了 → 数得到、下不了
@@ -357,13 +392,132 @@ async def test_response_content_type_wins_when_supported():
 
 
 @respx.mock
-async def test_unusable_response_content_type_falls_back_to_declared():
-    """响应头不可信时用 select_images 已校验过的声明类型,
-    不能无脑塞 image/png —— 那会把 GIF 谎报成 PNG。"""
+async def test_wildcard_declaration_resolved_from_response_header():
+    """声明是 image/* 时,响应头里的具体类型算数。
+
+    这是通配符能安全放行的前提:select_images 不再知道格式了,
+    格式检查整体挪到了下载之后,而响应头是第一个可能的信息来源。
+    """
     respx.get(GOOD_URL).mock(return_value=httpx.Response(
-        200, content=PNG, headers={"content-type": "application/octet-stream"}))
-    files = await download([{"contentType": "image/gif", "contentUrl": GOOD_URL}])
+        200, content=PNG, headers={"content-type": "image/gif"}))
+    files = await download([{"contentType": "image/*", "contentUrl": GOOD_URL}])
     assert files[0].content_type == "image/gif"
+
+
+# 四种格式的魔术字节样本。品种必须齐全:只喂 PNG 的话,"真的嗅探"与
+# "无脑 return 'image/png'" 两种实现给出完全相同的结果,测试等于没测。
+JPEG = b"\xff\xd8\xff\xe0" + b"0" * 32
+GIF87 = b"GIF87a" + b"0" * 32
+GIF89 = b"GIF89a" + b"0" * 32
+# WebP 是 RIFF 容器:中间 4 字节是长度字段,"WEBP" 落在偏移 8,
+# 所以它是唯一一个不能用 startswith 判的格式。
+WEBP = b"RIFF" + b"\x24\x00\x00\x00" + b"WEBP" + b"VP8 " + b"0" * 24
+
+
+@pytest.mark.parametrize("content,expected", [
+    (PNG, "image/png"),
+    (JPEG, "image/jpeg"),
+    (GIF87, "image/gif"),     # GIF 有两个版本号,都得认
+    (GIF89, "image/gif"),
+    (WEBP, "image/webp"),
+])
+@respx.mock
+async def test_magic_bytes_resolve_format_when_header_unusable(content, expected):
+    """声明是 image/* **且**响应头不可用时,靠字节自己认出格式。
+
+    这是通配符路径的最后一道防线,也是最容易被"实现成假的"的一处:
+    如果这里只喂 PNG,那么 `return "image/png"` 这种无脑实现照样全绿。
+    五个样本覆盖四种格式(GIF 两个版本号),每个都断言各自解析正确 ——
+    任何一种"猜一个常量"的写法都会被其中至少三条抓住。
+
+    猜错的实际后果不是抽象的:把 GIF 谎报成 PNG 会让 Azure OpenAI 报 400,
+    进而触发剥图降级,用户收到与真实原因无关的提示。
+    """
+    respx.get(GOOD_URL).mock(return_value=httpx.Response(
+        200, content=content, headers={"content-type": "application/octet-stream"}))
+    files = await download([{"contentType": "image/*", "contentUrl": GOOD_URL}])
+    assert [f.content_type for f in files] == [expected]
+
+
+@pytest.mark.parametrize("content", [
+    # SVG:这条路径要挡的正是它。声明成 image/svg+xml 会被 select_images 拒,
+    # 但伪装成 image/* + application/octet-stream 就绕过了那一层,
+    # 只剩魔术字节能认出"这不是那四种格式之一"。
+    b"<svg xmlns='http://www.w3.org/2000/svg'/>",
+    # RIFF 容器但不是 WebP(这是 WAVE 音频)。唯一能杀掉
+    # `content[:4] == b"RIFF"` 这种漏掉偏移 8 校验的写法的样本 ——
+    # 少了它,把 WebP 判据放宽成"只看 RIFF"照样全绿。
+    b"RIFF" + b"\x24\x00\x00\x00" + b"WAVE" + b"fmt " + b"0" * 24,
+    b"\x89PNG",                               # 截断的 PNG 签名:不足 8 字节
+])
+@respx.mock
+async def test_unresolvable_format_is_rejected_rather_than_guessed(content):
+    """响应头和魔术字节都判不出时,拒绝该图,而不是猜一个。
+
+    猜出来的类型必然是错的:字节既然不是那四种格式之一,贴任何一个标签
+    都会在 Azure OpenAI 那边报 400 —— 白烧一次往返,还触发与真实原因
+    无关的剥图降级。
+
+    截断样本还顺带钉住"嗅探不能抛":切片写法对短 bytes 安全,
+    而 content[8:12] 这类若被改成 content[8] 就会 IndexError ——
+    在 download_files 的兜底 except 里会被吞成静默丢图。
+    """
+    respx.get(GOOD_URL).mock(return_value=httpx.Response(
+        200, content=content,
+        headers={"content-type": "application/octet-stream"}))
+    assert await download([{"contentType": "image/*",
+                            "contentUrl": GOOD_URL}]) == []
+
+
+@respx.mock
+async def test_never_yields_a_wildcard_content_type():
+    """_fetch 绝不能把 image/* 透传下去 —— 那会打死整个 turn。
+
+    断言刻意落在"能不能构造出 ImageInput"上,而不是字符串比较:那才是
+    下游真正的契约。ImageInput 的 ^image/[\\w.+-]+$ 不认 *(* 不在
+    [\\w.+-] 里),而 bot.py 的 _to_image_inputs 在 on_message 的 try
+    **之外**调用 —— 抛出的 ValidationError 会越过 fallback:没有回复、
+    没有 FALLBACK_MESSAGE、连 turn_state.save() 都被跳过,用户一个字都收不到。
+    比丢一张图严重得多,而且从用户视角完全静默。
+
+    响应头这里刻意也回 image/*(Teams 完全可能原样回显声明类型):
+    这一条能杀掉"响应头不在白名单就退回声明类型"那类写法 —— 两边都是
+    image/*,兜底兜到的正是那个会炸的值。
+    """
+    respx.get(GOOD_URL).mock(return_value=httpx.Response(
+        200, content=WEBP, headers={"content-type": "image/*"}))
+    files = await download([{"contentType": "image/*", "contentUrl": GOOD_URL}])
+    assert [f.content_type for f in files] == ["image/webp"]
+    # 下游契约本身,而不是它的近似:构造不出来就等于 turn 被打死
+    assert [ImageInput(data=f.content, mime_type=f.content_type).mime_type
+            for f in files] == ["image/webp"]
+
+
+@respx.mock
+async def test_wildcard_attachment_survives_the_whole_pipeline():
+    """端到端:一张真实形态的 Teams 内联图片穿过 select_images → _fetch。
+
+    重演冒烟里的那条消息:Teams 下发一个 text/html 卡片 + 一个 image/*
+    图片附件。事故当时 image_count 是 0;这条钉住它必须是 1,且带具体类型。
+
+    连着断言 _raw_image_count 是为了钉死接缝:skipped = raw - len(images)
+    必须算出 0,用户才不会再收到那句"(另有 1 张图片未能获取)"。
+    只断言 len(files) == 1 抓不到这半边 —— 事故里下载器与计数器口径不一致,
+    恰恰是两侧都单独"正确"却对不上。
+    """
+    attachments = [
+        {"contentType": "text/html", "contentUrl": GOOD_URL},   # Teams 的伴生卡片
+        {"contentType": "image/*", "contentUrl": GOOD_URL},
+    ]
+    respx.get(GOOD_URL).mock(return_value=httpx.Response(
+        200, content=JPEG, headers={"content-type": "image/jpeg"}))
+
+    files = await download(attachments)
+    assert [f.content_type for f in files] == ["image/jpeg"]
+    assert files[0].content == JPEG
+    # 接缝:下载到的张数必须补齐 _raw_image_count 数到的张数
+    raw = _raw_image_count(_activity_to_dict(attachments_activity(attachments)))
+    assert raw - len(files) == 0
 
 
 @respx.mock

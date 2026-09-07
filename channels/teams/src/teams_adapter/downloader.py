@@ -31,22 +31,67 @@ ALLOWED_HOSTS = frozenset({"smba.trafficmanager.net", "api.botframework.com"})
 # 但 content-type 分辨不出动静,只能靠 maf_backend 的不归因降级文案兜底。
 SUPPORTED_IMAGE_TYPES = frozenset({
     "image/png", "image/jpeg", "image/webp", "image/gif"})
+# Teams 对内联图片下发的 contentType 是**字面通配符** image/*,不是具体 MIME
+# 类型;真实格式藏在同时下发的 text/html 附件的 itemscope 里,Teams 自己在
+# 下载前也不知道。官方文档(bots-filesv4)因此要求用子串匹配而非相等判断。
+# 早先这里用精确白名单,于是每一张内联图片都被 select_images 丢掉、
+# 而 bot.py 的 _raw_image_count(startswith)照样数到,用户永远收到
+# "另有 N 张图片未能获取" —— 功能在生产环境从未工作过。
+TEAMS_WILDCARD_TYPE = "image/*"
+# 魔术字节。声明类型现在可能是无信息量的 image/*,响应头也可能缺失或不可信,
+# 所以真实格式最终由字节自己说了算。这四条签名对各自格式是穷尽的:
+# PNG 固定 8 字节签名,JPEG 固定 SOI+标记,GIF 只有 87a/89a 两个版本,
+# WebP 是 RIFF 容器(size 字段占中间 4 字节,故 WEBP 在偏移 8)。
+IMAGE_MAGIC_BYTES = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+)
 MAX_IMAGES = 4
 MAX_IMAGE_BYTES = 4 * 1024 * 1024
 DOWNLOAD_TIMEOUT_S = 10.0
 
 
+def _log_rejected_type(content_type: str) -> None:
+    """按"这次丢弃用户看不看得见"分级,而不是一律 WARNING。
+
+    Teams 每条带图消息都会附一个 text/html 卡片,那是常态,拒它不值得告警 ——
+    一律 WARNING 会让真正的信号淹没在每条消息都有的噪声里。
+    判据刻意与 bot.py 的 _raw_image_count 同口径(裸 startswith("image/")):
+    它数进去的每一张,丢弃后都会变成用户看得见的"另有 N 张图片未能获取",
+    那才是需要在日志里留痕的事。本次 image/* 事故正落在 WARNING 一侧。
+    """
+    if content_type.startswith("image/"):
+        logger.warning("skipping image attachment, content type not accepted: "
+                       "%s", content_type)
+    else:
+        logger.debug("skipping non-image attachment, content type: %s",
+                     content_type or "<missing>")
+
+
 def select_images(attachments) -> list[tuple[str, str]]:
     """挑出可下载的 inline image,返回 (url, content_type)。纯函数,无 I/O。
 
-    带出 content_type 是给 _fetch 兜底用的:响应头缺失或不可信时,
-    用这里已经校验过的声明类型,而不是无脑塞 image/png。
+    带出 content_type **只用于日志**,绝不能拿它当 _fetch 的类型兜底:
+    Teams 内联图片的声明类型是 image/*,而 ImageInput 的 ^image/[\\w.+-]+$
+    不认 *(实测 ValidationError),而 bot.py 的 _to_image_inputs 在 try 之外
+    调用 —— 兜回声明类型会把整个 turn 打死,比丢图严重得多。
+    真实格式由 _fetch 从字节里解析,见 _resolve_image_type。
     """
     selected: list[tuple[str, str]] = []
     for attachment in attachments or []:
         content_type = (getattr(attachment, "content_type", None) or "").lower()
-        # 不在白名单即丢弃,顺带排除了 Teams 附带的 text/html
-        if content_type not in SUPPORTED_IMAGE_TYPES:
+        # 通配符必须放行:Teams 的内联图片全都长这样(见 TEAMS_WILDCARD_TYPE)。
+        # 放行不等于取消格式检查,只是把它推迟到 _fetch 拿到真实字节之后 ——
+        # 那时才知道是不是 PNG/JPEG/WebP/GIF。
+        # 声明了具体格式的照旧在这里判:image/svg+xml、image/bmp、image/tiff
+        # 已经自报是什么,不必等下载,省一次出网。
+        if (content_type != TEAMS_WILDCARD_TYPE
+                and content_type not in SUPPORTED_IMAGE_TYPES):
+            # 这条日志是本次事故的直接教训:精确白名单丢掉了每一张内联图片,
+            # 而整段生产日志里没有一行来自本模块,排障时完全看不出原因。
+            _log_rejected_type(content_type)
             continue
         url = getattr(attachment, "content_url", None)
         # 这行不只是省一次 urlparse:本函数没有 try/except,而 spec §5.3 要求
@@ -56,6 +101,10 @@ def select_images(attachments) -> list[tuple[str, str]]:
         # 变成 AttributeError 并连累整个 turn。测试覆盖不到这条(去掉它现有
         # 用例依然全绿),所以别当它冗余删掉。
         if not url:
+            # 无条件 WARNING:能走到这里说明它已经过了类型闸,是一张
+            # _raw_image_count 会数进去的图,丢掉必然对用户可见。
+            logger.warning("skipping attachment with no content url; "
+                           "content_type=%s", content_type)
             continue
         parsed = urlparse(url)
         # userinfo 必须拒绝,而不只是查 hostname:白名单查的是 hostname,
@@ -80,6 +129,31 @@ def select_images(attachments) -> list[tuple[str, str]]:
         if len(selected) >= MAX_IMAGES:
             break
     return selected
+
+
+def _sniff_image_type(content: bytes) -> str | None:
+    """从魔术字节判定真实格式,判不出返回 None。"""
+    for signature, image_type in IMAGE_MAGIC_BYTES:
+        if content.startswith(signature):
+            return image_type
+    # WebP 是 RIFF 容器:中间 4 字节是长度字段,不能整体 startswith。
+    # 切片对短 bytes 安全(返回短切片,比不上就是 False),不会 IndexError。
+    if content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _resolve_image_type(response_type: str, content: bytes) -> str | None:
+    """定出可以交给 Azure OpenAI 的具体类型;定不出返回 None(该图作废)。
+
+    返回值恒为 SUPPORTED_IMAGE_TYPES 的成员或 None —— 格式检查并没有因为
+    select_images 放行 image/* 而消失,只是挪到了这里:此刻才有真实字节。
+    绝不返回 image/*,也绝不在判不出时猜一个(猜错会把 GIF 谎报成 PNG,
+    或者把 SVG 之类当图片发出去,在 API 层报 400 后触发无关的剥图降级)。
+    """
+    if response_type in SUPPORTED_IMAGE_TYPES:
+        return response_type
+    return _sniff_image_type(content)
 
 
 class TeamsImageDownloader(InputFileDownloader):
@@ -173,11 +247,20 @@ class TeamsImageDownloader(InputFileDownloader):
                            len(content), url)
             return None
 
-        content_type = (response.headers.get("content-type", "")
-                        .split(";")[0].strip().lower())
-        if content_type not in SUPPORTED_IMAGE_TYPES:
-            # 响应头不可信时退回 select_images 已校验过的声明类型,
-            # 而不是无脑塞 image/png —— 那会把 GIF 谎报成 PNG。
-            content_type = declared_type
+        response_type = (response.headers.get("content-type", "")
+                         .split(";")[0].strip().lower())
+        content_type = _resolve_image_type(response_type, content)
+        if content_type is None:
+            # 拒绝,不猜。declared_type 在这里**只进日志**:Teams 内联图片的
+            # 声明类型是 image/*,拿它兜底会让 bot.py 的 _to_image_inputs 在
+            # 构造 ImageInput 时抛 ValidationError(pattern 不认 *),而那处
+            # 调用在 try 之外 —— 整个 turn 死掉,用户一个字都收不到。
+            # url 与上面两条告警同格式,便于把同一张图的日志串起来;
+            # 带 userinfo 的 URL 到不了这里(select_images 已拒),没有泄漏面。
+            logger.warning(
+                "attachment format not recognized, skipped; declared=%s "
+                "response=%s url=%s",
+                declared_type, response_type or "<missing>", url)
+            return None
         return InputFile(content=content, content_type=content_type,
                          content_url=url)
