@@ -194,17 +194,40 @@ fixture。链路本身已由 `test_vision_pipeline.py` 覆盖(变异验证过)�
 
 ## 5. 环境
 
-### 5.1 Azure OpenAI 间歇性 ConnectTimeout —— 已实证
+### 5.1 Azure OpenAI 间歇性 ConnectTimeout —— 已实证,**部分缓解**
 
 真机冒烟时 `httpcore2.ConnectTimeout` 打到 chat completions 端点,
 重试两次都超时,落到 `FALLBACK_MESSAGE`。
 
-**链路行为是对的**(`core.py` 重试 2 次 → 兜底文案 → 用户收到道歉而非崩溃),
-但网络本身有问题。同一台机器上早先跑 vision pipeline 测试是通的,
-所以要么间歇性,要么 bot 进程的出口路径不同。
+**根因有两半,一半是我们的配置错。** 实测该 endpoint 的**成功**连接耗时
+(13 次采样,单位秒):
+
+```
+7.9  9.5  10.3  9.9  5.2  8.5  7.1  8.8  8.1  2.5  7.9  1.9  6.0
+```
+
+中位数约 8s、最大 10.9s,**只有 2 次落在 openai SDK 默认的 `connect=5.0` 之内**。
+也就是说 bot 在连接本来能建立的时候就提前放弃了 —— 这部分是配置问题,已修。
+
+**已做的缓解:**
+
+- `connect` 超时 5s → **15s**(覆盖实测最大值并留余量)。`read`/`write`/`pool`
+  保持 SDK 默认 600 不动 —— 那是 LLM 生成时间,与连接无关。
+- 重试从两层收敛为一层:`core.py` 的 `_MAX_ATTEMPTS` 2 → 1(不重试),
+  只保留 openai SDK 的重试(`max_retries=1`,即总 2 次尝试)。否则 2 × 3 = 6 次
+  连接 × 15s = 90s,对 Teams 用户不可接受。现在最坏 ~30s。
+- 策略集中在 `factory.build_openai_client()`。**注意**:chat client 原先由
+  `MAFBackend` 自己 new,不经过 factory —— 只改 factory 会漏掉真正出问题的那个
+  client。现在由 factory 注入。
+
+**仍然存在的问题(未解决):** 采样中另有**约 35% 的连接彻底失败**,与超时值无关
+—— 15s、60s 都连不上。这是网络本身的问题,不是代码能治的。按这个失败率,
+即使配置修好,用户仍会间歇性看到兜底道歉文案。**需要联系网络组**排查 bot 主机到
+Azure OpenAI endpoint 的出口路径。在此之前,冒烟"失败一次"不足以判定功能坏了。
 
 **重跑冒烟时注意**:超时会**掩盖图片处理的真实结果**。若又超时,
-先确认网络再判断功能。
+先确认网络再判断功能。同一台机器上早先跑 vision pipeline 测试是通的,
+说明是间歇性,或 bot 进程的出口路径与测试进程不同。
 
 ---
 

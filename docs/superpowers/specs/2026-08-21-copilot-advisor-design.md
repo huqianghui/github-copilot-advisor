@@ -391,13 +391,25 @@ channels:
 |---|---|
 | AI Search 不可用 | search_solutions 降级为仅 github_live_search;全失败则如实告知+通用建议 |
 | web provider 失败 | failover 链依次尝试;全挂跳过该级进通用建议 |
-| Azure OpenAI 限流/超时 | 指数退避重试 2 次;仍失败回复固定道歉文案(adapter 兜底,不静默) |
+| Azure OpenAI 限流/超时 | 重试只在 openai SDK 一层:总 2 次尝试(`max_retries=1`)、指数退避、遵守 `Retry-After`、只重试 429/5xx/连接错误。core 不重试(见下)。仍失败回复固定道歉文案(adapter 兜底,不静默) |
 | GitHub API 限流 | ingestion:退避+断点续传(水位不推进);live search:跳过不阻塞 |
 | ingestion 单源失败 | 隔离,其他源继续;摘要报告标红,exit code 非 0 供告警 |
 | LLM 提炼失败(单条) | 跳过并记录,不中断批次 |
 | 会话存储丢失 | 优雅降级为单轮问答 |
 | 图片下载失败/超时 | 跳过该图以文本继续;无图存活且文本为空则提示改贴文字 |
 | 带图请求被拒(400) | MAFBackend 内剥图重试一次,回答附不归因的未处理说明 |
+
+**重试为什么只留一层。** `AdvisorCore` 曾经也重试(`_MAX_ATTEMPTS = 2`),与 SDK
+的重试相乘,最坏要打 6 次连接。两层里该留的是 SDK 那层:它区分可重试的状态码、
+遵守 `Retry-After`、做指数退避;core 那层是 `except Exception` 盲重试,而且重跑的是
+**整个 tool loop** —— `search_solutions` / `web_search` 会被重复执行,产生重复的
+GitHub API 调用与重复的 web search 计费。故 `_MAX_ATTEMPTS = 1`(不重试)。
+
+**连接超时。** openai SDK 默认 `connect=5.0`,而实测本环境到 Azure OpenAI 的成功
+连接耗时中位数约 8s、最大 10.9s —— 默认值会在连接本来能建立时提前放弃。现改为
+`connect=15.0`(`read`/`write`/`pool` 保持默认 600,那是 LLM 生成时间)。策略定义在
+`factory.build_openai_client()`,chat 与 embedding 两个 client 共用。
+最坏路径:1(core)× 2(SDK 尝试)× 15s = **~30s** 后回兜底文案。
 
 ### 10.2 可观测性(v1 不自建控制台,用 Azure 原生栈)
 
