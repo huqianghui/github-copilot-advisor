@@ -26,7 +26,7 @@ advisor agent。用户在群里 @agent 提问,agent 回答所有 GitHub Copilot 
 | 5 | 编排框架 | Microsoft Agent Framework(2026-04 已 1.0 GA,Python/.NET),取代自建 tool loop;与 Foundry hosted agents 原生兼容 |
 | 6 | GitHub Copilot SDK | 第一版不用作核心引擎(technical preview、订阅制授权不适合服务端 bot、定位是编码 agent 而非知识问答)。作为 LLM provider 抽象下的预留 backend,待 GA 后可加 adapter 接入 |
 | 7 | Web search | 可插拔多 provider:Bing Grounding(Azure AI Foundry)/ Tavily / WorkIQ 等,支持 failover 链,配置驱动 |
-| 8 | 多轮对话 | 支持。按 Teams 会话线程(reply thread / 1:1 会话)维护状态;会话存储起步用内存,接口预留 Cosmos DB/Redis |
+| 8 | 多轮对话 | 支持。按 Teams 租户 + 完整会话/线程 ID + 发送者 ID 隔离;AdvisorCore + SessionStore 维护历史,会话存储起步用内存,接口预留 Cosmos DB/Redis |
 | 9 | 回答语言 | 跟随提问语言(中文问中文答,英文问英文答);引用英文源保留原文链接 |
 | 10 | 部署形态 | 三种都支持:本地进程 / 容器(Container Apps 等)/ Azure hosted agent。核心功能与库先行 |
 | 11 | 数据源筛选 | vscode 仓库按 Copilot 相关标签筛 closed issues;专门反馈仓库(vscode-copilot-release、copilot-intellij-feedback)可全量 |
@@ -283,10 +283,11 @@ corporate egress/proxy/firewall。因此定位为"排除性证据 + 客户自测
 
 ### 7.4 多轮会话
 
-- MAF thread/session 维护历史;会话 key = `AdvisorRequest.conversation_key` —— 平台无关的
-  不透明字符串,agent core 只作字典 key 使用、从不解析。**如何推导是各渠道 adapter 的私有
-  实现**:Teams 用 conversation.id(天然含 reply thread);企微/飞书等未来各自用本平台的
-  会话/话题标识推导,core 与其他 adapter 均不受影响
+- AdvisorCore + SessionStore 维护历史;会话 key = `teams:user:v1:<SHA-256>` —— 平台无关的不透明字符串,
+  core 只作字典 key 使用、从不解析。Teams 历史按租户、完整会话/线程 ID 和发送者 ID 隔离,
+  具体编码与校验见 [用户隔离设计](2026-09-11-teams-user-isolation-design.md)。
+  core 将键视为不透明字符串,同键完整回合排队,不同键并行。工具路由使用请求级上下文,
+  不使用进程全局的渠道/群聊标记。旧的群共享历史不迁移、不回退读取;现有内存 TTL 与条数上限不变。
 - 存储接口抽象:v1 in-memory(TTL+条数上限),留 Cosmos DB/Redis 实现位
 - 升级推进依赖对话历史,无显式状态字段
 
@@ -320,8 +321,8 @@ Teams 客户端(@提及 / 1:1)
 关键规则:
 - 触发:channel 仅 @提及响应;1:1 全部响应;其余群消息忽略(自动沉淀留后续)
 - 即时反馈:先发 typing indicator,agent 完成再回正文(检索+LLM 5-15s)
-- conversation_key(Teams adapter 私有推导规则):直接取 Teams conversation.id ——
-  channel 回帖时其值为 `"{channel_id};messageid={根消息ID}"`,天然同串共享会话;1:1 即会话 id
+- conversation_key(Teams adapter 私有推导规则):按租户、完整会话/线程 ID 和发送者 ID 生成
+  `teams:user:v1:<SHA-256>`;channel 回帖时仍使用原 reply thread ID,1:1 即会话 id。
 - 本地开发:dev tunnel / Bot Framework Emulator / 测试租户
 - 图片输入:支持 Teams inline image(报错截图/配置截图/纯图片),
   详见 `2026-09-04-image-input-design.md`。图片不进会话历史,
