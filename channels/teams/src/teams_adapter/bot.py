@@ -8,12 +8,21 @@ from microsoft_agents.activity import Activity
 from microsoft_agents.hosting.core import AgentApplication, TurnContext, TurnState
 
 from advisor_agent.core import FALLBACK_MESSAGE
-from teams_adapter.extract import is_empty, should_respond, to_advisor_request
+from teams_adapter.extract import (
+    ConversationIdentityError,
+    is_empty,
+    should_respond,
+    to_advisor_request,
+)
 from teams_adapter.render import render_reply
 
 logger = logging.getLogger(__name__)
 
 IMAGE_FETCH_FAILED = "图片没取到,能否把错误信息贴成文字?"
+IDENTITY_UNAVAILABLE = (
+    "无法识别本次消息的会话或用户身份,为避免混用他人的上下文,本次未处理。"
+    "请重新发送;若仍失败,请联系管理员。"
+)
 
 
 def _activity_to_dict(activity: Activity) -> dict:
@@ -92,7 +101,17 @@ def register_handlers(agent_app: AgentApplication, core):
             return
 
         images = _to_image_inputs(state)
-        request = to_advisor_request(activity, bot_id, images)
+        try:
+            request = to_advisor_request(activity, bot_id, images)
+        except ConversationIdentityError as error:
+            logger.warning(
+                "conversation identity rejected field=%s reason=%s",
+                error.field,
+                error.reason,
+            )
+            await context.send_activity(Activity(
+                type="message", text=IDENTITY_UNAVAILABLE))
+            return
         raw_images = _raw_image_count(activity)
 
         if is_empty(request):
