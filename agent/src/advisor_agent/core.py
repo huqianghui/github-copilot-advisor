@@ -10,7 +10,7 @@ from advisor_agent.extensions import (
     QueryPlanner,
 )
 from advisor_agent.run_context import new_run
-from advisor_agent.sessions import SessionStore
+from advisor_agent.sessions import SessionStore, SessionTurnCoordinator
 from advisor_shared.events import AdvisorEvent
 from advisor_shared.messages import AdvisorRequest, AdvisorResponse, Citation
 
@@ -45,8 +45,13 @@ class AdvisorCore:
         self.evaluator = evaluator or NoopEvaluator()
         self.event_sink = event_sink
         self.channel_name = channel_name
+        self._turns = SessionTurnCoordinator()
 
     async def handle(self, request: AdvisorRequest) -> AdvisorResponse:
+        async with self._turns.turn(request.conversation_key):
+            return await self._handle_turn(request)
+
+    async def _handle_turn(self, request: AdvisorRequest) -> AdvisorResponse:
         request = await self.planner.plan(request)
         run = new_run()
         history = await self.sessions.get(request.conversation_key)

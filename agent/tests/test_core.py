@@ -1,3 +1,5 @@
+import asyncio
+
 from advisor_agent.core import _SUMMARY_CHARS, FALLBACK_MESSAGE, AdvisorCore
 from advisor_agent.run_context import current_run
 from advisor_agent.sessions import InMemorySessionStore
@@ -164,3 +166,63 @@ async def test_event_summary_is_truncated():
                        event_sink=collect_events(events))
     await core.handle(make_request(text="错" * 200))
     assert len(events[0].question_summary) == _SUMMARY_CHARS
+
+
+async def test_core_serializes_one_key_without_blocking_other_keys():
+    entered = []
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    followup_queued = asyncio.Event()
+    other_finished = asyncio.Event()
+
+    class BlockingBackend(StubBackend):
+        async def run(self, user_text, history, images=None):
+            entered.append(user_text)
+            if user_text == "first":
+                first_started.set()
+                await release_first.wait()
+            return await super().run(user_text, history, images)
+
+    backend = BlockingBackend(reply="answer")
+    core = AdvisorCore(backend, InMemorySessionStore(), event_sink=lambda e: None)
+
+    async def followup():
+        followup_queued.set()
+        return await core.handle(make_request("followup"))
+
+    async def other():
+        response = await core.handle(make_request("other").model_copy(
+            update={"conversation_key": "ck2", "user_id": "other"}))
+        other_finished.set()
+        return response
+
+    async with asyncio.timeout(5), asyncio.TaskGroup() as tasks:
+        tasks.create_task(core.handle(make_request("first")))
+        await first_started.wait()
+        tasks.create_task(followup())
+        await followup_queued.wait()
+        assert entered == ["first"]
+        tasks.create_task(other())
+        await other_finished.wait()
+        assert entered == ["first", "other"]
+        release_first.set()
+    histories = dict(backend.calls)
+    assert histories["other"] == []
+    assert histories["followup"] == [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    assert core._turns._entries == {}
+
+
+async def test_failed_turn_does_not_block_next_turn_or_save_failure():
+    sessions = InMemorySessionStore()
+    core = AdvisorCore(StubBackend(reply="ok", fail_times=1), sessions,
+                       event_sink=lambda e: None)
+    assert (await core.handle(make_request("failed"))).markdown == FALLBACK_MESSAGE
+    assert (await core.handle(make_request("next"))).markdown == "ok"
+    assert await sessions.get("ck1") == [
+        {"role": "user", "content": "next"},
+        {"role": "assistant", "content": "ok"},
+    ]
+    assert core._turns._entries == {}
