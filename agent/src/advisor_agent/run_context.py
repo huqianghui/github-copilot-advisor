@@ -51,6 +51,11 @@ def request_scope(channel_id: str, is_group: bool) -> Iterator[RunContext]:
 
 
 def new_run() -> RunContext:
+    """仅供独立工具测试使用；生产回合请通过 request_scope() 绑定。
+
+    new_run() 不会恢复先前的 current_run token，也不应在 request_scope()
+    管理的 scoped turn 内再次调用。
+    """
     run = RunContext()
     current_run.set(run)
     return run
