@@ -1,7 +1,9 @@
 import asyncio
 
+import pytest
+
 from advisor_agent.core import _SUMMARY_CHARS, FALLBACK_MESSAGE, AdvisorCore
-from advisor_agent.run_context import current_run
+from advisor_agent.run_context import current_run, get_request_context, request_scope
 from advisor_agent.sessions import InMemorySessionStore
 from advisor_shared.events import AdvisorEvent
 from advisor_shared.messages import AdvisorRequest, ImageInput, MentionDirective
@@ -226,3 +228,101 @@ async def test_failed_turn_does_not_block_next_turn_or_save_failure():
         {"role": "assistant", "content": "ok"},
     ]
     assert core._turns._entries == {}
+
+
+@pytest.mark.parametrize("in_place", [False, True])
+@pytest.mark.parametrize(("field", "value"), [
+    ("conversation_key", "wrong-key"),
+    ("channel_id", "wrong-channel"),
+    ("user_id", "wrong-user"),
+    ("is_group", False),
+])
+async def test_planner_cannot_change_identity(field, value, in_place):
+    class Planner:
+        async def plan(self, request):
+            if in_place:
+                setattr(request, field, value)
+                return request
+            return request.model_copy(update={field: value})
+
+    backend = StubBackend()
+    sessions = InMemorySessionStore()
+    core = AdvisorCore(backend, sessions, planner=Planner(),
+                       event_sink=lambda e: None)
+    with pytest.raises(ValueError, match="planner changed request identity"):
+        await core.handle(make_request())
+    assert backend.calls == []
+    assert await sessions.get("ck1") == []
+    assert await sessions.get("wrong-key") == []
+    assert core._turns._entries == {}
+
+
+async def test_planner_can_rewrite_text_inside_request_scope():
+    class Planner:
+        async def plan(self, request):
+            assert get_request_context().channel_id == "19:abc"
+            assert get_request_context().is_group is True
+            return request.model_copy(update={"text": "rewritten"})
+
+    backend = StubBackend()
+    core = AdvisorCore(backend, InMemorySessionStore(), planner=Planner(),
+                       event_sink=lambda e: None)
+    with request_scope("outer", False) as outer:
+        await core.handle(make_request())
+        assert get_request_context().channel_id == "outer"
+        assert current_run.get() is outer
+    assert backend.calls[0][0] == "rewritten"
+
+
+@pytest.mark.parametrize("failure_at", ["planner", "evaluator"])
+async def test_core_failure_restores_context_and_releases_turn(failure_at):
+    class Planner:
+        async def plan(self, request):
+            if failure_at == "planner":
+                raise RuntimeError("failed")
+            return request
+
+    class Evaluator:
+        async def evaluate(self, request, response):
+            raise RuntimeError("failed")
+
+    sessions = InMemorySessionStore()
+    core = AdvisorCore(StubBackend(), sessions, planner=Planner(),
+                       evaluator=Evaluator(), event_sink=lambda e: None)
+    with request_scope("outer", False) as outer:
+        with pytest.raises(RuntimeError, match="failed"):
+            await core.handle(make_request())
+        assert get_request_context().channel_id == "outer"
+        assert current_run.get() is outer
+    assert await sessions.get("ck1") == []
+    assert core._turns._entries == {}
+
+
+async def test_core_cancellation_restores_child_context_and_releases_turn():
+    entered = asyncio.Event()
+
+    class BlockingBackend(StubBackend):
+        async def run(self, user_text, history, images=None):
+            entered.set()
+            await asyncio.Event().wait()
+            raise AssertionError("blocking backend unexpectedly resumed")
+
+    sessions = InMemorySessionStore()
+    core = AdvisorCore(BlockingBackend(), sessions, event_sink=lambda e: None)
+    with request_scope("outer", False) as outer:
+        async def call():
+            try:
+                await core.handle(make_request())
+            except asyncio.CancelledError:
+                assert get_request_context().channel_id == "outer"
+                assert current_run.get() is outer
+                raise
+
+        async with asyncio.timeout(5), asyncio.TaskGroup() as tasks:
+            task = tasks.create_task(call())
+            await entered.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+    assert core._turns._entries == {}
+    assert await sessions.get("ck1") == []

@@ -8,7 +8,6 @@ from microsoft_agents.activity import Activity
 from microsoft_agents.hosting.core import AgentApplication, TurnContext, TurnState
 
 from advisor_agent.core import FALLBACK_MESSAGE
-from advisor_agent.factory import set_current_channel_id, set_current_is_group
 from teams_adapter.extract import is_empty, should_respond, to_advisor_request
 from teams_adapter.render import render_reply
 
@@ -109,8 +108,6 @@ def register_handlers(agent_app: AgentApplication, core):
                 "text": f"{request.text}(另有 {skipped} 张图片未能获取)".strip()})
 
         await context.send_activity(Activity(type="typing"))
-        set_current_channel_id(request.channel_id)
-        set_current_is_group(request.is_group)
         try:
             response = await core.handle(request)
             reply = render_reply(response)

@@ -1,6 +1,8 @@
 """单次问答的运行上下文:工具上报副作用,核心管线读取。
 用 contextvars 而不是解析 LLM 自由文本(spec 7.1、10.2)。"""
 from contextvars import ContextVar
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 from advisor_shared.events import SearchAttempt
@@ -18,6 +20,34 @@ class RunContext:
 
 
 current_run: ContextVar[RunContext] = ContextVar("current_run")
+
+
+@dataclass(frozen=True)
+class RequestContext:
+    channel_id: str
+    is_group: bool
+
+
+_current_request: ContextVar[RequestContext] = ContextVar("current_request")
+
+
+def get_request_context() -> RequestContext:
+    try:
+        return _current_request.get()
+    except LookupError:
+        raise RuntimeError("request context is not bound") from None
+
+
+@contextmanager
+def request_scope(channel_id: str, is_group: bool) -> Iterator[RunContext]:
+    request_token = _current_request.set(RequestContext(channel_id, is_group))
+    run = RunContext()
+    run_token = current_run.set(run)
+    try:
+        yield run
+    finally:
+        current_run.reset(run_token)
+        _current_request.reset(request_token)
 
 
 def new_run() -> RunContext:

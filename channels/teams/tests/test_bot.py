@@ -122,14 +122,13 @@ async def test_core_error_sends_fallback():
     assert FALLBACK_MESSAGE in ctx.sent[-1].text
 
 
-async def test_sets_current_channel_id_and_is_group():
-    from advisor_agent.factory import _channel_id_holder, _is_group_holder
+async def test_passes_channel_and_group_mode_to_core():
     core = StubCore()
     handler = register_handlers(_agent_app(), core)
     ctx = FakeTurnContext(group_activity())
     await handler(ctx, TurnState())
-    assert _channel_id_holder["value"] == "19:c"
-    assert _is_group_holder["value"] is True
+    assert core.requests[0].channel_id == "19:c"
+    assert core.requests[0].is_group is True
 
 
 def _image_attachment(url="https://x/y") -> Attachment:

@@ -60,17 +60,11 @@ def test_solid_png_is_a_valid_png():
 
 async def test_image_bytes_actually_reach_the_model():
     """模型能说出颜色 ⇒ 像素真的到了。这是整条链路唯一的端到端证据。"""
-    from advisor_agent.factory import (
-        build_advisor,
-        set_current_channel_id,
-        set_current_is_group,
-    )
+    from advisor_agent.factory import build_advisor
 
     events = []
     core = build_advisor(channel_name="vision-pipeline")
     core.event_sink = events.append
-    set_current_channel_id("19:eval")
-    set_current_is_group(True)
 
     request = AdvisorRequest(
         text="这张图是什么颜色?", conversation_key="vision-pipeline",

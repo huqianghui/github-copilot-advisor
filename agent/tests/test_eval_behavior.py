@@ -87,11 +87,10 @@ def make_request(text: str, images: list[ImageInput] | None = None) -> AdvisorRe
 
 @pytest.mark.parametrize("case", CASES, ids=[c["id"] for c in CASES])
 async def test_eval_case(case, eval_turns: list[dict]):
-    from advisor_agent.factory import build_advisor, set_current_channel_id
+    from advisor_agent.factory import build_advisor
     events: list[AdvisorEvent] = []
     core = build_advisor(channel_name="eval")
     core.event_sink = events.append
-    set_current_channel_id("19:eval")
 
     turns = case.get("multi_turn") or [case["text"]]
     key = f"eval-{case['id']}"
