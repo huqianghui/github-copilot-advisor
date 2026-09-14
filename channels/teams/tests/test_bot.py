@@ -1,4 +1,6 @@
 # channels/teams/tests/test_bot.py
+import pytest
+
 from advisor_shared.messages import AdvisorResponse
 from microsoft_agents.activity import Activity, Attachment
 from microsoft_agents.hosting.core import (
@@ -7,7 +9,7 @@ from microsoft_agents.hosting.core import (
     TurnState,
 )
 from microsoft_agents.hosting.core.app.input_file import InputFile
-from teams_adapter.bot import IMAGE_FETCH_FAILED, register_handlers
+from teams_adapter.bot import IMAGE_FETCH_FAILED, IDENTITY_UNAVAILABLE, register_handlers
 
 BOT_ID = "28:bot"
 
@@ -58,7 +60,8 @@ def group_activity(mentions_bot=True) -> Activity:
         "entities": entities,
         "conversation": {"id": "19:c;messageid=1",
                          "conversationType": "channel"},
-        "channelData": {"channel": {"id": "19:c"}},
+        "channelData": {"channel": {"id": "19:c"},
+                        "tenant": {"id": "tenant-a"}},
         "from": {"id": "29:u", "name": "n"},
     })
 
@@ -68,7 +71,8 @@ def personal_activity() -> Activity:
         "type": "message",
         "text": "登录失败",
         "recipient": {"id": BOT_ID, "name": "bot"},
-        "conversation": {"id": "19:personal", "conversationType": "personal"},
+        "conversation": {"id": "19:personal", "conversationType": "personal",
+                          "tenantId": "tenant-a"},
         "from": {"id": "29:u", "name": "n"},
     })
 
@@ -122,14 +126,13 @@ async def test_core_error_sends_fallback():
     assert FALLBACK_MESSAGE in ctx.sent[-1].text
 
 
-async def test_sets_current_channel_id_and_is_group():
-    from advisor_agent.factory import _channel_id_holder, _is_group_holder
+async def test_passes_channel_and_group_mode_to_core():
     core = StubCore()
     handler = register_handlers(_agent_app(), core)
     ctx = FakeTurnContext(group_activity())
     await handler(ctx, TurnState())
-    assert _channel_id_holder["value"] == "19:c"
-    assert _is_group_holder["value"] is True
+    assert core.requests[0].channel_id == "19:c"
+    assert core.requests[0].is_group is True
 
 
 def _image_attachment(url="https://x/y") -> Attachment:
@@ -325,3 +328,35 @@ async def test_partial_drop_note_survives_empty_text():
     await handler(FakeTurnContext(activity), state)
     assert core.requests[0].text == "(另有 1 张图片未能获取)"
     assert len(core.requests[0].images) == 1
+
+
+@pytest.mark.parametrize("missing", ["tenant", "conversation", "user"])
+async def test_missing_identity_is_visible_and_never_reaches_core(
+        missing, caplog):
+    payload = group_activity().model_dump(by_alias=True, exclude_none=True)
+    payload["text"] = "<at>A</at> private-test-question"
+    if missing == "tenant":
+        del payload["channelData"]["tenant"]
+    elif missing == "conversation":
+        payload["conversation"]["id"] = " "
+    else:
+        del payload["from"]["id"]
+    context = FakeTurnContext(Activity.model_validate(payload))
+    core = StubCore()
+    await register_handlers(_agent_app(), core)(context, TurnState())
+    assert core.requests == []
+    assert [message.text for message in context.sent] == [IDENTITY_UNAVAILABLE]
+    assert "conversation identity rejected" in caplog.text
+    assert "private-test-question" not in caplog.text
+    assert "29:u" not in caplog.text
+    assert "tenant-a" not in caplog.text
+
+
+async def test_sdk_serialization_preserves_both_supported_tenant_locations():
+    for activity in (group_activity(), personal_activity()):
+        context = FakeTurnContext(activity)
+        core = StubCore()
+        await register_handlers(_agent_app(), core)(context, TurnState())
+        assert len(core.requests) == 1
+        assert core.requests[0].conversation_key.startswith("teams:user:v1:")
+        assert len(context.sent) == 2

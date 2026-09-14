@@ -10,6 +10,7 @@ from advisor_agent.core import AdvisorCore
 from advisor_agent.diagnostics import NetworkDiagnostics
 from advisor_agent.escalation import EscalationConfig
 from advisor_agent.maf_backend import MAFBackend
+from advisor_agent.run_context import get_request_context
 from advisor_agent.search.combined import CombinedSearch
 from advisor_agent.search.github_live import GitHubLiveSearchClient
 from advisor_agent.search.knowledge import KnowledgeSearchClient
@@ -17,9 +18,6 @@ from advisor_agent.search.web import BraveProvider, TavilyProvider, WebSearchCha
 from advisor_agent.sessions import InMemorySessionStore
 from advisor_agent.tools import AdvisorTools
 from advisor_agent.usage import CopilotUsageClient
-
-_channel_id_holder: dict[str, str] = {"value": ""}
-_is_group_holder: dict[str, bool] = {"value": False}
 
 # openai SDK 的默认 connect 超时是 5s。实测本环境到 Azure OpenAI endpoint 的
 # 成功连接耗时(13 次采样)中位数约 8s、最大 10.9s,只有 2 次落在 5s 内 ——
@@ -60,22 +58,11 @@ def build_openai_client(api_version: str) -> AsyncAzureOpenAI:
 
 
 def _channel_id_provider() -> str:
-    return _channel_id_holder["value"]
-
-
-def set_current_channel_id(channel_id: str) -> None:
-    """渠道 adapter 在每次 handle 前调用(单 worker 内串行时安全;
-    多并发部署改为 contextvars,接口不变)。"""
-    _channel_id_holder["value"] = channel_id
+    return get_request_context().channel_id
 
 
 def _is_group_provider() -> bool:
-    return _is_group_holder["value"]
-
-
-def set_current_is_group(is_group: bool) -> None:
-    """渠道 adapter 在每次 handle 前调用,与 set_current_channel_id 同模式。"""
-    _is_group_holder["value"] = is_group
+    return get_request_context().is_group
 
 
 def build_advisor(channel_name: str = "generic") -> AdvisorCore:

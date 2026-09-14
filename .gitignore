@@ -4,7 +4,9 @@ __pycache__/
 superpowers-plugin
 .claude/settings.local.json
 .venv/
+.worktrees/
 *.egg-info/
 .pytest_cache/
+agent/tests/output/
 .state/
 agent/escalation.yaml

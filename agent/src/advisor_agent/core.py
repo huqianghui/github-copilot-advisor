@@ -9,8 +9,8 @@ from advisor_agent.extensions import (
     NoopPlanner,
     QueryPlanner,
 )
-from advisor_agent.run_context import new_run
-from advisor_agent.sessions import SessionStore
+from advisor_agent.run_context import RunContext, request_scope
+from advisor_agent.sessions import SessionStore, SessionTurnCoordinator
 from advisor_shared.events import AdvisorEvent
 from advisor_shared.messages import AdvisorRequest, AdvisorResponse, Citation
 
@@ -33,6 +33,11 @@ def _log_event(event: AdvisorEvent) -> None:
     logger.info("advisor_event %s", event.to_log_line())
 
 
+def _request_identity(request: AdvisorRequest) -> tuple[str, str, str, bool]:
+    return (request.conversation_key, request.channel_id,
+            request.user_id, request.is_group)
+
+
 class AdvisorCore:
     def __init__(self, backend: AgentBackend, sessions: SessionStore,
                  planner: QueryPlanner | None = None,
@@ -45,10 +50,19 @@ class AdvisorCore:
         self.evaluator = evaluator or NoopEvaluator()
         self.event_sink = event_sink
         self.channel_name = channel_name
+        self._turns = SessionTurnCoordinator()
 
     async def handle(self, request: AdvisorRequest) -> AdvisorResponse:
-        request = await self.planner.plan(request)
-        run = new_run()
+        identity = _request_identity(request)
+        async with self._turns.turn(identity[0]):
+            with request_scope(identity[1], identity[3]) as run:
+                planned = await self.planner.plan(request)
+                if _request_identity(planned) != identity:
+                    raise ValueError("planner changed request identity")
+                return await self._handle_turn(planned, run)
+
+    async def _handle_turn(self, request: AdvisorRequest,
+                           run: RunContext) -> AdvisorResponse:
         history = await self.sessions.get(request.conversation_key)
         # 必须在 planner 之后求值:planner 会换掉 request 对象。
         # 历史与事件共用 —— 纯图片消息的 question_summary 不能是空串。
@@ -95,5 +109,6 @@ class AdvisorCore:
             mentioned_human=bool(run.mentions),
             image_count=len(request.images),
             error=error if answer is None else None,
+            search_attempts=run.search_attempts,
         ))
         return response

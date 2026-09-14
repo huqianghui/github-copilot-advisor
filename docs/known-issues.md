@@ -460,6 +460,16 @@ Azure OpenAI endpoint 的出口路径。在此之前,冒烟"失败一次"不足�
 
 ## 7. 零碎
 
+- **Teams 同群用户历史混用** —— 已修复。自动化回归已通过,
+  2026-09-14 用户确认双账号 Teams 用户隔离验证通过;其余专项验收状态见 Teams 联调清单。
+  原因是历史键只有 conversation.id,且工具渠道/群聊标记使用进程全局变量。
+  现按租户、完整会话/线程、发送者分区,同键排队,工具上下文按请求绑定。
+  但同一核心 turn 仍是串行的,没有 per-key queue 深度上限,也没有 Teams 消息去重;
+  若平台重投递同一 activity,现阶段可能再次处理并回复。旧混合历史不继承;
+  内存 TTL、重启失忆和单进程限制保留。
+  设计见 [用户隔离设计](superpowers/specs/2026-09-11-teams-user-isolation-design.md),
+  人工动作见 [Teams 联调](teams-setup.md)。
+
 - **`_TOOL_SCHEMAS` 值得抽成独立模块** —— `maf_backend.py` 247 行里它占 98 行
   纯数据。建议等下一个需要动 schema 的任务顺手做,不值得为纯移动单开 commit。
   详见实现计划的「遗留观察」小节。

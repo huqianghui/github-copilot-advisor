@@ -7,6 +7,7 @@ from typing import Protocol
 import httpx
 
 from advisor_agent.search.models import SearchResult
+from advisor_agent.search.telemetry import SearchTrace
 
 logger = logging.getLogger(__name__)
 
@@ -68,10 +69,13 @@ class WebSearchChain:
     async def search(self, query: str,
                      top: int = 5) -> tuple[list[SearchResult], int]:
         failovers = 0
+        if not self.providers:
+            with SearchTrace("web", None, self.timeout) as attempt:
+                attempt.status = "not_configured"
         for provider in self.providers:
             try:
-                results = await asyncio.wait_for(
-                    provider.search(query, top), self.timeout)
+                results = await SearchTrace("web", provider.name, self.timeout).run(
+                    asyncio.wait_for(provider.search(query, top), self.timeout))
                 if results:
                     return results, failovers
                 logger.info("provider %s returned empty", provider.name)
