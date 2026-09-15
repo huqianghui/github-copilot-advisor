@@ -7,6 +7,11 @@ from typing import Protocol
 import httpx
 
 from advisor_agent.search.models import SearchResult
+from advisor_agent.search.source_policy import (
+    WebSearchScope,
+    source_confidence,
+    web_query,
+)
 from advisor_agent.search.telemetry import SearchTrace
 
 logger = logging.getLogger(__name__)
@@ -67,7 +72,10 @@ class WebSearchChain:
         self.timeout = timeout_seconds
 
     async def search(self, query: str,
-                     top: int = 5) -> tuple[list[SearchResult], int]:
+                     top: int = 5, *,
+                     scope: WebSearchScope = "trusted"
+                     ) -> tuple[list[SearchResult], int]:
+        query = web_query(query, scope)
         failovers = 0
         if not self.providers:
             with SearchTrace("web", None, self.timeout) as attempt:
@@ -76,9 +84,15 @@ class WebSearchChain:
             try:
                 results = await SearchTrace("web", provider.name, self.timeout).run(
                     asyncio.wait_for(provider.search(query, top), self.timeout))
+                results = [
+                    result for result in results if result.content.strip()
+                    and (scope == "general" or source_confidence(result) == "high")
+                ]
+                results.sort(key=lambda result: source_confidence(result) != "high")
                 if results:
                     return results, failovers
-                logger.info("provider %s returned empty", provider.name)
+                logger.info("provider %s returned no usable %s results",
+                            provider.name, scope)
             except Exception:
                 logger.warning("provider %s failed", provider.name,
                                exc_info=True)

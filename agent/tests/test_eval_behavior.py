@@ -3,6 +3,7 @@ prompt/工具描述每次改动必跑:uv run pytest -m integration agent/tests/t
 import os
 import re
 import time
+from itertools import groupby
 from pathlib import Path
 
 import pytest
@@ -85,12 +86,51 @@ def make_request(text: str, images: list[ImageInput] | None = None) -> AdvisorRe
                           images=images or [])
 
 
+def assert_concise_answer(markdown: str) -> None:
+    summary, body = re.split(r"(?:\*\*)?建议尝试[：:](?:\*\*)?", markdown,
+                             maxsplit=1)
+    steps, sources = re.split(r"(?:\*\*)?来源[：:](?:\*\*)?", body, maxsplit=1)
+    assert 2 <= len(re.findall(r"[。！？]+", summary)) <= 3, summary
+    assert 3 <= len(re.findall(r"(?m)^\s*\d+[.)、]\s*", steps)) <= 5, steps
+    assert len(summary.strip()) + len(steps.strip()) <= 600
+    urls = [url.rstrip(").,;") for url in _BARE_URL.findall(sources)]
+    assert 1 <= len(urls) <= 3, sources
+    assert len(urls) == len(set(urls)), sources
+
+
+def configure_search_fixture(core, fixture: dict) -> list[str]:
+    """Use synthetic search evidence to isolate real model routing and style."""
+    from advisor_agent.search.models import SearchResult
+    from advisor_agent.search.web import WebSearchChain
+
+    queries: list[str] = []
+
+    class EmptyCombined:
+        async def search_solutions(self, query, product_area=None):
+            return {"no_results": True, "results": []}
+
+    class FixtureProvider:
+        name = "eval-fixture"
+
+        async def search(self, query, top):
+            scope = "trusted" if "site:" in query else "general"
+            queries.append(scope)
+            return [SearchResult(**item, origin="web", score=0)
+                    for item in fixture.get(scope, [])][:top]
+
+    core.backend._tools._combined = EmptyCombined()
+    core.backend._tools._web = WebSearchChain([FixtureProvider()])
+    return queries
+
+
 @pytest.mark.parametrize("case", CASES, ids=[c["id"] for c in CASES])
 async def test_eval_case(case, eval_turns: list[dict]):
     from advisor_agent.factory import build_advisor
     events: list[AdvisorEvent] = []
     core = build_advisor(channel_name="eval")
     core.event_sink = events.append
+    queries = (configure_search_fixture(core, case["search_fixture"])
+               if "search_fixture" in case else None)
 
     turns = case.get("multi_turn") or [case["text"]]
     key = f"eval-{case['id']}"
@@ -131,3 +171,12 @@ async def test_eval_case(case, eval_turns: list[dict]):
         assert is_mostly_chinese(resp.markdown), resp.markdown[:200]
     elif case.get("reply_language") == "en":
         assert not is_mostly_chinese(resp.markdown), resp.markdown[:200]
+    if case.get("expect_concise_answer"):
+        assert_concise_answer(resp.markdown)
+    if queries is not None:
+        phases = [scope for scope, _ in groupby(queries)]
+        assert phases == case["expected_web_scopes"], queries
+        if "max_web_calls" in case:
+            assert len(queries) <= case["max_web_calls"], queries
+    for url in case.get("expect_source_urls", []):
+        assert url in resp.markdown

@@ -103,7 +103,7 @@ async def test_web_records_each_failover_and_keeps_repeated_calls():
         StubProvider("brave", [r("web", "web")]),
     ])
     for _ in range(2):
-        results, failovers = await chain.search("q")
+        results, failovers = await chain.search("q", scope="general")
         assert len(results) == 1 and failovers == 1
     recorded = attempts(run)
     assert len(recorded) == 4

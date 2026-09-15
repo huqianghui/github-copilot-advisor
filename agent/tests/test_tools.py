@@ -7,7 +7,9 @@ import pytest
 from advisor_agent.escalation import EscalationConfig
 from advisor_agent.run_context import new_run
 from advisor_agent.search.models import SearchResult
+from advisor_agent.search.web import WebSearchChain
 from advisor_agent.tools import AdvisorTools
+from test_web_search import StubProvider
 
 ESCALATION_YAML = """
 defaults:
@@ -50,7 +52,7 @@ class StubWeb:
     def __init__(self, results, failovers):
         self._out = (results, failovers)
 
-    async def search(self, query, top=5):
+    async def search(self, query, top=5, *, scope="trusted"):
         return self._out
 
 
@@ -122,6 +124,60 @@ async def test_web_search_sets_stage_and_failover(tmp_path):
     out = json.loads(await tools.web_search("q"))
     assert out["results"][0]["origin"] == "web"
     assert run.stage == "web" and run.failover_count == 2
+
+
+async def test_web_search_returns_scope_confidence_and_empty_status(tmp_path):
+    new_run()
+    tools = make_tools(tmp_path)
+    tools._web = WebSearchChain([StubProvider("a", [
+        SearchResult(title="Docs", content="answer",
+                     url="https://docs.github.com/en/copilot",
+                     origin="web", score=0),
+    ])])
+    out = json.loads(await tools.web_search("q"))
+    assert out["scope"] == "trusted"
+    assert out["no_results"] is False
+    assert out["results"][0]["source_confidence"] == "high"
+    assert "sufficient" not in out  # Source reputation is not answer sufficiency.
+
+
+async def test_general_search_cannot_skip_trusted_stage(tmp_path):
+    run = new_run()
+    provider = StubProvider("a", [r("other", "web")])
+    tools = make_tools(tmp_path)
+    tools._web = WebSearchChain([provider])
+    out = json.loads(await tools.web_search("q", scope="general"))
+    assert out["status"] == "trusted_search_required"
+    assert not provider.called
+    assert run.citations_seen == []
+
+
+@pytest.mark.parametrize("trusted_has_results", [True, False])
+async def test_general_search_allowed_after_insufficient_trusted_search(
+        tmp_path, trusted_has_results):
+    new_run()
+    provider = StubProvider("a", [
+        SearchResult(title="Docs", content="related but incomplete",
+                     url="https://docs.github.com/en/copilot",
+                     origin="web", score=0),
+    ] if trusted_has_results else [])
+    tools = make_tools(tmp_path)
+    tools._web = WebSearchChain([provider])
+    first = json.loads(await tools.web_search("q"))
+    assert first["no_results"] is not trusted_has_results
+    provider._results = [r("other", "web")]
+    out = json.loads(await tools.web_search("q", scope="general"))
+    assert out["scope"] == "general"
+    assert out["results"][0]["source_confidence"] == "low"
+
+
+async def test_trusted_search_gate_resets_for_each_run(tmp_path):
+    new_run()
+    tools = make_tools(tmp_path)
+    await tools.web_search("q")
+    new_run()
+    out = json.loads(await tools.web_search("q", scope="general"))
+    assert out["status"] == "trusted_search_required"
 
 
 async def test_escalate_adds_mention_only_for_in_channel(tmp_path):

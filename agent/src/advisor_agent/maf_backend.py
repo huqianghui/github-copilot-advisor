@@ -63,13 +63,18 @@ _TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": (
-                "在 web 上搜索最新信息(版本发布、技术博客、官方文档)。"
-                "仅当 search_solutions 返回 no_results=true 时才使用。"
-            ),
+            "description": AdvisorTools.web_search.__doc__,
             "parameters": {
                 "type": "object",
-                "properties": {"query": {"type": "string"}},
+                "properties": {
+                    "query": {"type": "string"},
+                    "scope": {
+                        "type": "string",
+                        "enum": ["trusted", "general"],
+                        "default": "trusted",
+                        "description": "先 trusted;仅当其结果不足以回答才 general。",
+                    },
+                },
                 "required": ["query"],
             },
         },
@@ -186,7 +191,8 @@ class MAFBackend:
             return await self._tools.search_solutions(
                 arguments["query"], arguments.get("product_area"))
         if name == "web_search":
-            return await self._tools.web_search(arguments["query"])
+            return await self._tools.web_search(
+                arguments["query"], arguments.get("scope", "trusted"))
         if name == "escalate_to_human":
             return await self._tools.escalate_to_human(
                 self._channel_id(), arguments["reason"])

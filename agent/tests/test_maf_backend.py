@@ -1,5 +1,6 @@
 """MAFBackend 的消息构造与 vision 降级(图片输入 spec §6)。"""
 import base64
+import json
 from types import SimpleNamespace
 
 import httpx
@@ -9,8 +10,10 @@ from openai import BadRequestError
 from advisor_agent.maf_backend import (_TOOL_SCHEMAS, IMAGE_NOT_PROCESSED_NOTE,
                                        MAFBackend, build_user_message)
 from advisor_agent.prompts import SYSTEM_PROMPT
+from advisor_agent.run_context import new_run
 from advisor_agent.usage import _QUESTION_TYPES
 from advisor_shared.messages import ImageInput
+from test_tools import make_tools
 
 PNG = b"\x89PNG\r\n\x1a\n"
 
@@ -248,3 +251,21 @@ def test_usage_schema_description_maps_the_retired_term():
     assert "credits_usage" in description
     assert "AI credits" in description
     assert "premium requests" in description
+
+
+async def test_web_scope_schema_and_dispatch_enforce_trusted_first(
+        backend, tmp_path):
+    new_run()
+    backend._tools = make_tools(tmp_path)
+    schema = next(s["function"] for s in _TOOL_SCHEMAS
+                  if s["function"]["name"] == "web_search")
+    assert schema["parameters"]["properties"]["scope"]["enum"] == [
+        "trusted", "general"]
+    blocked = json.loads(await backend._dispatch(
+        "web_search", {"query": "q", "scope": "general"}))
+    assert blocked["status"] == "trusted_search_required"
+    trusted = json.loads(await backend._dispatch("web_search", {"query": "q"}))
+    assert trusted["scope"] == "trusted"
+    general = json.loads(await backend._dispatch(
+        "web_search", {"query": "q", "scope": "general"}))
+    assert general["scope"] == "general"

@@ -21,6 +21,23 @@ def test_citations_appended_as_reference_list():
     assert "- [Issue 42](https://g/42)" in text
 
 
+def test_sources_already_in_answer_are_not_appended_again():
+    markdown = "建议尝试:\n1. 新建会话。\n\n来源:\n- [FAQ](https://g/faq)"
+    text = render_reply(AdvisorResponse(
+        markdown=markdown,
+        citations=[Citation(title="FAQ", url="https://g/faq")]))["text"]
+    assert text == markdown
+
+
+def test_only_missing_citations_are_appended():
+    text = render_reply(AdvisorResponse(
+        markdown="来源:\nhttps://g/123",
+        citations=[Citation(title="existing", url="https://g/123"),
+                   Citation(title="missing", url="https://g/12")]))["text"]
+    assert text.count("https://g/123") == 1
+    assert "- [missing](https://g/12)" in text
+
+
 def test_mentions_prepended_with_entities():
     resp = AdvisorResponse(
         markdown="请跟进。",
