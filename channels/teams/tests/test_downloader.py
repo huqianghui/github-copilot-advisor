@@ -278,6 +278,26 @@ async def test_downloads_with_bearer_token():
 
 
 @respx.mock
+async def test_download_steps_are_correlated_and_do_not_log_signed_url(caplog):
+    import logging
+    from advisor_shared.logging import configure_logging
+    from advisor_shared.telemetry import trace_scope
+
+    configure_logging()
+    url = GOOD_URL + "?sig=private-signature"
+    respx.get(url).mock(return_value=httpx.Response(403))
+    with caplog.at_level(logging.INFO), trace_scope() as trace:
+        assert await download([{"contentType": "image/png", "contentUrl": url}]) == []
+    stages = {s.name: s for s in trace.timings}
+    assert {"teams.downloads", "teams.download_token",
+            "teams.download_request"} <= stages.keys()
+    assert stages["teams.download_request"].attributes["http_status"] == 403
+    assert stages["teams.download_request"].status == "degraded"
+    assert stages["teams.downloads"].status == "degraded"
+    assert "private-signature" not in caplog.text
+
+
+@respx.mock
 async def test_never_requests_non_allowlisted_host():
     """安全回归:非白名单 host 一次请求都不能发出。"""
     route = respx.get(EVIL_URL).mock(return_value=httpx.Response(200, content=PNG))

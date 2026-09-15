@@ -109,6 +109,58 @@ def backend(monkeypatch):
                       is_group_provider=lambda: False)
 
 
+async def test_each_llm_round_has_separate_timing_and_token_counts(
+        backend, monkeypatch):
+    from advisor_shared.telemetry import trace_scope
+
+    calls = 0
+
+    async def create(**kwargs):
+        nonlocal calls
+        calls += 1
+        return SimpleNamespace(
+            usage=SimpleNamespace(prompt_tokens=100, completion_tokens=20),
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content="answer", tool_calls=[_tool_call()] if calls == 1 else None))])
+
+    async def dispatch(name, arguments):
+        return "{}"
+
+    monkeypatch.setattr(backend._client.chat.completions, "create", create)
+    monkeypatch.setattr(backend, "_dispatch", dispatch)
+    with trace_scope() as trace:
+        assert await backend.run("private-question", []) == "answer"
+    assert any(s.name == "llm.prepare_messages" for s in trace.timings)
+    rounds = [s for s in trace.timings if s.name == "llm.completion"]
+    assert [s.attributes["round"] for s in rounds] == [1, 2]
+    assert [s.attributes["tool_call_count"] for s in rounds] == [1, 0]
+    assert rounds[0].attributes["input_tokens"] == 100
+    assert rounds[0].attributes["output_tokens"] == 20
+    assert "private-question" not in str(trace.timings)
+
+
+async def test_vision_fallback_has_its_own_timing(backend, monkeypatch):
+    from advisor_shared.telemetry import trace_scope
+
+    async def create(**kwargs):
+        if isinstance(kwargs["messages"][-1]["content"], list):
+            raise _bad_request()
+        return SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content="answer", tool_calls=None))])
+
+    monkeypatch.setattr(backend._client.chat.completions, "create", create)
+    with trace_scope() as trace:
+        result = await backend.run(
+            "question", [], [ImageInput(data=PNG, mime_type="image/png")])
+    assert IMAGE_NOT_PROCESSED_NOTE in result
+    assert [s.status for s in trace.timings
+            if s.name == "llm.completion"] == ["error", "success"]
+    fallback = next(s for s in trace.timings if s.name == "llm.vision_fallback")
+    assert fallback.status == "degraded"
+    assert any(s.parent_span_id == fallback.span_id and s.name == "llm.completion"
+               for s in trace.timings)
+
+
 async def test_vision_400_retries_without_images(backend, monkeypatch):
     seen = []
 

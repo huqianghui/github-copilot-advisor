@@ -4,6 +4,7 @@
 import logging
 
 from advisor_shared.messages import ImageInput
+from advisor_shared.telemetry import step, timed
 from microsoft_agents.activity import Activity
 from microsoft_agents.hosting.core import AgentApplication, TurnContext, TurnState
 
@@ -81,6 +82,7 @@ def _raw_image_count(activity: dict) -> int:
 
 def register_handlers(agent_app: AgentApplication, core):
     @agent_app.activity("message")
+    @timed("teams.message")
     async def on_message(context: TurnContext, state: TurnState):
         recipient = context.activity.recipient
         bot_id = recipient.id if recipient else ""
@@ -109,16 +111,18 @@ def register_handlers(agent_app: AgentApplication, core):
                 error.field,
                 error.reason,
             )
-            await context.send_activity(Activity(
-                type="message", text=IDENTITY_UNAVAILABLE))
+            with step("teams.send", outcome="identity_unavailable"):
+                await context.send_activity(Activity(
+                    type="message", text=IDENTITY_UNAVAILABLE))
             return
         raw_images = _raw_image_count(activity)
 
         if is_empty(request):
             # 有图片附件却一张都没存活 = 下载全失败,必须告知而非静默
             if raw_images:
-                await context.send_activity(Activity(
-                    type="message", text=IMAGE_FETCH_FAILED))
+                with step("teams.send", outcome="image_fetch_failed"):
+                    await context.send_activity(Activity(
+                        type="message", text=IMAGE_FETCH_FAILED))
             return
 
         skipped = raw_images - len(images)
@@ -126,16 +130,19 @@ def register_handlers(agent_app: AgentApplication, core):
             request = request.model_copy(update={
                 "text": f"{request.text}(另有 {skipped} 张图片未能获取)".strip()})
 
-        await context.send_activity(Activity(type="typing"))
+        with step("teams.typing"):
+            await context.send_activity(Activity(type="typing"))
         try:
             response = await core.handle(request)
-            reply = render_reply(response)
-        except Exception:
-            logger.exception("core.handle failed")
+            with step("teams.render"):
+                reply = render_reply(response)
+        except Exception as error:
+            logger.error("core.handle failed error_type=%s", type(error).__name__)
             reply = {"type": "message", "text": FALLBACK_MESSAGE,
                      "entities": []}
-        await context.send_activity(Activity(
-            type=reply["type"], text=reply["text"],
-            entities=reply["entities"] or None))
+        with step("teams.send"):
+            await context.send_activity(Activity(
+                type=reply["type"], text=reply["text"],
+                entities=reply["entities"] or None))
 
     return on_message

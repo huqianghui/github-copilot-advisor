@@ -128,7 +128,7 @@ async def test_factory_tool_context_isolated_during_interleaved_turns(
             {"question_type": "user_usage", "username": "alice"}))
         if label == "group":
             group_dispatched.set()
-        return label
+        return f"{label}: https://example.test/{label}"
 
     monkeypatch.setattr(backend, "_run_tool_loop", fake_loop)
 

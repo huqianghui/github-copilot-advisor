@@ -98,6 +98,33 @@ async def test_responds_with_typing_then_answer():
     assert len(ctx.sent) == 2
 
 
+async def test_handler_times_typing_render_and_send():
+    from advisor_shared.telemetry import trace_scope
+
+    handler = register_handlers(_agent_app(), StubCore())
+    with trace_scope() as trace:
+        await handler(FakeTurnContext(group_activity()), TurnState())
+    stages = {s.name: s for s in trace.timings}
+    assert {"teams.message", "teams.typing", "teams.render", "teams.send"} <= stages.keys()
+    assert stages["teams.send"].parent_span_id == stages["teams.message"].span_id
+
+
+async def test_failed_reply_send_is_timed_and_propagates():
+    from advisor_shared.telemetry import trace_scope
+
+    class FailingContext(FakeTurnContext):
+        async def send_activity(self, activity):
+            if activity.type == "message":
+                raise RuntimeError("private-response")
+            return await super().send_activity(activity)
+
+    handler = register_handlers(_agent_app(), StubCore())
+    with trace_scope() as trace, pytest.raises(RuntimeError):
+        await handler(FailingContext(group_activity()), TurnState())
+    failures = [s for s in trace.timings if s.status == "error"]
+    assert {s.name for s in failures} == {"teams.send", "teams.message"}
+
+
 async def test_responds_to_personal_activity():
     core = StubCore()
     handler = register_handlers(_agent_app(), core)

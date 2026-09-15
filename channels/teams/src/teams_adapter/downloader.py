@@ -20,6 +20,7 @@ from microsoft_agents.hosting.core.app.input_file import (
     InputFile,
     InputFileDownloader,
 )
+from advisor_shared.telemetry import current_span, step, timed
 
 logger = logging.getLogger(__name__)
 
@@ -178,22 +179,30 @@ class TeamsImageDownloader(InputFileDownloader):
         """
         try:
             return await self._download_all(context)
-        except Exception:
+        except Exception as error:
             # 兜底,不是替代:_access_token 那处的内层 except 保留着,
             # 它给的是"取 token 失败"这条精确日志,这里只知道"某处炸了"。
-            logger.exception("image download failed, continuing without images")
+            logger.error("image download failed, continuing without images error_type=%s",
+                         type(error).__name__)
             return []
 
+    @timed("teams.downloads")
     async def _download_all(self, context: TurnContext) -> list[InputFile]:
         if context.activity.channel_id != TEAMS_CHANNEL_ID:
             return []
         images = select_images(context.activity.attachments)
+        timing = current_span()
+        if timing is not None:
+            timing.attributes["image_count"] = len(images)
         if not images:
             return []                     # 无图不取 token
         try:
             token = await self._access_token(context)
-        except Exception:
-            logger.exception("failed to acquire bot token for attachments")
+        except Exception as error:
+            if timing is not None:
+                timing.status = "degraded"
+            logger.error("failed to acquire bot token for attachments error_type=%s",
+                         type(error).__name__)
             return []
 
         files: list[InputFile] = []
@@ -210,8 +219,13 @@ class TeamsImageDownloader(InputFileDownloader):
                                                declared_type, token)
                 if downloaded is not None:
                     files.append(downloaded)
+        if timing is not None:
+            timing.attributes["result_count"] = len(files)
+            if len(files) < len(images):
+                timing.status = "degraded"
         return files
 
+    @timed("teams.download_token")
     async def _access_token(self, context: TurnContext) -> str:
         provider = self._connection_manager.get_token_provider_from_activity(
             context.identity, context.activity)
@@ -222,29 +236,32 @@ class TeamsImageDownloader(InputFileDownloader):
     async def _fetch(self, client: httpx.AsyncClient, url: str,
                      declared_type: str, token: str) -> InputFile | None:
         try:
-            response = await client.get(
-                url, headers={"Authorization": f"Bearer {token}"})
-        except Exception:
-            logger.warning("attachment download failed: %s", url, exc_info=True)
+            with step("teams.download_request") as timing:
+                response = await client.get(
+                    url, headers={"Authorization": f"Bearer {token}"})
+                timing.attributes["http_status"] = response.status_code
+                timing.attributes["size_bytes"] = len(response.content)
+                if response.status_code != 200:
+                    timing.status = "degraded"
+        except Exception as error:
+            logger.warning("attachment download failed error_type=%s",
+                           type(error).__name__)
             return None
 
         if response.status_code != 200:
             # 绝不在 401/403 后重试加 token(GHSA-7vwx-582j-j332)
-            logger.warning("attachment download status=%s url=%s",
-                           response.status_code, url)
+            logger.warning("attachment download status=%s", response.status_code)
             return None
 
         content = response.content
         # 空 body 的 200 也要挡:放过去会一路走到 "data:image/png;base64,"
         # 然后由 Azure OpenAI 报 400,白烧一次往返还触发剥图降级。
-        # 两种情况分开打日志:合并成一条会打出 "size rejected (0 bytes)"
-        # 这种自相矛盾的文案,且都缺 URL,与上面的状态码告警关联不起来。
+        # 空内容与过大分别记录,使用 trace_id 关联,不记录可能带签名的 URL。
         if not content:
-            logger.warning("attachment has empty body, skipped: %s", url)
+            logger.warning("attachment has empty body, skipped")
             return None
         if len(content) > MAX_IMAGE_BYTES:
-            logger.warning("attachment too large (%d bytes), skipped: %s",
-                           len(content), url)
+            logger.warning("attachment too large (%d bytes), skipped", len(content))
             return None
 
         response_type = (response.headers.get("content-type", "")
@@ -255,12 +272,10 @@ class TeamsImageDownloader(InputFileDownloader):
             # 声明类型是 image/*,拿它兜底会让 bot.py 的 _to_image_inputs 在
             # 构造 ImageInput 时抛 ValidationError(pattern 不认 *),而那处
             # 调用在 try 之外 —— 整个 turn 死掉,用户一个字都收不到。
-            # url 与上面两条告警同格式,便于把同一张图的日志串起来;
-            # 带 userinfo 的 URL 到不了这里(select_images 已拒),没有泄漏面。
             logger.warning(
                 "attachment format not recognized, skipped; declared=%s "
-                "response=%s url=%s",
-                declared_type, response_type or "<missing>", url)
+                "response=%s",
+                declared_type, response_type or "<missing>")
             return None
         return InputFile(content=content, content_type=content_type,
                          content_url=url)

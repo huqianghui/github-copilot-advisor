@@ -59,6 +59,58 @@ def test_threshold_constant():
     assert MIN_RERANKER_SCORE == 1.5
 
 
+async def test_kb_timing_includes_lazy_fetch_and_separates_embedding(monkeypatch):
+    from advisor_shared import telemetry
+
+    now = [0.0]
+    monkeypatch.setattr(telemetry.time, "monotonic", lambda: now[0])
+
+    class Embeddings(FakeEmbeddings):
+        async def _create(self, model, input):
+            now[0] += 0.5
+            return await super()._create(model, input)
+
+    class LazySearch(FakeSearchClient):
+        async def search(self, search_text, **kwargs):
+            async def pages():
+                now[0] += 2.0
+                for item in self._docs:
+                    yield item
+            return pages()
+
+    client = KnowledgeSearchClient(
+        LazySearch([doc("keep", 2.5), doc("drop", 1.0)]), Embeddings())
+    with telemetry.trace_scope() as trace:
+        results = await client.search("private-question")
+    assert [r.title for r in results] == ["keep"]
+    stages = {s.name: s for s in trace.timings}
+    assert stages["search.kb.embedding"].duration_ms == 500
+    assert stages["search.kb.azure_search"].duration_ms == 2000
+    assert stages["search.kb.filter"].attributes == {
+        "raw_count": 2, "result_count": 1, "filtered_count": 1}
+    assert "private-question" not in str(trace.timings)
+
+
+async def test_kb_fetch_failure_is_timed_not_mistaken_for_empty():
+    import pytest
+    from advisor_shared.telemetry import trace_scope
+
+    class FailingSearch:
+        async def search(self, **kwargs):
+            async def pages():
+                raise RuntimeError("private-response")
+                yield
+            return pages()
+
+    with trace_scope() as trace:
+        with pytest.raises(RuntimeError):
+            await KnowledgeSearchClient(FailingSearch(), FakeEmbeddings()).search("q")
+    fetch = next(s for s in trace.timings if s.name == "search.kb.azure_search")
+    assert fetch.status == "error"
+    assert fetch.error_type == "RuntimeError"
+    assert not any(s.name == "search.kb.filter" for s in trace.timings)
+
+
 async def test_product_area_quote_escaped():
     fake = FakeSearchClient([])
     await KnowledgeSearchClient(fake, FakeEmbeddings()).search(

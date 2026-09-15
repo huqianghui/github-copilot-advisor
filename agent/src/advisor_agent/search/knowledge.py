@@ -2,6 +2,7 @@
 from azure.search.documents.models import VectorizedQuery
 
 from advisor_agent.search.models import MIN_RERANKER_SCORE, SearchResult
+from advisor_shared.telemetry import step
 
 
 class KnowledgeSearchClient:
@@ -13,8 +14,9 @@ class KnowledgeSearchClient:
 
     async def search(self, query: str, product_area: str | None = None,
                      top: int = 5) -> list[SearchResult]:
-        emb = await self.embed.embeddings.create(model=self.embed_model,
-                                                 input=[query])
+        with step("search.kb.embedding", model=self.embed_model):
+            emb = await self.embed.embeddings.create(model=self.embed_model,
+                                                     input=[query])
         vector = VectorizedQuery(vector=emb.data[0].embedding,
                                  k_nearest_neighbors=top,
                                  fields="content_vector")
@@ -22,20 +24,29 @@ class KnowledgeSearchClient:
         if product_area:
             safe = product_area.replace("'", "''")
             odata_filter = f"product_area eq '{safe}'"
-        pager = await self.search_client.search(
-            search_text=query,
-            vector_queries=[vector],
-            query_type="semantic",
-            semantic_configuration_name="default",
-            filter=odata_filter,
-            top=top,
-        )
-        results = []
-        async for d in pager:
-            score = d.get("@search.reranker_score") or 0.0
-            if score < MIN_RERANKER_SCORE:
-                continue
-            results.append(SearchResult(
-                title=d["title"], content=d["content"], url=d["url"],
-                origin="kb", score=score))
+        with step("search.kb.azure_search", top=top,
+                  query_type="hybrid_semantic", has_filter=bool(odata_filter)):
+            pager = await self.search_client.search(
+                search_text=query,
+                vector_queries=[vector],
+                query_type="semantic",
+                semantic_configuration_name="default",
+                filter=odata_filter,
+                top=top,
+            )
+            # The SDK sends requests while consuming the lazy pager, not at search().
+            documents = [document async for document in pager]
+        with step("search.kb.filter") as timing:
+            results = []
+            for d in documents:
+                score = d.get("@search.reranker_score") or 0.0
+                if score < MIN_RERANKER_SCORE:
+                    continue
+                results.append(SearchResult(
+                    title=d["title"], content=d["content"], url=d["url"],
+                    origin="kb", score=score))
+            timing.attributes.update(
+                raw_count=len(documents), result_count=len(results),
+                filtered_count=len(documents) - len(results))
+            timing.status = "success" if results else "empty"
         return results

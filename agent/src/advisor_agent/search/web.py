@@ -13,6 +13,7 @@ from advisor_agent.search.source_policy import (
     web_query,
 )
 from advisor_agent.search.telemetry import SearchTrace
+from advisor_shared.telemetry import step
 
 logger = logging.getLogger(__name__)
 
@@ -78,23 +79,30 @@ class WebSearchChain:
         query = web_query(query, scope)
         failovers = 0
         if not self.providers:
-            with SearchTrace("web", None, self.timeout) as attempt:
+            with step("search.web", provider=None) as timing, \
+                    SearchTrace("web", None, self.timeout) as attempt:
                 attempt.status = "not_configured"
+                attempt.span_id = timing.span_id
+                timing.status = "not_configured"
         for provider in self.providers:
             try:
                 results = await SearchTrace("web", provider.name, self.timeout).run(
                     asyncio.wait_for(provider.search(query, top), self.timeout))
-                results = [
-                    result for result in results if result.content.strip()
-                    and (scope == "general" or source_confidence(result) == "high")
-                ]
-                results.sort(key=lambda result: source_confidence(result) != "high")
+                with step("search.web.filter", provider=provider.name,
+                          scope=scope, raw_count=len(results)) as timing:
+                    results = [
+                        result for result in results if result.content.strip()
+                        and (scope == "general" or source_confidence(result) == "high")
+                    ]
+                    results.sort(key=lambda result: source_confidence(result) != "high")
+                    timing.attributes["result_count"] = len(results)
+                    timing.status = "success" if results else "empty"
                 if results:
                     return results, failovers
                 logger.info("provider %s returned no usable %s results",
                             provider.name, scope)
-            except Exception:
-                logger.warning("provider %s failed", provider.name,
-                               exc_info=True)
+            except Exception as error:
+                logger.warning("provider %s failed error_type=%s",
+                               provider.name, type(error).__name__)
             failovers += 1
         return [], failovers

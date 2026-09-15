@@ -68,6 +68,23 @@ async def test_budget_timeout_is_not_reported_as_an_empty_search():
     assert recorded["github-live"]["duration_ms"] > recorded["kb"]["duration_ms"]
 
 
+async def test_budget_expiry_is_logged_as_timeout_before_event_emission(caplog):
+    from advisor_shared.telemetry import trace_scope
+
+    run = new_run()
+    with trace_scope() as trace:
+        await CombinedSearch(StubKB(), StubLive(delay=5),
+                             budget_seconds=0.01).search_solutions("q")
+    attempt = next(a for a in run.search_attempts if a.source == "github-live")
+    span = next(s for s in trace.timings if s.span_id == attempt.span_id)
+    assert span.status == "timeout"
+    assert span.error_type == "TimeoutError"
+    log = next(r.telemetry for r in caplog.records
+               if r.msg == "step_completed"
+               and r.telemetry["span_id"] == span.span_id)
+    assert log["status"] == "timeout"
+
+
 async def test_combined_cancellation_cleans_up_both_searches():
     started = asyncio.Event()
     stopped = []

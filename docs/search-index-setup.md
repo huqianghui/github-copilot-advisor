@@ -231,6 +231,49 @@ KB 的计数是经过语义分数过滤后的结果数,耗时包含问题 embedd
 HTTP 状态码及格式受限的服务错误码用于排查。`error = null` 仍只表示本轮
 Agent 没有整体失败,不代表每次检索都成功。旧报告没有这些数据,需重新运行生成。
 
+### 细粒度检索计时
+
+`tool_latencies_ms.search_solutions` **不是 Azure AI Search 服务耗时**。
+它是工具调用耗时,包含 KB 与 GitHub live 并行检索、等待、取消清理和合并。
+同一轮重复调用工具时,这个旧字段现在累计所有调用(包括失败/取消);
+逐次调用保存在新增的 `events[].timings` 中,不再仅剩最后一次耗时。
+
+| 步骤名 | 计时边界 |
+|---|---|
+| `tool.search_solutions` | 一次完整工具调用,包含结果序列化 |
+| `search.combined` | 一次组合检索,共享等待预算仍为 8 秒 |
+| `search.kb` | KB 分支整体,包含 embedding、Search 和本地过滤 |
+| `search.kb.embedding` | 问题 embedding SDK 调用 |
+| `search.kb.azure_search` | hybrid + semantic 查询及**完整遍历分页结果**,不含 embedding |
+| `search.kb.filter` | 本地 reranker 分数过滤和结果构造;记录原始、保留、过滤条数 |
+| `search.github-live` / `search.github.request` | GitHub 分支整体 / HTTP 调用 |
+| `search.merge` | KB 优先合并、去重及结果构造 |
+| `tool.web_search` / `search.web` | Web 工具整体 / 每次 provider 尝试 |
+| `search.web.filter` | Web 来源和内容过滤;记录 scope、provider 和条数 |
+
+Azure Search SDK 的 `await search_client.search(...)` 返回惰性 pager;
+当前版本在 `async for` 时才发起请求。若只给 `await search(...)` 计时,
+会把真正的网络耗时漏掉。本项目的新计时覆盖创建 pager 到全部取数完成。
+这个值仍是**客户端观察到的耗时**,包含网络、服务处理、SDK 重试及反序列化,
+不能继续凭它拆出服务端 BM25、向量召回或 semantic ranker 各自用了多久。
+
+Portal 的全量 `search=*` 与本项目的“问题 embedding + hybrid + semantic +
+GitHub 并行查询”不是等价查询。比较 Search 本身时,应使用相同的查询类型、
+向量、过滤条件、top、索引和客户端环境,并区分首次请求与热连接。
+
+每条 `timings` 记录有唯一 `span_id` 和 `parent_span_id`,以及相对于同一请求
+起点的 `start_offset_ms`、实际 `duration_ms`、状态和安全诊断字段。
+`search_attempts[].span_id` 指向对应的分支/provider 步骤。按起始偏移排序,
+而不是按照记录在数组中的完成顺序判断执行先后。
+
+**不要把所有步骤耗时相加**:父步骤包含子步骤,KB 和 GitHub 还互相重叠。
+例如 KB 已完成但 GitHub 仍未返回,组合检索仍会等到 GitHub 完成或 8 秒预算到期。
+8 秒是等待预算,不是含取消清理和合并在内的硬性总时长上限。预算耗尽的分支记
+`timeout`,外层请求取消记 `cancelled`;超时分支内部被取消的子步骤可记 `cancelled`。
+
+日志级别、JSON/文本格式、LLM/Teams 计时和隐私边界见
+[Development](../DEVELOPMENT.md#分级日志与延迟分析)。
+
 ---
 
 ## 6. 增量与重跑

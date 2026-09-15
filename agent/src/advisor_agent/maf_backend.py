@@ -21,6 +21,7 @@ from openai import AsyncAzureOpenAI, BadRequestError
 from advisor_agent.prompts import SYSTEM_PROMPT
 from advisor_agent.tools import AdvisorTools
 from advisor_shared.messages import ImageInput
+from advisor_shared.telemetry import step
 
 logger = logging.getLogger(__name__)
 
@@ -206,9 +207,11 @@ class MAFBackend:
 
     async def run(self, user_text: str, history: list[dict],
                   images: list[ImageInput] | None = None) -> str:
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        messages.extend(history)
-        messages.append(build_user_message(user_text, images))
+        with step("llm.prepare_messages", image_count=len(images or []),
+                  history_count=len(history)):
+            messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+            messages.extend(history)
+            messages.append(build_user_message(user_text, images))
         try:
             # 传副本:_run_tool_loop 会往列表里 append 助手消息与工具结果。若让
             # 它写进这里的 messages,下面的 messages[-1] 就不再是那条 user
@@ -223,17 +226,29 @@ class MAFBackend:
             # 误诊搬到运维侧。图片张数是安全的(计数不是内容)且有排查价值。
             logger.warning("400 on a request carrying %d image(s); retrying without them",
                            len(images))
-            messages[-1] = build_user_message(user_text, None)
-            answer = await self._run_tool_loop(messages)
+            with step("llm.vision_fallback", image_count=len(images)) as timing:
+                timing.status = "degraded"
+                messages[-1] = build_user_message(user_text, None)
+                answer = await self._run_tool_loop(messages)
             return f"{answer}\n\n{IMAGE_NOT_PROCESSED_NOTE}"
 
     async def _run_tool_loop(self, messages: list[dict]) -> str:
-        for _ in range(_MAX_TOOL_ROUNDS):
-            response = await self._client.chat.completions.create(
-                model=self._deployment,
-                messages=messages,
-                tools=_TOOL_SCHEMAS,
-            )
+        for round_index in range(_MAX_TOOL_ROUNDS):
+            with step("llm.completion", round=round_index + 1,
+                      model=self._deployment, message_count=len(messages)) as timing:
+                response = await self._client.chat.completions.create(
+                    model=self._deployment,
+                    messages=messages,
+                    tools=_TOOL_SCHEMAS,
+                )
+                timing.attributes["tool_call_count"] = len(
+                    response.choices[0].message.tool_calls or [])
+                usage = getattr(response, "usage", None)
+                for attribute, field in (("input_tokens", "prompt_tokens"),
+                                         ("output_tokens", "completion_tokens")):
+                    count = getattr(usage, field, None)
+                    if isinstance(count, int):
+                        timing.attributes[attribute] = count
             message = response.choices[0].message
             tool_calls = message.tool_calls
             if not tool_calls:

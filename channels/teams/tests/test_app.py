@@ -71,6 +71,63 @@ async def test_messages_routes_to_start_agent_process(monkeypatch):
     assert seen["adapter"] is sentinel_adapter
 
 
+async def test_http_and_agent_timings_share_trace_without_logging_payload(
+        monkeypatch, caplog):
+    from advisor_agent.core import AdvisorCore
+    from advisor_agent.sessions import InMemorySessionStore
+    from advisor_shared.messages import AdvisorRequest
+    from advisor_shared.telemetry import current_trace
+
+    events = []
+
+    class Backend:
+        async def run(self, *args):
+            return "answer"
+
+    core = AdvisorCore(Backend(), InMemorySessionStore(), event_sink=events.append)
+
+    async def fake_start(*args):
+        await core.handle(AdvisorRequest(
+            conversation_key="private-key", channel_id="test",
+            user_id="private-user", user_name="private-name",
+            text="private-question", is_group=False))
+        return web.Response(status=202)
+
+    monkeypatch.setattr(app_module, "start_agent_process", fake_start)
+    with caplog.at_level(logging.INFO):
+        async with TestClient(TestServer(create_app(
+                object(), object(), _anon_config()))) as client:
+            assert (await client.post("/api/messages", json={})).status == 202
+    http_logs = [r.telemetry for r in caplog.records
+                 if r.msg == "step_completed" and r.telemetry["name"] == "teams.http"]
+    assert len(http_logs) == 1
+    assert http_logs[0]["trace_id"] == events[0].trace_id
+    assert http_logs[0]["attributes"]["http_status"] == 202
+    turn = next(s for s in events[0].timings if s.name == "agent.turn")
+    assert turn.parent_span_id == http_logs[0]["span_id"]
+    assert "private-question" not in caplog.text
+    assert current_trace() is None
+
+
+def test_entrypoint_applies_app_debug_without_sdk_payload_debug(monkeypatch):
+    from advisor_shared.logging import TelemetryFormatter
+
+    monkeypatch.setenv("ADVISOR_LOG_LEVEL", "DEBUG")
+    monkeypatch.setenv("ADVISOR_LOG_FORMAT", "text")
+    try:
+        main_module._configure_logging()
+        assert logging.getLogger("advisor_shared.telemetry").isEnabledFor(logging.DEBUG)
+        assert not logging.getLogger("openai").isEnabledFor(logging.DEBUG)
+        assert not logging.getLogger("httpx").isEnabledFor(logging.INFO)
+        assert any(isinstance(h.formatter, TelemetryFormatter)
+                   and h.formatter.output_format == "text"
+                   for h in logging.getLogger().handlers)
+    finally:
+        monkeypatch.setenv("ADVISOR_LOG_LEVEL", "INFO")
+        monkeypatch.setenv("ADVISOR_LOG_FORMAT", "json")
+        main_module._configure_logging()
+
+
 async def test_valid_teams_activity_reaches_agent_through_real_adapter():
     config = load_configuration_from_env({
         "CONNECTIONS__SERVICE_CONNECTION__SETTINGS__CLIENTID": "test",

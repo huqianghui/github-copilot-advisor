@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Callable, Protocol
+from advisor_shared.telemetry import step
 
 
 class SessionStore(Protocol):
@@ -31,8 +32,12 @@ class SessionTurnCoordinator:
             self._entries[key] = entry
         entry.references += 1
         try:
-            async with entry.lock:
+            with step("session.queue"):
+                await entry.lock.acquire()
+            try:
                 yield
+            finally:
+                entry.lock.release()
         finally:
             entry.references -= 1
             if entry.references == 0:

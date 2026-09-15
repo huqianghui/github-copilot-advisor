@@ -1,12 +1,18 @@
 """单次问答的运行上下文:工具上报副作用,核心管线读取。
 用 contextvars 而不是解析 LLM 自由文本(spec 7.1、10.2)。"""
 from contextvars import ContextVar
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from functools import wraps
+from typing import ParamSpec, TypeVar
 
 from advisor_shared.events import SearchAttempt
 from advisor_shared.messages import MentionDirective
+from advisor_shared.telemetry import step
+
+P = ParamSpec("P")
+R = TypeVar("R")
 
 
 @dataclass
@@ -21,6 +27,20 @@ class RunContext:
 
 
 current_run: ContextVar[RunContext] = ContextVar("current_run")
+
+
+def timed_tool(operation: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
+    @wraps(operation)
+    async def measured(*args: P.args, **kwargs: P.kwargs) -> R:
+        run = current_run.get()
+        name = operation.__name__
+        try:
+            with step(f"tool.{name}") as timing:
+                return await operation(*args, **kwargs)
+        finally:
+            run.tool_latencies_ms[name] = (
+                run.tool_latencies_ms.get(name, 0) + int(timing.duration_ms))
+    return measured
 
 
 @dataclass(frozen=True)

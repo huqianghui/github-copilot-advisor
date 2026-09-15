@@ -108,6 +108,10 @@ def test_report_keeps_turns_outcomes_and_errors_without_image_bytes(pytester):
     assert len(first["events"]) == len(second["events"]) == 1
     assert first["events"][0]["stage"] == "kb_hit"
     assert first["events"][0]["tool_latencies_ms"] == {"search_solutions": 12}
+    assert first["events"][0]["trace_id"] != second["events"][0]["trace_id"]
+    first_timings = first["events"][0]["timings"]
+    assert any(s["name"] == "agent.turn" for s in first_timings)
+    assert all(s["span_id"] and s["duration_ms"] >= 0 for s in first_timings)
     assert first["duration_seconds"] >= 0
     raw = path.read_text(encoding="utf-8")
     assert "\u4e2d\u6587" in raw

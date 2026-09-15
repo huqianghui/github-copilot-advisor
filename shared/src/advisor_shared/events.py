@@ -7,6 +7,22 @@ Stage = Literal["kb_hit", "live_hit", "web", "generic_advice", "escalated"]
 SearchSource = Literal["kb", "github-live", "web"]
 
 
+class StepTiming(BaseModel):
+    name: str
+    span_id: str
+    parent_span_id: str | None = None
+    started_at: str
+    start_offset_ms: float = Field(ge=0)
+    duration_ms: float = Field(default=0, ge=0)
+    status: Literal[
+        "success", "empty", "error", "timeout", "cancelled",
+        "not_configured", "degraded",
+    ] = "success"
+    error_type: str | None = None
+    attributes: dict[str, str | int | float | bool | None] = Field(
+        default_factory=dict)
+
+
 class SearchAttempt(BaseModel):
     source: SearchSource
     provider: str | None
@@ -19,6 +35,7 @@ class SearchAttempt(BaseModel):
     error_type: str | None = None
     http_status: int | None = None
     error_code: str | None = None
+    span_id: str | None = None
 
 
 class AdvisorEvent(BaseModel):
@@ -32,6 +49,8 @@ class AdvisorEvent(BaseModel):
     image_count: int = 0
     error: str | None = None
     search_attempts: list[SearchAttempt] = Field(default_factory=list)
+    trace_id: str | None = None
+    timings: list[StepTiming] = Field(default_factory=list)
 
     def to_log_line(self) -> str:
         return self.model_dump_json()

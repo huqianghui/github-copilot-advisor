@@ -56,6 +56,45 @@ async def test_happy_path_returns_response_and_persists_session():
     assert events[0].stage == "generic_advice"  # 无工具调用时默认
 
 
+async def test_event_contains_complete_turn_timing_and_unique_request_ids():
+    events = []
+    core = AdvisorCore(StubBackend(), InMemorySessionStore(),
+                       event_sink=events.append)
+    await core.handle(make_request())
+    await core.handle(make_request())
+    assert events[0].trace_id and events[0].trace_id != events[1].trace_id
+    for event in events:
+        stages = {s.name: s for s in event.timings}
+        assert {"agent.turn", "session.queue", "agent.plan", "session.read",
+                "agent.backend", "answer.postprocess", "answer.evaluate",
+                "session.write"} <= stages.keys()
+        assert stages["agent.turn"].duration_ms >= stages["agent.backend"].duration_ms
+        assert all(s.status == "success" for s in event.timings)
+
+
+async def test_runtime_summary_does_not_log_question_or_backend_exception(caplog):
+    import json
+    import logging
+
+    class Backend:
+        async def run(self, *args):
+            raise ValueError("private-backend-error")
+
+    with caplog.at_level(logging.INFO):
+        response = await AdvisorCore(
+            Backend(), InMemorySessionStore()).handle(
+                make_request("private-question"))
+    assert response.markdown == FALLBACK_MESSAGE
+    assert "private-question" not in caplog.text
+    assert "private-backend-error" not in caplog.text
+    summary = next(r for r in caplog.records if r.msg == "advisor_event")
+    assert summary.telemetry["trace_id"]
+    assert "question_summary" not in summary.telemetry
+    assert "error" not in summary.telemetry
+    assert "private-question" not in json.dumps(summary.telemetry)
+    assert "private-backend-error" not in json.dumps(summary.telemetry)
+
+
 async def test_history_passed_to_backend():
     sessions = InMemorySessionStore()
     await sessions.append("ck1", "user", "之前的问题")

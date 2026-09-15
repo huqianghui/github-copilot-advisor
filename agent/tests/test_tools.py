@@ -118,6 +118,46 @@ async def test_search_solutions_live_only_sets_live_hit(tmp_path):
     assert run.stage == "live_hit"
 
 
+async def test_repeated_tool_calls_accumulate_and_keep_each_timing(
+        tmp_path, monkeypatch):
+    from advisor_shared import telemetry
+
+    now = [0.0]
+    monkeypatch.setattr(telemetry.time, "monotonic", lambda: now[0])
+
+    class DelayedCombined:
+        async def search_solutions(self, query, product_area=None):
+            now[0] += 0.25
+            return {"no_results": True, "results": []}
+
+    run = new_run()
+    tools = make_tools(tmp_path)
+    tools._combined = DelayedCombined()
+    with telemetry.trace_scope() as trace:
+        await tools.search_solutions("first")
+        await tools.search_solutions("second")
+    assert run.tool_latencies_ms["search_solutions"] == 500
+    assert [s.duration_ms for s in trace.timings
+            if s.name == "tool.search_solutions"] == [250, 250]
+
+
+async def test_failed_tool_call_still_records_latency(tmp_path):
+    from advisor_shared.telemetry import trace_scope
+
+    class FailingCombined:
+        async def search_solutions(self, query, product_area=None):
+            raise RuntimeError("private-error")
+
+    run = new_run()
+    tools = make_tools(tmp_path)
+    tools._combined = FailingCombined()
+    with trace_scope() as trace, pytest.raises(RuntimeError):
+        await tools.search_solutions("q")
+    assert "search_solutions" in run.tool_latencies_ms
+    assert trace.timings[-1].name == "tool.search_solutions"
+    assert trace.timings[-1].status == "error"
+
+
 async def test_web_search_sets_stage_and_failover(tmp_path):
     run = new_run()
     tools = make_tools(tmp_path, web=([r("w", "web")], 2))

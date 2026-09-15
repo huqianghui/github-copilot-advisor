@@ -5,6 +5,7 @@ import os
 import httpx
 
 from advisor_agent.search.models import SearchResult
+from advisor_shared.telemetry import step
 
 logger = logging.getLogger(__name__)
 
@@ -91,10 +92,11 @@ class GitHubLiveSearchClient:
         terms = _fit_terms(query)
         repo_scope = " ".join(f"repo:{r}" for r in self.repos)
         qualifiers = f"{repo_scope} state:open {_ISSUE_QUALIFIER}"
-        resp = await self._client.get(
-            "/search/issues",
-            params={"q": f"{terms} {qualifiers}", "per_page": top})
-        resp.raise_for_status()
+        with step("search.github.request", top=top):
+            resp = await self._client.get(
+                "/search/issues",
+                params={"q": f"{terms} {qualifiers}", "per_page": top})
+            resp.raise_for_status()
         return [
             SearchResult(
                 title=item["title"],

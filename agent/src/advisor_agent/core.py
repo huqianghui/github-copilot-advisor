@@ -14,6 +14,7 @@ from advisor_agent.sessions import SessionStore, SessionTurnCoordinator
 from advisor_shared.citations import has_citation
 from advisor_shared.events import AdvisorEvent
 from advisor_shared.messages import AdvisorRequest, AdvisorResponse, Citation
+from advisor_shared.telemetry import step, trace_scope
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,9 @@ _SUMMARY_CHARS = 80
 
 
 def _log_event(event: AdvisorEvent) -> None:
-    logger.info("advisor_event %s", event.to_log_line())
+    logger.info("advisor_event", extra={"telemetry": event.model_dump(exclude={
+        "conversation_key", "question_summary", "error", "timings",
+    })})
 
 
 def _request_identity(request: AdvisorRequest) -> tuple[str, str, str, bool]:
@@ -55,16 +58,26 @@ class AdvisorCore:
 
     async def handle(self, request: AdvisorRequest) -> AdvisorResponse:
         identity = _request_identity(request)
-        async with self._turns.turn(identity[0]):
-            with request_scope(identity[1], identity[3]) as run:
-                planned = await self.planner.plan(request)
-                if _request_identity(planned) != identity:
-                    raise ValueError("planner changed request identity")
-                return await self._handle_turn(planned, run)
+        with trace_scope() as trace:
+            with step("agent.turn", channel=self.channel_name) as timing:
+                async with self._turns.turn(identity[0]):
+                    with request_scope(identity[1], identity[3]) as run:
+                        with step("agent.plan"):
+                            planned = await self.planner.plan(request)
+                            if _request_identity(planned) != identity:
+                                raise ValueError("planner changed request identity")
+                        response, event = await self._handle_turn(planned, run)
+                if event.error is not None:
+                    timing.status = "degraded"
+            event.trace_id = trace.trace_id
+            event.timings = list(trace.timings)
+            self.event_sink(event)
+            return response
 
     async def _handle_turn(self, request: AdvisorRequest,
-                           run: RunContext) -> AdvisorResponse:
-        history = await self.sessions.get(request.conversation_key)
+                           run: RunContext) -> tuple[AdvisorResponse, AdvisorEvent]:
+        with step("session.read"):
+            history = await self.sessions.get(request.conversation_key)
         # 必须在 planner 之后求值:planner 会换掉 request 对象。
         # 历史与事件共用 —— 纯图片消息的 question_summary 不能是空串。
         marked_text = (f"[图片×{len(request.images)}] {request.text}".strip()
@@ -73,34 +86,38 @@ class AdvisorCore:
         answer, error = None, None
         for _ in range(_MAX_ATTEMPTS):
             try:
-                answer = await self.backend.run(
-                    request.text, history, request.images or None)
+                with step("agent.backend"):
+                    answer = await self.backend.run(
+                        request.text, history, request.images or None)
                 break
             except Exception as e:
-                logger.exception("backend attempt failed")
+                logger.error("backend attempt failed error_type=%s", type(e).__name__)
                 error = str(e)
 
         if answer is None:
             response = AdvisorResponse(markdown=FALLBACK_MESSAGE)
         else:
-            seen, citations = set(), []
-            for c in run.citations_seen:
-                if c["url"] in seen or not has_citation(answer, c["url"]):
-                    continue
-                seen.add(c["url"])
-                citations.append(Citation(title=c["title"], url=c["url"]))
-            response = AdvisorResponse(
-                markdown=answer,
-                citations=citations[:_MAX_CITATIONS],
-                mentions=list(run.mentions),
-            )
-            response = await self.evaluator.evaluate(request, response)
-            await self.sessions.append(
-                request.conversation_key, "user", marked_text)
-            await self.sessions.append(
-                request.conversation_key, "assistant", response.markdown)
+            with step("answer.postprocess"):
+                seen, citations = set(), []
+                for c in run.citations_seen:
+                    if c["url"] in seen or not has_citation(answer, c["url"]):
+                        continue
+                    seen.add(c["url"])
+                    citations.append(Citation(title=c["title"], url=c["url"]))
+                response = AdvisorResponse(
+                    markdown=answer,
+                    citations=citations[:_MAX_CITATIONS],
+                    mentions=list(run.mentions),
+                )
+            with step("answer.evaluate"):
+                response = await self.evaluator.evaluate(request, response)
+            with step("session.write"):
+                await self.sessions.append(
+                    request.conversation_key, "user", marked_text)
+                await self.sessions.append(
+                    request.conversation_key, "assistant", response.markdown)
 
-        self.event_sink(AdvisorEvent(
+        event = AdvisorEvent(
             conversation_key=request.conversation_key,
             channel=self.channel_name,
             question_summary=marked_text[:_SUMMARY_CHARS],
@@ -111,5 +128,5 @@ class AdvisorCore:
             image_count=len(request.images),
             error=error if answer is None else None,
             search_attempts=run.search_attempts,
-        ))
-        return response
+        )
+        return response, event
