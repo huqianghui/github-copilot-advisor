@@ -1,5 +1,6 @@
 # channels/teams/src/teams_adapter/render.py
 """AdvisorResponse → Teams activity dict:mention entity 在此拼装(spec 8.1/8.2)。"""
+from advisor_shared.citations import has_citation
 from advisor_shared.messages import AdvisorResponse
 
 MAX_MARKDOWN_CHARS = 6000
@@ -23,8 +24,9 @@ def render_reply(response: AdvisorResponse) -> dict:
             })
         text = " ".join(at_tags) + " " + text
 
-    if response.citations:
-        refs = "\n".join(f"- [{c.title}]({c.url})" for c in response.citations)
+    missing = [c for c in response.citations if not has_citation(text, c.url)]
+    if missing:
+        refs = "\n".join(f"- [{c.title}]({c.url})" for c in missing)
         text = f"{text}\n\n**参考:**\n{refs}"
 
     return {"type": "message", "text": text, "entities": entities}

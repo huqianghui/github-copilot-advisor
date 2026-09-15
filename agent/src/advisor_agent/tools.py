@@ -1,13 +1,17 @@
 """MAF 注册的五个工具。docstring 即工具描述,LLM 依此决定调用时机(spec 7.2/7.3)。"""
 import json
+import logging
 import os
 import time
 
 from advisor_agent.diagnostics import NetworkDiagnostics
 from advisor_agent.escalation import EscalationConfig
 from advisor_agent.run_context import current_run
+from advisor_agent.search.source_policy import WebSearchScope, source_confidence
 from advisor_agent.usage import CopilotUsageClient
 from advisor_shared.messages import MentionDirective
+
+logger = logging.getLogger(__name__)
 
 
 class AdvisorTools:
@@ -40,20 +44,47 @@ class AdvisorTools:
             for item in out["results"])
         return json.dumps(out, ensure_ascii=False)
 
-    async def web_search(self, query: str) -> str:
-        """在 web 上搜索最新信息(版本发布、技术博客、官方文档)。
-        仅当 search_solutions 返回 no_results 时才使用此工具。"""
+    async def web_search(self, query: str,
+                         scope: WebSearchScope = "trusted") -> str:
+        """仅当 search_solutions 返回 no_results=true 时搜索网络。
+        默认 scope=trusted,优先检索 Copilot 官方文档/更新、VS Code 更新与
+        issue、Copilot Community 和 copilotfaq。结果足以回答则直接按模板作答;
+        这些结果为空或不足以回答时必须用 scope=general 扩展其它来源,
+        不能把产品介绍/关键词命中当作解决方案直接给通用排查。
+        source_confidence 仅表示来源置信度,不是答案充分性或已验证解决方案。"""
         run = current_run.get()
+        if scope not in ("trusted", "general"):
+            raise ValueError(f"invalid web search scope: {scope}")
+        if scope == "general" and not run.trusted_web_searched:
+            logger.warning("general web search blocked before trusted search")
+            return json.dumps({
+                "status": "trusted_search_required",
+                "message": "请先使用 scope=trusted 搜索并判断是否足以回答。",
+            }, ensure_ascii=False)
         start = time.monotonic()
-        results, failovers = await self._web.search(query)
-        run.tool_latencies_ms["web_search"] = int(
-            (time.monotonic() - start) * 1000)
+        results, failovers = await self._web.search(query, scope=scope)
+        run.tool_latencies_ms["web_search"] = (
+            run.tool_latencies_ms.get("web_search", 0)
+            + int((time.monotonic() - start) * 1000))
+        if scope == "trusted":
+            run.trusted_web_searched = True
         run.stage = "web"
         run.failover_count += failovers
         run.citations_seen.extend(
             {"title": r.title, "url": r.url} for r in results)
         return json.dumps(
-            {"results": [r.model_dump() for r in results]},
+            {"scope": scope, "no_results": not results,
+             "guidance": (
+                 "先判断结果是否包含针对当前问题的实质说明或可执行建议。"
+                 "足够则停止搜索,用 2-3 句总结、建议列表、来源回答。"
+                 "仅有产品介绍/关键词命中不算可用答案;结果不足或为空时,"
+                 "下一步必须 web_search(scope='general'),不能直接给通用排查。"
+                 if scope == "trusted" else
+                 "仅引用能支撑当前问题的内容;无可靠答案时明确说明不确定性,"
+                 "并按简洁模板给出必要建议。"),
+             "results": [
+                 {**r.model_dump(), "source_confidence": source_confidence(r)}
+                 for r in results]},
             ensure_ascii=False)
 
     async def escalate_to_human(self, channel_id: str, reason: str) -> str:

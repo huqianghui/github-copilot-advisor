@@ -17,6 +17,7 @@ class RunContext:
     tool_latencies_ms: dict[str, int] = field(default_factory=dict)
     failover_count: int = 0
     search_attempts: list[SearchAttempt] = field(default_factory=list)
+    trusted_web_searched: bool = False
 
 
 current_run: ContextVar[RunContext] = ContextVar("current_run")

@@ -11,6 +11,7 @@ from advisor_agent.extensions import (
 )
 from advisor_agent.run_context import RunContext, request_scope
 from advisor_agent.sessions import SessionStore, SessionTurnCoordinator
+from advisor_shared.citations import has_citation
 from advisor_shared.events import AdvisorEvent
 from advisor_shared.messages import AdvisorRequest, AdvisorResponse, Citation
 
@@ -25,7 +26,7 @@ FALLBACK_MESSAGE = ("抱歉,我这边暂时出了点问题,请稍后重试。"
 # GitHub API 调用、重复的 web search 计费)。两层叠乘还会把最坏等待推到
 # 6 次连接 × 15s,对 Teams 用户不可接受。
 _MAX_ATTEMPTS = 1
-_MAX_CITATIONS = 5
+_MAX_CITATIONS = 3
 _SUMMARY_CHARS = 80
 
 
@@ -84,7 +85,7 @@ class AdvisorCore:
         else:
             seen, citations = set(), []
             for c in run.citations_seen:
-                if c["url"] in seen:
+                if c["url"] in seen or not has_citation(answer, c["url"]):
                     continue
                 seen.add(c["url"])
                 citations.append(Citation(title=c["title"], url=c["url"]))

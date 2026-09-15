@@ -79,7 +79,8 @@ async def test_citations_and_mentions_from_run_context():
             name="李四", platform_user_id="29:1", role="CSAM"))
 
     events: list[AdvisorEvent] = []
-    core = AdvisorCore(StubBackend(side_effect=side_effect),
+    core = AdvisorCore(StubBackend(reply="见 https://x/a 和 [b](https://x/b)",
+                                   side_effect=side_effect),
                        InMemorySessionStore(),
                        event_sink=collect_events(events))
     resp = await core.handle(make_request())
@@ -87,6 +88,34 @@ async def test_citations_and_mentions_from_run_context():
     assert resp.mentions[0].name == "李四"
     assert events[0].stage == "kb_hit"
     assert events[0].mentioned_human is True
+
+
+async def test_citations_exclude_uncited_results_and_url_prefix_matches():
+    def side_effect():
+        current_run.get().citations_seen.extend([
+            {"title": "unused", "url": "https://x/unused"},
+            {"title": "prefix", "url": "https://x/12"},
+            {"title": "cited", "url": "https://x/123"},
+        ])
+
+    core = AdvisorCore(
+        StubBackend(reply="来源:\nhttps://x/123", side_effect=side_effect),
+        InMemorySessionStore(), event_sink=lambda e: None)
+    resp = await core.handle(make_request())
+    assert [c.url for c in resp.citations] == ["https://x/123"]
+
+
+async def test_response_metadata_keeps_at_most_three_cited_sources():
+    def side_effect():
+        current_run.get().citations_seen.extend(
+            {"title": str(i), "url": f"https://x/{i}"} for i in range(5))
+
+    core = AdvisorCore(
+        StubBackend(reply="\n".join(f"https://x/{i}" for i in range(5)),
+                    side_effect=side_effect),
+        InMemorySessionStore(), event_sink=lambda e: None)
+    resp = await core.handle(make_request())
+    assert len(resp.citations) == 3
 
 
 async def test_core_does_not_retry_backend():

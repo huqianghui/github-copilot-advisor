@@ -2,6 +2,40 @@
 # 行为断言:expected_stage = 事件里的瀑布终点;expect_mention = 是否应 @人
 # 语言断言:reply_language = zh/en(检查回复主要语言)
 cases:
+  - id: quality-trusted-sufficient
+    text: 'VS Code 中 GitHub Copilot 报 "Invalid string length",怎么处理?'
+    expected_stage_in: [web]
+    reply_language: zh
+    expect_concise_answer: true
+    expected_web_scopes: [trusted]
+    max_web_calls: 1
+    expect_source_urls: ["https://github.com/microsoft/vscode/issues/292795"]
+    # Synthetic evidence for routing/style evaluation, not an issue transcript.
+    search_fixture:
+      trusted:
+        - title: "GitHub Copilot Invalid string length"
+          content: "Copilot 聊天在历史过长或包含大型图片附件时可能出现 Invalid string length。建议移除图片附件,新建聊天,回退上一条消息再重试。报告仍在调查,未确认所有情况的根因,也未承诺修复版本。"
+          url: "https://github.com/microsoft/vscode/issues/292795"
+      general:
+        - title: "Additional context"
+          content: "No additional search should be needed when trusted evidence answers the question."
+          url: "https://example.com/help"
+  - id: quality-trusted-insufficient
+    text: 'VS Code 中 GitHub Copilot 报 "Invalid string length",怎么处理?'
+    expected_stage_in: [web]
+    reply_language: zh
+    expect_concise_answer: true
+    expected_web_scopes: [trusted, general]
+    expect_source_urls: ["https://example.com/copilot-chat-length"]
+    search_fixture:
+      trusted:
+        - title: "GitHub Copilot overview"
+          content: "Copilot supports code completion. This page has no information about chat errors or Invalid string length."
+          url: "https://docs.github.com/en/copilot"
+      general:
+        - title: "GitHub Copilot chat: Invalid string length"
+          content: "用户经验:Copilot 聊天历史过长、附带大图时出现 Invalid string length。新建会话、移除附件、回退上一条消息重试后缓解。并非官方结论,原因未经确认。"
+          url: "https://example.com/copilot-chat-length"
   # P0 主题1:Credits/Token/计费/上下文治理
   - id: billing-premium-requests
     text: "Copilot 的 AI Credit 是怎么计费的?我们团队额度用超了"
