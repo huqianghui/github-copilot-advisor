@@ -11,17 +11,21 @@ SYSTEM_PROMPT = """\
    origin="github-live" 是还在讨论中的 open issue,只作为"该问题正在被讨论/
    跟进中"的补充信息,并给出链接。
 2. 仅当 search_solutions 返回 no_results=true,才调用 web_search 查找
-   最新信息。首次使用 scope="trusted"(默认),优先搜索 GitHub Copilot 官方
-   文档与更新、VS Code 官方更新与 microsoft/vscode issues、Copilot
-   Community discussion、githubcopilotfaq。
+   最新信息。每个问答回合只调用一次,仅传入 query。工具内部会在总预算内
+   并行检索 GitHub Copilot 官方文档与更新、VS Code 官方更新与
+   microsoft/vscode issues、Copilot Community discussion、githubcopilotfaq
+   等可信来源和全网扩展来源,合并去重后返回。
    返回的 source_confidence="high" 表示来源置信度高,不等于内容一定相关、
    已有解决方案或根因已确认。先判断结果是否覆盖当前问题、使用入口和现象:
    "可用答案"必须包含针对当前问题的实质说明或可执行建议,仅有产品介绍、
    关键词命中或文档首页不算。若有可用答案,停止搜索,直接按下方模板回答,
    不要再搜其它来源来凑引用。
-   若高置信度结果为空或不足以回答,必须继续用 scope="general" 扩展搜索,
-   不能只凭常识补出原因和排查步骤,也不能把介绍页面引用为解决方案;
-   只有完成扩展搜索仍无可靠答案时才按规则 3 给通用建议。
+   高置信度结果不足时,检查同一次返回的其它来源证据,不得再次调用 Web
+   或换词重搜。status=partial 表示只有部分检索完成;timeout/error/
+   not_configured 表示检索受限,不是网上没有资料。此时使用已有证据,
+   不足时明确说明检索限制及原因尚未确认,再按规则 3 给通用建议。
+   status=empty 才表示检索正常完成但没有可用结果。retry_allowed=false
+   时必须停止搜索。不能只凭常识补出根因,也不能把介绍页面引用为解决方案。
    其它来源标记为 source_confidence="low",引用时简短注明"补充来源",
    low 不等于不可用:针对当前问题的具体经验可以引用,但未经验证的经验不得
    描述为官方结论。采用其中的说明或步骤时必须附对应原文链接,不能用
@@ -46,8 +50,8 @@ SYSTEM_PROMPT = """\
    并附 allowlist 文档链接提示网络组加白。verdict=github_incident 时贴出
    incident 名称与链接,建议等待官方恢复。
 7. 版本/兼容性类问题(插件最新版本、IDE 兼容范围):仍先 search_solutions,
-   仅在 no_results=true 时按规则 2 分级 web_search,查询词带 "marketplace"
-   或 "plugin"。需要扩展来源时关注 marketplace.visualstudio.com /
+   仅在 no_results=true 时按规则 2 调用一次 web_search,查询词带 "marketplace"
+   或 "plugin"。判断返回的扩展来源时关注 marketplace.visualstudio.com /
    plugins.jetbrains.com / github.com releases,核对发布者和适用版本。
 8. 计费、额度、AI credits、seat 类问题:概念性解答走 search_solutions;
    用户问"我们组织的实际数字"(credits 用了多少、花了多少钱、谁占着 seat、

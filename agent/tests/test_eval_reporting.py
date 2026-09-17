@@ -219,20 +219,20 @@ class EmptySearch:
 class WebProvider:
     name = "brave"
 
-    async def search(self, query, top):
+    async def search(self, query, top, *, client=None):
         return [SearchResult(title="found", content="answer",
-                             url="https://example.test/result",
+                             url="https://docs.github.com/en/copilot/help",
                              origin="web", score=1)]
 
 class FailingProvider:
     name = "tavily"
 
-    async def search(self, query, top):
+    async def search(self, query, top, *, client=None):
         raise httpx.ConnectTimeout("private-connection-detail")
 
 async def search_backend(self, user_text, history, images=None):
     await CombinedSearch(EmptySearch(), EmptySearch()).search_solutions(user_text)
-    await WebSearchChain([FailingProvider(), WebProvider()]).search(user_text)
+    await WebSearchChain([FailingProvider(), WebProvider()]).retrieve(user_text)
     current_run.get().stage = "web"
     return f"Reply: {user_text}"
 
@@ -244,7 +244,12 @@ Backend.run = search_backend
     first, second = report["cases"][0]["turns"]
     for turn in (first, second):
         attempts = turn["events"][0].get("search_attempts", [])
-        assert len(attempts) == 4
+        assert len(attempts) == 6
+        assert turn["events"][0]["error"] is None
+        web_attempts = [a for a in attempts if a["source"] == "web"]
+        assert {(a["scope"], a["provider"], a["status"]) for a in web_attempts} == {
+            ("trusted", "tavily", "timeout"), ("general", "tavily", "timeout"),
+            ("trusted", "brave", "success"), ("general", "brave", "success")}
         by_provider = {attempt["provider"]: attempt for attempt in attempts}
         assert by_provider["azure_ai_search"]["status"] == "empty"
         assert by_provider["azure_ai_search"]["result_count"] == 0

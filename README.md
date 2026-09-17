@@ -30,8 +30,12 @@ uv run --env-file .env python -m teams_adapter  # 启动 Teams bot(见 docs/team
 ## 回答策略
 
 - 回答策略:保持知识库/GitHub live 优先;仅在 `no_results=true` 时转网络搜索。
-  网络搜索先使用 `trusted` 范围(高置信度来源),结果足以回答就停止;
-  为空或不足以回答时才使用 `general` 范围扩展其它来源。
+  每个问答回合仅执行一次逻辑网络检索,工具内部并行查询 `trusted`
+  (高置信度来源)和 `general` (全网),合并去重并优先呈现可信来源。
+  模型收到结果后直接判断证据并回答,不再通过反复调用工具重搜。
+  双范围共享默认 12 秒等待预算,单个 provider 尝试最多 6 秒;
+  失败时在剩余预算内切换已配置的备用 provider,保留已获得的部分结果。
+  超时/服务不可用与正常无结果明确区分,重复调用复用本回合结果。
   高置信度范围为 Copilot 官方文档与 GitHub Changelog、VS Code 更新与
   `microsoft/vscode` issues、Copilot Community discussion、`githubcopilotfaq`。
   来源策略集中在 [source_policy.py](agent/src/advisor_agent/search/source_policy.py);
@@ -41,7 +45,7 @@ uv run --env-file .env python -m teams_adapter  # 启动 Teams bot(见 docs/team
   中文正文目标不超过 600 个字符(不含来源),用户明确要求详情时可放宽;
   Teams 不重复追加已有链接,也不展示未被回答引用的检索结果。
 - 回答质量回归:现有 `test_eval_behavior.py` 中的 `quality-` 用例以固定检索
-  夹具验证真实模型的分级搜索决策、回答结构和长度,不依赖搜索网站实时排序。
+  夹具验证真实模型使用单次合并检索的证据、回答结构和长度,不依赖搜索网站实时排序。
   可用 `uv run --no-sync --env-file .env pytest -m integration agent/tests/test_eval_behavior.py -k quality-`
   单独运行;报告保存在 `agent/tests/output/`。
 

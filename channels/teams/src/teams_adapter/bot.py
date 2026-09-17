@@ -1,5 +1,5 @@
 # channels/teams/src/teams_adapter/bot.py
-"""Teams handler 注册:触发判定 → typing → agent core → 渲染回复(spec 8.2)。
+"""Teams handler 注册:触发判定 → agent core → 渲染回复(spec 8.2)。
 纯逻辑仍在 extract/render;此处只做 Agents SDK 对象与 dict 的桥接。"""
 import logging
 
@@ -130,8 +130,6 @@ def register_handlers(agent_app: AgentApplication, core):
             request = request.model_copy(update={
                 "text": f"{request.text}(另有 {skipped} 张图片未能获取)".strip()})
 
-        with step("teams.typing"):
-            await context.send_activity(Activity(type="typing"))
         try:
             response = await core.handle(request)
             with step("teams.render"):

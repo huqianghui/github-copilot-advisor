@@ -71,12 +71,17 @@ uv run --env-file .env python -m teams_adapter
 
 ## 四、冒烟清单
 
-- [ ] 1:1 私聊问"Copilot 登录失败怎么办" → typing 指示 → 中文回答带引用链接
+- [ ] 1:1 私聊问"Copilot 登录失败怎么办" → 处理期间并行续发 typing → 中文回答带引用链接
+- [ ] 慢请求处理中持续显示 typing;最终回复不等待 typing 请求,回复后不再续发
+- [ ] 群聊未 @ Bot、未通过入口认证的请求不产生 typing
 - [ ] channel 里不 @bot 发消息 → bot 无反应
 - [ ] channel 里 @bot 提问 → 回答出现在同一 reply thread
 - [ ] 同一 thread 里追问"还是不行,找个人吧" → 回复含 CSAM @提及或联系方式
 - [ ] 英文提问 → 英文回答
 - [ ] 停掉 AI Search(改错 endpoint)再提问 → 仍有回答(live/web 兜底)或明确道歉,进程不崩
+
+Typing 默认每 3 秒尝试发送,单次发送超时为 2 秒;实际显示由 Teams 客户端和网络
+决定。日志及非阻塞边界见 [Development](../DEVELOPMENT.md#非阻塞-typing)。
 
 ### 用户隔离
 

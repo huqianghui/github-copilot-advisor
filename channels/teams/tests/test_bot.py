@@ -87,25 +87,26 @@ def test_handler_registered_for_message_activity():
     assert handler.__name__ == "on_message"
 
 
-async def test_responds_with_typing_then_answer():
+async def test_handler_sends_only_answer_typing_is_owned_by_middleware():
     core = StubCore()
     handler = register_handlers(_agent_app(), core)
     ctx = FakeTurnContext(group_activity())
     await handler(ctx, TurnState())
     assert len(core.requests) == 1
     assert core.requests[0].text == "登录失败"
-    assert ctx.sent[0].type == "typing"
-    assert len(ctx.sent) == 2
+    assert ctx.sent[0].type == "message"
+    assert len(ctx.sent) == 1
 
 
-async def test_handler_times_typing_render_and_send():
+async def test_handler_times_render_and_send_without_inline_typing():
     from advisor_shared.telemetry import trace_scope
 
     handler = register_handlers(_agent_app(), StubCore())
     with trace_scope() as trace:
         await handler(FakeTurnContext(group_activity()), TurnState())
     stages = {s.name: s for s in trace.timings}
-    assert {"teams.message", "teams.typing", "teams.render", "teams.send"} <= stages.keys()
+    assert {"teams.message", "teams.render", "teams.send"} <= stages.keys()
+    assert "teams.typing" not in stages
     assert stages["teams.send"].parent_span_id == stages["teams.message"].span_id
 
 
@@ -133,7 +134,7 @@ async def test_responds_to_personal_activity():
     assert len(core.requests) == 1
     assert core.requests[0].text == "登录失败"
     assert core.requests[0].user_id == "29:u"
-    assert len(ctx.sent) == 2
+    assert len(ctx.sent) == 1
 
 
 async def test_ignores_group_message_without_mention():
@@ -386,4 +387,4 @@ async def test_sdk_serialization_preserves_both_supported_tenant_locations():
         await register_handlers(_agent_app(), core)(context, TurnState())
         assert len(core.requests) == 1
         assert core.requests[0].conversation_key.startswith("teams:user:v1:")
-        assert len(context.sent) == 2
+        assert len(context.sent) == 1

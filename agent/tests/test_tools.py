@@ -7,6 +7,7 @@ import pytest
 from advisor_agent.escalation import EscalationConfig
 from advisor_agent.run_context import new_run
 from advisor_agent.search.models import SearchResult
+from advisor_agent.search.retrieval import WebRetrievalResult, WebScopeResult
 from advisor_agent.search.web import WebSearchChain
 from advisor_agent.tools import AdvisorTools
 from test_web_search import StubProvider
@@ -52,8 +53,11 @@ class StubWeb:
     def __init__(self, results, failovers):
         self._out = (results, failovers)
 
-    async def search(self, query, top=5, *, scope="trusted"):
-        return self._out
+    async def retrieve(self, query, top=5):
+        results, failovers = self._out
+        status = "success" if results else "empty"
+        return WebRetrievalResult(status, results, [
+            WebScopeResult("general", status, results, failovers=failovers)])
 
 
 class StubDiagnostics:
@@ -175,49 +179,131 @@ async def test_web_search_returns_scope_confidence_and_empty_status(tmp_path):
                      origin="web", score=0),
     ])])
     out = json.loads(await tools.web_search("q"))
-    assert out["scope"] == "trusted"
+    assert out["status"] == "success"
     assert out["no_results"] is False
     assert out["results"][0]["source_confidence"] == "high"
+    assert {s["scope"] for s in out["scopes"]} == {"trusted", "general"}
     assert "sufficient" not in out  # Source reputation is not answer sufficiency.
 
 
-async def test_general_search_cannot_skip_trusted_stage(tmp_path):
+async def test_repeated_web_search_reuses_results_without_duplicate_side_effects(tmp_path):
     run = new_run()
     provider = StubProvider("a", [r("other", "web")])
     tools = make_tools(tmp_path)
     tools._web = WebSearchChain([provider])
-    out = json.loads(await tools.web_search("q", scope="general"))
-    assert out["status"] == "trusted_search_required"
-    assert not provider.called
-    assert run.citations_seen == []
+    first = await tools.web_search("q")
+    citations = list(run.citations_seen)
+    failovers = run.failover_count
+    second = await tools.web_search("changed query")
+    assert first == second
+    assert len(provider.queries) == 2
+    assert run.citations_seen == citations
+    assert len(citations) == 1
+    assert run.failover_count == failovers
+    assert run.web_search_started is True
 
 
 @pytest.mark.parametrize("trusted_has_results", [True, False])
-async def test_general_search_allowed_after_insufficient_trusted_search(
+async def test_one_call_includes_general_even_when_trusted_has_results(
         tmp_path, trusted_has_results):
+    from test_web_retrieval import Provider
+
     new_run()
-    provider = StubProvider("a", [
+    provider = Provider(trusted=[
         SearchResult(title="Docs", content="related but incomplete",
                      url="https://docs.github.com/en/copilot",
                      origin="web", score=0),
-    ] if trusted_has_results else [])
+    ] if trusted_has_results else [], general=[r("other", "web")])
     tools = make_tools(tmp_path)
     tools._web = WebSearchChain([provider])
-    first = json.loads(await tools.web_search("q"))
-    assert first["no_results"] is not trusted_has_results
-    provider._results = [r("other", "web")]
-    out = json.loads(await tools.web_search("q", scope="general"))
-    assert out["scope"] == "general"
-    assert out["results"][0]["source_confidence"] == "low"
+    out = json.loads(await tools.web_search("q"))
+    assert out["status"] == "success"
+    assert sorted(provider.calls) == ["general", "trusted"]
+    assert any(r["title"] == "other" for r in out["results"])
 
 
-async def test_trusted_search_gate_resets_for_each_run(tmp_path):
+async def test_web_search_allowance_resets_for_each_run(tmp_path):
     new_run()
     tools = make_tools(tmp_path)
+    provider = StubProvider("a")
+    tools._web = WebSearchChain([provider])
     await tools.web_search("q")
     new_run()
-    out = json.loads(await tools.web_search("q", scope="general"))
-    assert out["status"] == "trusted_search_required"
+    await tools.web_search("q")
+    assert len(provider.queries) == 4
+
+
+@pytest.mark.parametrize(("error", "status", "no_results"), [
+    (TimeoutError("private"), "timeout", None),
+    (RuntimeError("private"), "error", None),
+    (None, "empty", True),
+])
+async def test_web_failure_is_explicit_and_cached(tmp_path, error, status, no_results):
+    new_run()
+    provider = StubProvider("a", error=error)
+    tools = make_tools(tmp_path)
+    tools._web = WebSearchChain([provider])
+    first = await tools.web_search("q")
+    second = await tools.web_search("retry")
+    assert first == second
+    assert len(provider.queries) == 2
+    payload = json.loads(first)
+    assert payload["status"] == status
+    assert payload["no_results"] is no_results
+    assert payload["retry_allowed"] is False
+    assert "private" not in first
+
+
+async def test_concurrent_web_calls_share_one_logical_execution(tmp_path):
+    from test_web_retrieval import Provider, result
+
+    new_run()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class Blocking(Provider):
+        async def search(self, query, top, *, client=None):
+            entered.set()
+            await release.wait()
+            return await super().search(query, top, client=client)
+
+    provider = Blocking(general=[result("answer")])
+    tools = make_tools(tmp_path)
+    tools._web = WebSearchChain([provider])
+    async with asyncio.timeout(3):
+        first = asyncio.create_task(tools.web_search("first"))
+        await entered.wait()
+        second = asyncio.create_task(tools.web_search("second"))
+        release.set()
+        assert await first == await second
+    assert sorted(provider.calls) == ["general", "trusted"]
+    assert provider.clients[0] is provider.clients[1]
+
+
+async def test_cancelled_web_call_cannot_restart_in_same_turn(tmp_path):
+    new_run()
+    entered = asyncio.Event()
+    calls = []
+
+    class Waiting:
+        name = "waiting"
+
+        async def search(self, query, top, *, client=None):
+            calls.append(query)
+            entered.set()
+            await asyncio.Event().wait()
+
+    tools = make_tools(tmp_path)
+    tools._web = WebSearchChain([Waiting()])
+    async with asyncio.timeout(3):
+        task = asyncio.create_task(tools.web_search("first"))
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        out = json.loads(await tools.web_search("retry"))
+    assert out["status"] == "already_attempted"
+    assert out["retry_allowed"] is False
+    assert len(calls) == 2
 
 
 async def test_escalate_adds_mention_only_for_in_channel(tmp_path):

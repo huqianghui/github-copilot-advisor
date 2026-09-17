@@ -21,6 +21,7 @@ from advisor_shared.telemetry import step
 from teams_adapter.app import create_app
 from teams_adapter.bot import register_handlers
 from teams_adapter.downloader import TeamsImageDownloader
+from teams_adapter.typing import NonBlockingTypingMiddleware
 
 
 def _configure_logging() -> None:
@@ -43,13 +44,14 @@ def build_agent_app():
     config = load_configuration_from_env(environ)
     connection_manager = MsalConnectionManager(**config)
     adapter = CloudAdapter(connection_manager=connection_manager)
+    adapter.use(NonBlockingTypingMiddleware())
     storage = MemoryStorage()
     authorization = Authorization(storage, connection_manager, **config)
     agent_app = AgentApplication[TurnState](
         storage=storage,
         adapter=adapter,
         authorization=authorization,
-        start_typing_timer=False,       # behavior-preserving:handler 手动发 typing
+        start_typing_timer=False,       # Typing is owned by the gated adapter middleware.
         remove_recipient_mention=False,  # behavior-preserving:extract.strip_mentions 唯一剥离来源
         file_downloaders=[TeamsImageDownloader(connection_manager)],
         **config,

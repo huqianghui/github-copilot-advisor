@@ -10,15 +10,17 @@ from openai import APITimeoutError
 
 from advisor_agent.run_context import current_run
 from advisor_agent.search.models import SearchResult
+from advisor_agent.search.source_policy import WebSearchScope
 from advisor_shared.events import SearchAttempt, SearchSource
 from advisor_shared.telemetry import step
 
 
 class SearchTrace:
     def __init__(self, source: SearchSource, provider: str | None,
-                 timeout_seconds: float):
+                 timeout_seconds: float, *, scope: WebSearchScope | None = None):
         self.attempt = SearchAttempt(
-            source=source, provider=provider, timeout_seconds=timeout_seconds)
+            source=source, provider=provider, timeout_seconds=timeout_seconds,
+            scope=scope)
         self._run = current_run.get(None)
         self._started_at = 0.0
         self._budget_expired = False
@@ -62,6 +64,7 @@ class SearchTrace:
     async def run(self, operation: Awaitable[list[SearchResult]]) -> list[SearchResult]:
         with step(f"search.{self.attempt.source}",
                   provider=self.attempt.provider,
+                  scope=self.attempt.scope,
                   timeout_seconds=self.attempt.timeout_seconds) as timing:
             self.attempt.span_id = timing.span_id
             try:

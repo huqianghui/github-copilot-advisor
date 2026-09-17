@@ -1,6 +1,7 @@
 """KB 检索:AI Search hybrid(BM25+向量+semantic ranker)(spec 7.2)。"""
 from azure.search.documents.models import VectorizedQuery
 
+from advisor_agent.llm_diagnostics import sdk_call_diagnostics
 from advisor_agent.search.models import MIN_RERANKER_SCORE, SearchResult
 from advisor_shared.telemetry import step
 
@@ -15,8 +16,11 @@ class KnowledgeSearchClient:
     async def search(self, query: str, product_area: str | None = None,
                      top: int = 5) -> list[SearchResult]:
         with step("search.kb.embedding", model=self.embed_model):
-            emb = await self.embed.embeddings.create(model=self.embed_model,
-                                                     input=[query])
+            with sdk_call_diagnostics("embeddings") as diagnostics:
+                emb = await self.embed.embeddings.create(model=self.embed_model,
+                                                         input=[query])
+                if diagnostics is not None:
+                    diagnostics.record_usage(getattr(emb, "usage", None))
         vector = VectorizedQuery(vector=emb.data[0].embedding,
                                  k_nearest_neighbors=top,
                                  fields="content_vector")

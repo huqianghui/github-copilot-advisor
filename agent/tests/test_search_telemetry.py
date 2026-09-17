@@ -53,7 +53,14 @@ async def test_combined_distinguishes_schema_error_from_empty_without_secrets():
     assert "private-test-value" not in str(recorded)
 
 
-async def test_budget_timeout_is_not_reported_as_an_empty_search():
+async def test_budget_timeout_is_not_reported_as_an_empty_search(monkeypatch):
+    from advisor_agent.search import telemetry
+
+    # Windows clock ticks can make these real durations equal; keep the timer
+    # assertions deterministic without changing the event loop's timeout clock.
+    ticks = iter([0.0, 0.0, 0.005, 0.020])
+    monkeypatch.setattr(telemetry, "time",
+                        SimpleNamespace(monotonic=lambda: next(ticks)))
     run = new_run()
     out = await CombinedSearch(
         StubKB([r("kb", "kb")]), StubLive(delay=5),
@@ -65,7 +72,8 @@ async def test_budget_timeout_is_not_reported_as_an_empty_search():
     assert recorded["github-live"]["result_count"] is None
     assert recorded["github-live"]["timeout_seconds"] == 0.02
     assert recorded["github-live"]["error_type"] == "TimeoutError"
-    assert recorded["github-live"]["duration_ms"] > recorded["kb"]["duration_ms"]
+    assert recorded["kb"]["duration_ms"] == 5
+    assert recorded["github-live"]["duration_ms"] == 20
 
 
 async def test_budget_expiry_is_logged_as_timeout_before_event_emission(caplog):
@@ -155,7 +163,7 @@ async def test_web_budget_timeout_then_empty_provider_are_separate_attempts():
     class SlowProvider:
         name = "slow"
 
-        async def search(self, query, top):
+        async def search(self, query, top, *, client=None):
             await asyncio.sleep(5)
             return []
 

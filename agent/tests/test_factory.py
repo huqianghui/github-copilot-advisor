@@ -59,6 +59,25 @@ def test_build_advisor_hardens_both_chat_and_embed_clients(azure_env):
     _assert_hardened(core.backend._tools._combined.kb.embed, "embed client")
 
 
+def test_factory_wires_web_budget_independently_of_openai(azure_env, monkeypatch):
+    monkeypatch.setenv("WEB_SEARCH_BUDGET_SECONDS", "9")
+    monkeypatch.setenv("WEB_SEARCH_ATTEMPT_TIMEOUT_SECONDS", "3")
+    core = build_advisor("teams")
+    web = core.backend._tools._web
+    assert web.budget == 9
+    assert web.timeout == 3
+    _assert_hardened(core.backend._client, "chat remains unchanged")
+
+
+@pytest.mark.parametrize("name", [
+    "WEB_SEARCH_BUDGET_SECONDS", "WEB_SEARCH_ATTEMPT_TIMEOUT_SECONDS"])
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "not-a-number"])
+def test_invalid_web_budget_fails_at_startup(azure_env, monkeypatch, name, value):
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=name):
+        build_advisor("teams")
+
+
 def test_maf_backend_prefers_injected_client(azure_env):
     sentinel = object()
     backend = MAFBackend(tools=None, channel_id_provider=lambda: "19:c",

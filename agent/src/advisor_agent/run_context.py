@@ -1,5 +1,6 @@
 """单次问答的运行上下文:工具上报副作用,核心管线读取。
 用 contextvars 而不是解析 LLM 自由文本(spec 7.1、10.2)。"""
+import asyncio
 from contextvars import ContextVar
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
@@ -23,7 +24,9 @@ class RunContext:
     tool_latencies_ms: dict[str, int] = field(default_factory=dict)
     failover_count: int = 0
     search_attempts: list[SearchAttempt] = field(default_factory=list)
-    trusted_web_searched: bool = False
+    web_search_started: bool = False
+    web_search_result: str | None = None
+    web_search_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 current_run: ContextVar[RunContext] = ContextVar("current_run")

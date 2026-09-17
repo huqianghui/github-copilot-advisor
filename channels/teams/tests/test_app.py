@@ -52,6 +52,22 @@ async def test_healthz_ok_without_auth():
         assert await resp.text() == "ok"
 
 
+async def test_unauthorized_http_message_never_reaches_typing(monkeypatch):
+    entered = []
+
+    async def unexpected_start(*args):
+        entered.append(True)
+        raise AssertionError("unauthorized request reached the adapter")
+
+    monkeypatch.setattr(app_module, "start_agent_process", unexpected_start)
+    config = AgentAuthConfiguration(
+        client_id="test", tenant_id="test", anonymous_allowed=False)
+    async with TestClient(TestServer(create_app(object(), object(), config))) as client:
+        response = await client.post("/api/messages", json={"type": "message"})
+    assert response.status == 401
+    assert entered == []
+
+
 async def test_messages_routes_to_start_agent_process(monkeypatch):
     seen = {}
 
@@ -216,9 +232,13 @@ def test_agent_app_wires_image_downloader(monkeypatch):
     class StubAuthorization:
         connection_manager = stub_cm
 
+    class StubAdapter:
+        def use(self, middleware):
+            return self
+
     monkeypatch.setattr(entry, "load_configuration_from_env", lambda env: {})
     monkeypatch.setattr(entry, "MsalConnectionManager", lambda **_: stub_cm)
-    monkeypatch.setattr(entry, "CloudAdapter", lambda **_: None)
+    monkeypatch.setattr(entry, "CloudAdapter", lambda **_: StubAdapter())
     monkeypatch.setattr(entry, "Authorization",
                         lambda *a, **k: StubAuthorization())
     monkeypatch.setattr(entry, "build_advisor", lambda channel_name: object())

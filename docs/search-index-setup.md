@@ -214,6 +214,7 @@ uv run --env-file .env pytest -m integration agent/tests/test_eval_behavior.py -
 |---|---|
 | `source` | `kb` / `github-live` / `web` |
 | `provider` | `azure_ai_search` / `github` / `tavily` / `brave`;未配置 Web provider 时为 `null` |
+| `scope` | Web 的 `trusted` / `general`,失败/超时也保留;KB/GitHub 和旧报告为 `null` |
 | `status` | `success` 有结果;`empty` 正常返回但无结果;`timeout` 超时;`error` 异常;`not_configured` 未配置;`cancelled` 被取消 |
 | `result_count` | 本次分支/provider 的结果条数;失败、超时、未配置时为 `null`,不是 `0` |
 | `duration_ms` | 该分支/provider 的实际耗时,不是组合检索整体耗时 |
@@ -249,7 +250,16 @@ Agent 没有整体失败,不代表每次检索都成功。旧报告没有这些�
 | `search.github-live` / `search.github.request` | GitHub 分支整体 / HTTP 调用 |
 | `search.merge` | KB 优先合并、去重及结果构造 |
 | `tool.web_search` / `search.web` | Web 工具整体 / 每次 provider 尝试 |
+| `search.web.retrieve` / `search.web.scope` | 单次逻辑 Web 检索 / 并行的 trusted 或 general 分支 |
 | `search.web.filter` | Web 来源和内容过滤;记录 scope、provider 和条数 |
+| `search.web.merge` | 双范围结果合并、URL 去重、可信来源优先排序 |
+
+Web 现在每个问答回合只执行一次逻辑检索,内部并行查询 trusted/general;
+两个范围共享默认 12 秒等待预算,每个 provider 尝试最多 6 秒。
+模型重复调用时复用结果,不再次出网。超时、错误和正常无结果分别返回,
+部分成功保留已有候选;不能根据 `tool.web_search` 的缓存返回状态判断新请求成功。
+模型接口不再接受 `scope`,只接受 `query`。配置及结果状态见
+[单次逻辑 Web 检索](../DEVELOPMENT.md#单次逻辑-web-检索)。
 
 Azure Search SDK 的 `await search_client.search(...)` 返回惰性 pager;
 当前版本在 `async for` 时才发起请求。若只给 `await search(...)` 计时,

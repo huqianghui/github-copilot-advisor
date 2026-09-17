@@ -7,8 +7,8 @@ cases:
     expected_stage_in: [web]
     reply_language: zh
     expect_concise_answer: true
-    expected_web_scopes: [trusted]
-    max_web_calls: 1
+    expected_web_scopes: [trusted, general]
+    max_web_requests: 2
     expect_source_urls: ["https://github.com/microsoft/vscode/issues/292795"]
     # Synthetic evidence for routing/style evaluation, not an issue transcript.
     search_fixture:
@@ -18,7 +18,7 @@ cases:
           url: "https://github.com/microsoft/vscode/issues/292795"
       general:
         - title: "Additional context"
-          content: "No additional search should be needed when trusted evidence answers the question."
+          content: "Copilot supports code completion. This overview has no troubleshooting details."
           url: "https://example.com/help"
   - id: quality-trusted-insufficient
     text: 'VS Code 中 GitHub Copilot 报 "Invalid string length",怎么处理?'
@@ -26,6 +26,7 @@ cases:
     reply_language: zh
     expect_concise_answer: true
     expected_web_scopes: [trusted, general]
+    max_web_requests: 2
     expect_source_urls: ["https://example.com/copilot-chat-length"]
     search_fixture:
       trusted:

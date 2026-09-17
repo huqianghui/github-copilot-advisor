@@ -9,12 +9,15 @@ from openai import AsyncAzureOpenAI, Timeout
 from advisor_agent.core import AdvisorCore
 from advisor_agent.diagnostics import NetworkDiagnostics
 from advisor_agent.escalation import EscalationConfig
+from advisor_agent.llm_diagnostics import DiagnosticAsyncHttpClient
 from advisor_agent.maf_backend import MAFBackend
 from advisor_agent.run_context import get_request_context
 from advisor_agent.search.combined import CombinedSearch
 from advisor_agent.search.github_live import GitHubLiveSearchClient
 from advisor_agent.search.knowledge import KnowledgeSearchClient
-from advisor_agent.search.web import BraveProvider, TavilyProvider, WebSearchChain
+from advisor_agent.search.web import (
+    BraveProvider, TavilyProvider, WebSearchChain, validate_seconds,
+)
 from advisor_agent.sessions import InMemorySessionStore
 from advisor_agent.tools import AdvisorTools
 from advisor_agent.usage import CopilotUsageClient
@@ -54,6 +57,7 @@ def build_openai_client(api_version: str) -> AsyncAzureOpenAI:
         api_version=api_version,
         timeout=_TIMEOUT,
         max_retries=_MAX_RETRIES,
+        http_client=DiagnosticAsyncHttpClient(timeout=_TIMEOUT),
     )
 
 
@@ -66,6 +70,12 @@ def _is_group_provider() -> bool:
 
 
 def build_advisor(channel_name: str = "generic") -> AdvisorCore:
+    web_budget = validate_seconds(
+        os.environ.get("WEB_SEARCH_BUDGET_SECONDS", "12"),
+        "WEB_SEARCH_BUDGET_SECONDS")
+    web_timeout = validate_seconds(
+        os.environ.get("WEB_SEARCH_ATTEMPT_TIMEOUT_SECONDS", "6"),
+        "WEB_SEARCH_ATTEMPT_TIMEOUT_SECONDS")
     # embedding 的 api_version 保持钉死,不跟随 AZURE_OPENAI_API_VERSION ——
     # 那个变量是给 chat 调 preview 版本用的,不该拖着 embeddings 一起漂。
     embed_client = build_openai_client("2024-10-21")
@@ -83,7 +93,8 @@ def build_advisor(channel_name: str = "generic") -> AdvisorCore:
         providers.append(TavilyProvider())
     if os.environ.get("BRAVE_API_KEY"):
         providers.append(BraveProvider())
-    web = WebSearchChain(providers)
+    web = WebSearchChain(providers, timeout_seconds=web_timeout,
+                         budget_seconds=web_budget)
     escalation = EscalationConfig.load(
         Path(os.environ.get("ESCALATION_CONFIG",
                             Path(__file__).parent.parent.parent

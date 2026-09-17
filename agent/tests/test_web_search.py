@@ -17,7 +17,7 @@ class StubProvider:
         self.called = False
         self.queries = []
 
-    async def search(self, query, top):
+    async def search(self, query, top, *, client=None):
         self.called = True
         self.queries.append(query)
         if self._error:

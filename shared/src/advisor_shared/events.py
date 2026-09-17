@@ -26,6 +26,7 @@ class StepTiming(BaseModel):
 class SearchAttempt(BaseModel):
     source: SearchSource
     provider: str | None
+    scope: Literal["trusted", "general"] | None = None
     status: Literal[
         "success", "empty", "timeout", "error", "not_configured", "cancelled"
     ] = "empty"

@@ -18,7 +18,9 @@ from typing import Callable
 
 from openai import AsyncAzureOpenAI, BadRequestError
 
+from advisor_agent.llm_diagnostics import sdk_call_diagnostics
 from advisor_agent.prompts import SYSTEM_PROMPT
+from advisor_agent.run_context import current_run
 from advisor_agent.tools import AdvisorTools
 from advisor_shared.messages import ImageInput
 from advisor_shared.telemetry import step
@@ -69,12 +71,6 @@ _TOOL_SCHEMAS = [
                 "type": "object",
                 "properties": {
                     "query": {"type": "string"},
-                    "scope": {
-                        "type": "string",
-                        "enum": ["trusted", "general"],
-                        "default": "trusted",
-                        "description": "先 trusted;仅当其结果不足以回答才 general。",
-                    },
                 },
                 "required": ["query"],
             },
@@ -168,6 +164,23 @@ def build_user_message(user_text: str,
     return {"role": "user", "content": content}
 
 
+def _completed_web_exchange(messages: list[dict]) -> list[dict]:
+    calls = {
+        call["id"]: call
+        for message in messages
+        for call in message.get("tool_calls", [])
+        if call["function"]["name"] == "web_search"
+    }
+    for message in reversed(messages):
+        if message["role"] == "tool" and message.get("tool_call_id") in calls:
+            return [
+                {"role": "assistant", "content": None,
+                 "tool_calls": [calls[message["tool_call_id"]]]},
+                message,
+            ]
+    return []
+
+
 class MAFBackend:
     def __init__(self, tools: AdvisorTools,
                  channel_id_provider: Callable[[], str],
@@ -192,8 +205,7 @@ class MAFBackend:
             return await self._tools.search_solutions(
                 arguments["query"], arguments.get("product_area"))
         if name == "web_search":
-            return await self._tools.web_search(
-                arguments["query"], arguments.get("scope", "trusted"))
+            return await self._tools.web_search(arguments["query"])
         if name == "escalate_to_human":
             return await self._tools.escalate_to_human(
                 self._channel_id(), arguments["reason"])
@@ -212,11 +224,12 @@ class MAFBackend:
             messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             messages.extend(history)
             messages.append(build_user_message(user_text, images))
+        attempted_messages = list(messages)
         try:
             # 传副本:_run_tool_loop 会往列表里 append 助手消息与工具结果。若让
             # 它写进这里的 messages,下面的 messages[-1] 就不再是那条 user
             # message —— 剥图会改错位置,还会切断 tool_calls 与 tool 结果的配对。
-            return await self._run_tool_loop(list(messages))
+            return await self._run_tool_loop(attempted_messages)
         except BadRequestError:
             if not images:
                 raise            # 无图时的 400 是真错误,交给 core 兜底
@@ -229,18 +242,31 @@ class MAFBackend:
             with step("llm.vision_fallback", image_count=len(images)) as timing:
                 timing.status = "degraded"
                 messages[-1] = build_user_message(user_text, None)
+                # Web is already unavailable this turn; keep its completed evidence
+                # and matching tool-call ID when discarding the image-bearing loop.
+                run = current_run.get(None)
+                if run is not None and run.web_search_result is not None:
+                    messages.extend(_completed_web_exchange(attempted_messages))
                 answer = await self._run_tool_loop(messages)
             return f"{answer}\n\n{IMAGE_NOT_PROCESSED_NOTE}"
 
     async def _run_tool_loop(self, messages: list[dict]) -> str:
         for round_index in range(_MAX_TOOL_ROUNDS):
+            run = current_run.get(None)
+            available_tools = [
+                schema for schema in _TOOL_SCHEMAS
+                if not (run is not None and run.web_search_started
+                        and schema["function"]["name"] == "web_search")]
             with step("llm.completion", round=round_index + 1,
                       model=self._deployment, message_count=len(messages)) as timing:
-                response = await self._client.chat.completions.create(
-                    model=self._deployment,
-                    messages=messages,
-                    tools=_TOOL_SCHEMAS,
-                )
+                with sdk_call_diagnostics("chat.completions") as diagnostics:
+                    response = await self._client.chat.completions.create(
+                        model=self._deployment,
+                        messages=messages,
+                        tools=available_tools,
+                    )
+                    if diagnostics is not None:
+                        diagnostics.record_usage(getattr(response, "usage", None))
                 timing.attributes["tool_call_count"] = len(
                     response.choices[0].message.tool_calls or [])
                 usage = getattr(response, "usage", None)

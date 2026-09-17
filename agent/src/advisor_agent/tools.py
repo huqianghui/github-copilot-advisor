@@ -6,7 +6,7 @@ import os
 from advisor_agent.diagnostics import NetworkDiagnostics
 from advisor_agent.escalation import EscalationConfig
 from advisor_agent.run_context import current_run, timed_tool
-from advisor_agent.search.source_policy import WebSearchScope, source_confidence
+from advisor_agent.search.source_policy import source_confidence
 from advisor_agent.usage import CopilotUsageClient
 from advisor_shared.messages import MentionDirective
 from advisor_shared.telemetry import current_span, step
@@ -43,44 +43,61 @@ class AdvisorTools:
         return json.dumps(out, ensure_ascii=False)
 
     @timed_tool
-    async def web_search(self, query: str,
-                         scope: WebSearchScope = "trusted") -> str:
-        """仅当 search_solutions 返回 no_results=true 时搜索网络。
-        默认 scope=trusted,优先检索 Copilot 官方文档/更新、VS Code 更新与
-        issue、Copilot Community 和 copilotfaq。结果足以回答则直接按模板作答;
-        这些结果为空或不足以回答时必须用 scope=general 扩展其它来源,
-        不能把产品介绍/关键词命中当作解决方案直接给通用排查。
+    async def web_search(self, query: str) -> str:
+        """仅当 search_solutions 返回 no_results=true 时使用,每个问答回合仅调用一次。
+        工具内部在总预算内并行检索可信来源与全网,合并去重并优先呈现可信来源。
+        根据 status 区分成功、部分成功、空结果、超时和服务不可用。
+        返回后直接使用已有证据回答,不足时说明限制;不要换词或再次调用。
         source_confidence 仅表示来源置信度,不是答案充分性或已验证解决方案。"""
         run = current_run.get()
-        if scope not in ("trusted", "general"):
-            raise ValueError(f"invalid web search scope: {scope}")
-        if scope == "general" and not run.trusted_web_searched:
-            logger.warning("general web search blocked before trusted search")
-            return json.dumps({
-                "status": "trusted_search_required",
-                "message": "请先使用 scope=trusted 搜索并判断是否足以回答。",
+        async with run.web_search_lock:
+            timing = current_span()
+            if run.web_search_result is not None:
+                if timing is not None:
+                    timing.attributes["cached"] = True
+                logger.info("reusing Web retrieval from this turn")
+                return run.web_search_result
+            if run.web_search_started:
+                logger.warning("interrupted Web retrieval cannot restart in this turn")
+                return json.dumps({
+                    "status": "already_attempted", "no_results": None,
+                    "retry_allowed": False, "results": [],
+                    "guidance": "本回合检索已中断,不要再次搜索;请说明限制并按已有证据回答。",
+                }, ensure_ascii=False)
+            run.web_search_started = True
+            run.stage = "web"
+            outcome = await self._web.retrieve(query)
+            run.failover_count += outcome.failovers
+            run.citations_seen.extend(
+                {"title": r.title, "url": r.url} for r in outcome.results)
+            if timing is not None:
+                timing.status = ("degraded" if outcome.status == "partial"
+                                 else outcome.status)
+                timing.attributes["cached"] = False
+            guidance = (
+                "本回合 Web 检索已完成,不要再次调用或换词重搜。"
+                "先判断证据是否真正回答问题,优先使用可信来源,仅引用实际支撑答案的链接。"
+                "没有充分证据时说明原因尚未确认,不要把产品介绍或关键词命中当作解决方案。")
+            if outcome.status in {"timeout", "error", "not_configured", "partial"}:
+                guidance += (
+                    "部分或全部检索未能完成,不能据此断言网上没有资料;"
+                    "可基于已获得证据回答,并明确说明检索受限。")
+            run.web_search_result = json.dumps({
+                "status": outcome.status,
+                "no_results": (False if outcome.results else
+                               True if outcome.status == "empty" else None),
+                "retry_allowed": False,
+                "guidance": guidance,
+                "scopes": [
+                    {"scope": scope.scope, "status": scope.status,
+                     "result_count": len(scope.results),
+                     "attempts": [a.model_dump() for a in scope.attempts]}
+                    for scope in outcome.scopes],
+                "results": [
+                    {**r.model_dump(), "source_confidence": source_confidence(r)}
+                    for r in outcome.results],
             }, ensure_ascii=False)
-        results, failovers = await self._web.search(query, scope=scope)
-        if scope == "trusted":
-            run.trusted_web_searched = True
-        run.stage = "web"
-        run.failover_count += failovers
-        run.citations_seen.extend(
-            {"title": r.title, "url": r.url} for r in results)
-        return json.dumps(
-            {"scope": scope, "no_results": not results,
-             "guidance": (
-                 "先判断结果是否包含针对当前问题的实质说明或可执行建议。"
-                 "足够则停止搜索,用 2-3 句总结、建议列表、来源回答。"
-                 "仅有产品介绍/关键词命中不算可用答案;结果不足或为空时,"
-                 "下一步必须 web_search(scope='general'),不能直接给通用排查。"
-                 if scope == "trusted" else
-                 "仅引用能支撑当前问题的内容;无可靠答案时明确说明不确定性,"
-                 "并按简洁模板给出必要建议。"),
-             "results": [
-                 {**r.model_dump(), "source_confidence": source_confidence(r)}
-                 for r in results]},
-            ensure_ascii=False)
+            return run.web_search_result
 
     @timed_tool
     async def escalate_to_human(self, channel_id: str, reason: str) -> str:

@@ -3,7 +3,6 @@ prompt/工具描述每次改动必跑:uv run pytest -m integration agent/tests/t
 import os
 import re
 import time
-from itertools import groupby
 from pathlib import Path
 
 import pytest
@@ -112,7 +111,7 @@ def configure_search_fixture(core, fixture: dict) -> list[str]:
     class FixtureProvider:
         name = "eval-fixture"
 
-        async def search(self, query, top):
+        async def search(self, query, top, *, client=None):
             scope = "trusted" if "site:" in query else "general"
             queries.append(scope)
             return [SearchResult(**item, origin="web", score=0)
@@ -174,9 +173,11 @@ async def test_eval_case(case, eval_turns: list[dict]):
     if case.get("expect_concise_answer"):
         assert_concise_answer(resp.markdown)
     if queries is not None:
-        phases = [scope for scope, _ in groupby(queries)]
-        assert phases == case["expected_web_scopes"], queries
-        if "max_web_calls" in case:
-            assert len(queries) <= case["max_web_calls"], queries
+        assert sorted(set(queries)) == sorted(case["expected_web_scopes"]), queries
+        if "max_web_requests" in case:
+            assert len(queries) <= case["max_web_requests"], queries
+        for event in events:
+            logical_calls = sum(t.name == "search.web.retrieve" for t in event.timings)
+            assert logical_calls <= 1
     for url in case.get("expect_source_urls", []):
         assert url in resp.markdown

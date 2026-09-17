@@ -305,19 +305,79 @@ def test_usage_schema_description_maps_the_retired_term():
     assert "premium requests" in description
 
 
-async def test_web_scope_schema_and_dispatch_enforce_trusted_first(
+async def test_web_schema_exposes_only_query_and_dispatch_returns_logical_result(
         backend, tmp_path):
     new_run()
     backend._tools = make_tools(tmp_path)
     schema = next(s["function"] for s in _TOOL_SCHEMAS
                   if s["function"]["name"] == "web_search")
-    assert schema["parameters"]["properties"]["scope"]["enum"] == [
-        "trusted", "general"]
-    blocked = json.loads(await backend._dispatch(
-        "web_search", {"query": "q", "scope": "general"}))
-    assert blocked["status"] == "trusted_search_required"
-    trusted = json.loads(await backend._dispatch("web_search", {"query": "q"}))
-    assert trusted["scope"] == "trusted"
-    general = json.loads(await backend._dispatch(
-        "web_search", {"query": "q", "scope": "general"}))
-    assert general["scope"] == "general"
+    assert set(schema["parameters"]["properties"]) == {"query"}
+    outcome = json.loads(await backend._dispatch("web_search", {"query": "q"}))
+    assert outcome["status"] == "empty"
+    assert outcome["retry_allowed"] is False
+
+
+async def test_backend_hides_used_web_tool_and_repeated_calls_do_not_repeat_http(
+        backend, tmp_path, monkeypatch):
+    import respx
+    from advisor_agent.search.web import TavilyProvider, WebSearchChain
+
+    new_run()
+    backend._tools = make_tools(tmp_path)
+    backend._tools._web = WebSearchChain([TavilyProvider(api_key="test")])
+    offers, replies = [], []
+
+    async def create(**kwargs):
+        offers.append({s["function"]["name"] for s in kwargs["tools"]})
+        replies.extend(m["content"] for m in kwargs["messages"]
+                       if m["role"] == "tool")
+        calls = [_tool_call()] if len(offers) <= 2 else None
+        return SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content="answer", tool_calls=calls))])
+
+    monkeypatch.setattr(backend._client.chat.completions, "create", create)
+    with respx.mock:
+        route = respx.post("https://api.tavily.com/search").mock(
+            return_value=httpx.Response(200, json={"results": []}))
+        assert await backend.run("question", []) == "answer"
+        assert route.call_count == 2
+    assert "web_search" in offers[0]
+    assert "web_search" not in offers[1] | offers[2]
+    assert replies and all(r == replies[0] for r in replies)
+
+
+async def test_vision_fallback_keeps_web_evidence_without_searching_again(
+        backend, tmp_path, monkeypatch):
+    from advisor_agent.search.models import SearchResult
+
+    new_run()
+    backend._tools = make_tools(tmp_path, web=([
+        SearchResult(title="evidence", content="specific advice",
+                     url="https://example.test/advice", origin="web", score=1)], 0))
+    calls = 0
+    retried = {}
+
+    async def create(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                content=None, tool_calls=[_tool_call()]))])
+        if calls == 2:
+            raise _bad_request()
+        retried.update(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+            content="answer", tool_calls=None))])
+
+    monkeypatch.setattr(backend._client.chat.completions, "create", create)
+    response = await backend.run("question", [], [ImageInput(data=PNG, mime_type="image/png")])
+    assert IMAGE_NOT_PROCESSED_NOTE in response
+    assert not any(s["function"]["name"] == "web_search" for s in retried["tools"])
+    tool_messages = [m for m in retried["messages"] if m["role"] == "tool"]
+    assert len(tool_messages) == 1
+    assert json.loads(tool_messages[0]["content"])["results"][0]["content"] == "specific advice"
+    matching = [call for m in retried["messages"] for call in m.get("tool_calls", [])
+                if call["id"] == tool_messages[0]["tool_call_id"]]
+    assert len(matching) == 1 and matching[0]["function"]["name"] == "web_search"
+    assert all(isinstance(m["content"], str)
+               for m in retried["messages"] if m["role"] == "user")
