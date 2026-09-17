@@ -12,7 +12,9 @@ from advisor_agent.escalation import EscalationConfig
 from advisor_agent.llm_diagnostics import DiagnosticAsyncHttpClient
 from advisor_agent.maf_backend import MAFBackend
 from advisor_agent.run_context import get_request_context
-from advisor_agent.search.combined import CombinedSearch
+from advisor_agent.search.combined import (
+    GITHUB_SEARCH_BUDGET_SECONDS, SEARCH_BUDGET_SECONDS, CombinedSearch,
+)
 from advisor_agent.search.github_live import GitHubLiveSearchClient
 from advisor_agent.search.knowledge import KnowledgeSearchClient
 from advisor_agent.search.web import (
@@ -70,6 +72,12 @@ def _is_group_provider() -> bool:
 
 
 def build_advisor(channel_name: str = "generic") -> AdvisorCore:
+    kb_budget = validate_seconds(
+        os.environ.get("KB_SEARCH_BUDGET_SECONDS", str(SEARCH_BUDGET_SECONDS)),
+        "KB_SEARCH_BUDGET_SECONDS")
+    live_budget = validate_seconds(
+        os.environ.get("GITHUB_SEARCH_BUDGET_SECONDS", str(GITHUB_SEARCH_BUDGET_SECONDS)),
+        "GITHUB_SEARCH_BUDGET_SECONDS")
     web_budget = validate_seconds(
         os.environ.get("WEB_SEARCH_BUDGET_SECONDS", "12"),
         "WEB_SEARCH_BUDGET_SECONDS")
@@ -87,6 +95,8 @@ def build_advisor(channel_name: str = "generic") -> AdvisorCore:
     combined = CombinedSearch(
         KnowledgeSearchClient(search_client, embed_client),
         GitHubLiveSearchClient(),
+        budget_seconds=kb_budget,
+        live_budget_seconds=live_budget,
     )
     providers = []
     if os.environ.get("TAVILY_API_KEY"):

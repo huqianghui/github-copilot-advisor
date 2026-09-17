@@ -66,4 +66,4 @@ async def test_both_empty_signals_no_results():
 
 
 def test_budget_constant():
-    assert SEARCH_BUDGET_SECONDS == 8.0
+    assert SEARCH_BUDGET_SECONDS == 12.0

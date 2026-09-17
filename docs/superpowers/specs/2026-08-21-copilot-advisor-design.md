@@ -193,7 +193,11 @@ CLI 入口:`python -m ingestion run [--source NAME]`;单源失败不影响其他
   的 open issues/discussions
 
 合并策略(代码保证,非模型决定):
-- 总超时预算(~8s):到点只回来一个就用一个
+- KB 与 GitHub 同时启动,独立等待预算:KB 默认 12s(包含 embedding、Search 和过滤),
+  GitHub 默认 4s;GitHub 超时不取消仍在预算内的 KB。通过
+  `KB_SEARCH_BUDGET_SECONDS` / `GITHUB_SEARCH_BUDGET_SECONDS` 配置,
+  GitHub 实际预算取两者较小值;总体等待上限为 KB 预算,不是两者相加。
+  两边提前完成即返回,超时只使用已完成分支,取消清理与合并耗时另计
 - 都回来:合并去重,KB 结果排前,标注 source(kb / github-live)
 - 都空/都失败:返回明确 "no_results" 信号
 

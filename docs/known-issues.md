@@ -358,7 +358,7 @@ prompt 规则 9 的复述 → 写入会话历史 → 下一轮可用,这条设�
 
 **并行化不是答案** —— `asyncio.gather` 只把"无界串行"变成"无界并行"。
 正解是**总预算**,本仓 `search/combined.py` 已有该惯用法
-(`SEARCH_BUDGET_SECONDS` + `asyncio.wait(timeout=...)`)。
+(`SEARCH_BUDGET_SECONDS` + 分支级 `asyncio.timeout(...)`)。
 
 ### 5.4 `httpx2` logger 未钉死 —— 已查证
 

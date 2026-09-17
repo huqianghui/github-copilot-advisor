@@ -218,7 +218,7 @@ uv run --env-file .env pytest -m integration agent/tests/test_eval_behavior.py -
 | `status` | `success` 有结果;`empty` 正常返回但无结果;`timeout` 超时;`error` 异常;`not_configured` 未配置;`cancelled` 被取消 |
 | `result_count` | 本次分支/provider 的结果条数;失败、超时、未配置时为 `null`,不是 `0` |
 | `duration_ms` | 该分支/provider 的实际耗时,不是组合检索整体耗时 |
-| `timeout_seconds` | 组合检索预算或 Web provider 的外层超时限制 |
+| `timeout_seconds` | 本次分支的实际等待预算:KB 默认 12 秒,GitHub 默认 4 秒(不超过 KB 预算);或 Web provider 的外层超时限制 |
 | `error_type` | 异常类型,如 `HTTPStatusError`、`HttpResponseError`、`ConnectTimeout` |
 | `http_status` / `error_code` | 可获取的 HTTP 状态码和服务错误码,如 `403`、`429`、`CannotSearchWithoutSearchableFields` |
 
@@ -242,7 +242,7 @@ Agent 没有整体失败,不代表每次检索都成功。旧报告没有这些�
 | 步骤名 | 计时边界 |
 |---|---|
 | `tool.search_solutions` | 一次完整工具调用,包含结果序列化 |
-| `search.combined` | 一次组合检索,共享等待预算仍为 8 秒 |
+| `search.combined` | 一次组合检索,并行等待 KB(默认 12 秒)与 GitHub(默认 4 秒),含取消清理和合并 |
 | `search.kb` | KB 分支整体,包含 embedding、Search 和本地过滤 |
 | `search.kb.embedding` | 问题 embedding SDK 调用 |
 | `search.kb.azure_search` | hybrid + semantic 查询及**完整遍历分页结果**,不含 embedding |
@@ -277,9 +277,14 @@ GitHub 并行查询”不是等价查询。比较 Search 本身时,应使用相�
 而不是按照记录在数组中的完成顺序判断执行先后。
 
 **不要把所有步骤耗时相加**:父步骤包含子步骤,KB 和 GitHub 还互相重叠。
-例如 KB 已完成但 GitHub 仍未返回,组合检索仍会等到 GitHub 完成或 8 秒预算到期。
-8 秒是等待预算,不是含取消清理和合并在内的硬性总时长上限。预算耗尽的分支记
+例如 KB 在 1 秒完成但 GitHub 仍未返回,默认最多等到 GitHub 的第 4 秒;
+GitHub 在第 4 秒超时不会取消仍在运行的 KB,KB 可继续到自己的第 12 秒。
+两边都提前完成则立即合并,不是固定等待 12 秒,也不是串行相加为 16 秒。
+预算覆盖 KB 的 embedding + Search + 过滤全链路,不会在进入 Search 时重新计时。
+这仍是等待预算,不是含取消清理和合并在内的硬性总时长上限。预算耗尽的分支记
 `timeout`,外层请求取消记 `cancelled`;超时分支内部被取消的子步骤可记 `cancelled`。
+配置说明与本地测量依据见
+[KB/GitHub 检索预算](../DEVELOPMENT.md#kbgithub-检索预算)。
 
 日志级别、JSON/文本格式、LLM/Teams 计时和隐私边界见
 [Development](../DEVELOPMENT.md#分级日志与延迟分析)。
