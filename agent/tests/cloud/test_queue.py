@@ -371,3 +371,15 @@ async def test_broken_diagnostics_do_not_keep_a_lost_delivery_running(
             transport.failures.append(("update", 503, "ServerBusy"))
             tick.set()
             await asyncio.wait_for(asyncio.Event().wait(), 2)
+
+
+async def test_outbox_repair_is_paged_and_resumable(job_store, make_payload, session_queue):
+    for user in ("a", "b", "c"):
+        await job_store.submit(make_payload(user=user))
+    dispatcher = OutboxDispatcher(job_store.inbox, session_queue)
+    first = await dispatcher.repair_page(limit=1)
+    assert first.scanned == 1 and first.republished == 1
+    assert first.next_cursor
+    second = await dispatcher.repair_page(cursor=first.next_cursor, limit=1)
+    assert second.scanned == 1 and second.republished == 1
+    assert await dispatcher.repair_pending() == 1

@@ -11,8 +11,9 @@ from typing import Annotated, Literal
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from advisor_agent.durable.blob import BlobGateway
-from advisor_agent.durable.leases import LeaseBusy, LeaseGuard
+from advisor_agent.durable.leases import LeaseBusy, LeaseGuard, _log_failure
 from advisor_shared.cloud import PreparedTurn, TaskPayload
+from advisor_shared.delivery import DeliveryFailure
 
 
 JobState = Literal[
@@ -106,9 +107,32 @@ class OutboxSnapshot(_Stored):
         return self.pending_count > 0 and self.generation > self.notified_generation
 
 
+class OutboxPage(_Stored):
+    snapshots: list[OutboxSnapshot]
+    next_cursor: str | None = Field(repr=False)
+    scanned: int
+
+
+class PruneCursor(_Stored):
+    prefix: Literal["jobs/", "payload/", "terminal-metadata/"] = "jobs/"
+    marker: str | None = Field(default=None, repr=False)
+
+
 class PruneResult(_Stored):
-    removed: int
-    cursors: dict[str, str | None]
+    removed: int = 0
+    scanned: int = 0
+    expired: int = 0
+    failed: int = 0
+    skipped: int = 0
+    cursor: PruneCursor | None = None
+
+    @property
+    def cursors(self) -> dict[str, str | None]:
+        values = dict.fromkeys(("jobs/", "payload/", "terminal-metadata/", "_prefix"))
+        if self.cursor:
+            values["_prefix"] = self.cursor.prefix
+            values[self.cursor.prefix] = self.cursor.marker
+        return values
 
 
 class _Inbox(_Stored):
@@ -218,22 +242,29 @@ class InboxStore:
             edit.record.notified_generation = max(edit.record.notified_generation, generation)
             await edit.save()
 
+    async def outbox_page(self, *, cursor: str | None = None, limit: int = 200) -> OutboxPage:
+        page = await self.gateway.list_page("inbox/", cursor=cursor, limit=limit)
+        snapshots = []
+        for name in page.names:
+            document = await self.gateway.read(name)
+            if document is None:
+                continue
+            record = _Inbox.model_validate_json(document.body)
+            if self.name(record.partition_key) != name:
+                raise JobConflict("inbox path mismatch")
+            snapshots.append(OutboxSnapshot(
+                partition_key=record.partition_key, generation=record.generation,
+                notified_generation=record.notified_generation, pending_count=len(record.pending)))
+        return OutboxPage(snapshots=snapshots, next_cursor=page.next_cursor, scanned=len(page.names))
+
     async def outboxes(self) -> AsyncIterator[OutboxSnapshot]:
         cursor = None
         while True:
-            page = await self.gateway.list_page("inbox/", cursor=cursor)
-            for name in page.names:
-                document = await self.gateway.read(name)
-                if document is None:
-                    continue
-                record = _Inbox.model_validate_json(document.body)
-                if self.name(record.partition_key) != name:
-                    raise JobConflict("inbox path mismatch")
-                yield OutboxSnapshot(
-                    partition_key=record.partition_key, generation=record.generation,
-                    notified_generation=record.notified_generation, pending_count=len(record.pending))
+            page = await self.outbox_page(cursor=cursor)
+            for snapshot in page.snapshots:
+                yield snapshot
             cursor = page.next_cursor
-            if not cursor:
+            if cursor is None:
                 break
 
 
@@ -340,7 +371,8 @@ class JobStore:
         return pending
 
     @asynccontextmanager
-    async def leased_job(self, job_id: str) -> AsyncIterator[LeasedJob]:
+    async def leased_job(self, job_id: str, *,
+                         include_payload: bool = True) -> AsyncIterator[LeasedJob]:
         name = self._name(job_id)
         if await self.gateway.read(name) is None:
             record = await self.read(job_id)
@@ -356,7 +388,8 @@ class JobStore:
             if record.job_id != job_id:
                 raise JobConflict("leased job identity mismatch")
             payload = None
-            if not record.terminal and self.now() < record.accepted_at + BODY_RETENTION:
+            if (include_payload and not record.terminal
+                    and self.now() < record.accepted_at + BODY_RETENTION):
                 payload = await self.load_payload(job_id)
                 if payload.partition_key != record.partition_key:
                     raise JobConflict("job payload partition mismatch")
@@ -383,49 +416,94 @@ class JobStore:
         if payload:
             await self.gateway.delete(payload_name, etag=payload.etag)
 
-    async def prune(self, *, limit: int = 200,
-                    cursors: dict[str, str | None] | None = None) -> PruneResult:
-        """Bounded maintenance; schedule regularly in addition to storage lifecycle rules."""
-        removed = 0
-        cursors = cursors or {}
-        next_cursors = {}
-        page = await self.gateway.list_page("jobs/", limit=limit, cursor=cursors.get("jobs/"))
-        next_cursors["jobs/"] = page.next_cursor
-        for name in page.names:
-            job_id = name.removeprefix("jobs/").removesuffix(".json")
-            record = await self.read(job_id)
-            if record is None or (
-                    not record.terminal and self.now() < record.accepted_at + BODY_RETENTION):
-                continue
-            async with self.leased_job(job_id) as job:
-                if not job.record.terminal and self.now() >= job.record.accepted_at + BODY_RETENTION:
-                    await job.expire()
-                if job.record.terminal:
-                    await self._clean_terminal(job.record)
-                    await self.inbox._retire_terminal(job.partition_key, job.job_id)
-                    if self.now() >= job.record.terminal_at + METADATA_RETENTION:
-                        job.assert_active()
-                        await self.gateway.delete(name, etag=job.etag, lease_id=job.guard.id)
-                        removed += 1
-        for prefix in ("payload/", "terminal-metadata/"):
-            page = await self.gateway.list_page(prefix, limit=limit, cursor=cursors.get(prefix))
-            next_cursors[prefix] = page.next_cursor
+    async def _prune_job(self, job_id: str, result: PruneResult) -> None:
+        record = await self.read(job_id)
+        if record is None or (
+                not record.terminal and self.now() < record.accepted_at + BODY_RETENTION):
+            return
+        async with self.leased_job(job_id, include_payload=False) as job:
+            if not job.record.terminal:
+                await job.expire()
+                result.expired += 1
+            await self._clean_terminal(job.record)
+            await self.inbox._retire_terminal(job.partition_key, job.job_id)
+            if (job.guard is not None and job.record.terminal_at is not None
+                    and self.now() >= job.record.terminal_at + METADATA_RETENTION):
+                job.assert_active()
+                await self.gateway.delete(self._name(job_id), etag=job.etag, lease_id=job.guard.id)
+                result.removed += 1
+
+    async def _prune_candidate(self, prefix: str, name: str, result: PruneResult) -> None:
+        if prefix == "jobs/":
+            await self._prune_job(name.removeprefix(prefix).removesuffix(".json"), result)
+            return
+        document = await self.gateway.read(name)
+        if document is None:
+            return
+        if prefix == "payload/":
+            payload = TaskPayload.model_validate_json(document.body)
+            self._name(payload.job_id)
+            if name != f"payload/{payload.job_id}.json":
+                raise JobConflict("payload path mismatch")
+            if self.now() < payload.accepted_at + BODY_RETENTION:
+                return
+            if await self.read(payload.job_id) is None:
+                # Reserve the actual missing job, so no concurrent submission can
+                # introduce an in-flight reference while an orphan is being removed.
+                terminal = JobRecord(
+                    job_id=payload.job_id, partition_key=payload.partition_key,
+                    accepted_at=payload.accepted_at, state="expired",
+                    terminal_at=self.now(), failure_code="expired")
+                await self.gateway.create(self._name(payload.job_id), _encode(terminal))
+            await self._prune_job(payload.job_id, result)
+            return
+        record = JobRecord.model_validate_json(document.body)
+        if (name != f"terminal-metadata/{record.job_id}.json"
+                or not record.terminal or record.terminal_at is None or record.result is not None):
+            raise JobConflict("invalid terminal metadata")
+        if self.now() < record.terminal_at + METADATA_RETENTION:
+            return
+        await self._prune_job(record.job_id, result)
+        await self.inbox._retire_terminal(record.partition_key, record.job_id)
+        await self.gateway.delete(name, etag=document.etag)
+        result.removed += 1
+
+    async def prune(self, *, limit: int = 200, cursor: PruneCursor | None = None,
+                    cursors: dict[str, str | None] | None = None,
+                    continue_on_error: bool = False) -> PruneResult:
+        """At most limit enumerated candidates TOTAL; coordination reads are additional.
+
+        Persist result.cursor between calls. The legacy cursors mapping remains accepted.
+        """
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise ValueError("limit must be between 1 and 200")
+        if cursor is not None and cursors is not None:
+            raise ValueError("use one cursor representation")
+        prefixes = ("jobs/", "payload/", "terminal-metadata/")
+        if cursor is None:
+            prefix = (cursors or {}).get("_prefix") or "jobs/"
+            cursor = PruneCursor(prefix=prefix, marker=(cursors or {}).get(prefix))
+        result = PruneResult(cursor=cursor)
+        while result.scanned < limit and result.cursor is not None:
+            current = result.cursor
+            page = await self.gateway.list_page(current.prefix, cursor=current.marker, limit=1)
             for name in page.names:
-                document = await self.gateway.read(name)
-                if document is None:
-                    continue
-                if prefix == "payload/":
-                    model = TaskPayload.model_validate_json(document.body)
-                    due = model.accepted_at + BODY_RETENTION
-                else:
-                    model = JobRecord.model_validate_json(document.body)
-                    due = model.terminal_at + METADATA_RETENTION
-                if self.now() >= due:
-                    if prefix == "terminal-metadata/":
-                        await self.inbox._retire_terminal(model.partition_key, model.job_id)
-                    await self.gateway.delete(name, etag=document.etag)
-                    removed += 1
-        return PruneResult(removed=removed, cursors=next_cursors)
+                result.scanned += 1
+                try:
+                    await self._prune_candidate(current.prefix, name, result)
+                except LeaseBusy:
+                    result.skipped += 1
+                except Exception as error:
+                    if not continue_on_error:
+                        raise
+                    _log_failure("maintenance.prune_failed", error)
+                    result.failed += 1
+            if page.next_cursor:
+                result.cursor = PruneCursor(prefix=current.prefix, marker=page.next_cursor)
+            else:
+                index = prefixes.index(current.prefix) + 1
+                result.cursor = PruneCursor(prefix=prefixes[index]) if index < len(prefixes) else None
+        return result
 
 
 class LeasedJob:
@@ -501,8 +579,31 @@ class LeasedJob:
                          result_written_at=_utc(written_at or self.store.now()))
 
     async def mark_sending(self) -> None:
-        self._require("result_ready")
-        await self._save(state="sending", delivery_attempts=self.record.delivery_attempts + 1)
+        self._require("result_ready", "retry_wait")
+        if self.result is None or (self.record.retry_at and self.store.now() < self.record.retry_at):
+            raise JobStateError("job is not ready to send")
+        await self._save(state="sending", delivery_attempts=self.record.delivery_attempts + 1,
+                         retry_at=None, failure_code=None)
+
+    async def retry_delivery(self, failure: DeliveryFailure, *,
+                             retry_at: datetime | None = None) -> None:
+        self._require("sending")
+        if (not isinstance(failure, DeliveryFailure) or failure.definitely_not_sent is not True
+                or failure.retryable is not True):
+            raise JobStateError("delivery retry requires proof it was definitely unsent and retryable")
+        try:
+            provider_time = self.store.now() + timedelta(seconds=failure.retry_after_seconds or 0)
+        except OverflowError:
+            provider_time = datetime.max.replace(tzinfo=timezone.utc)
+        due = max(provider_time, _utc(retry_at) if retry_at is not None else provider_time)
+        await self._save(state="retry_wait", failure_code="delivery_failed", retry_at=due)
+
+    async def fail_delivery(self, failure: DeliveryFailure, *,
+                            code: FailureCode = "delivery_failed") -> None:
+        self._require("sending")
+        if not isinstance(failure, DeliveryFailure) or failure.definitely_not_sent is not True:
+            raise JobStateError("delivery failure requires proof it was definitely unsent")
+        await self._terminal("failed", failure_code=code)
 
     async def retry(self, code: FailureCode, *, retry_at: datetime | None = None) -> None:
         self._require("queued", "running", "retry_wait")

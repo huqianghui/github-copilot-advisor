@@ -15,7 +15,7 @@ from azure.storage.queue.aio import QueueClient
 from azure.storage.queue._message_encoding import NoDecodePolicy, NoEncodePolicy
 from typing_extensions import Self
 
-from advisor_agent.durable.jobs import InboxStore
+from advisor_agent.durable.jobs import InboxStore, _Stored
 from advisor_agent.durable.leases import _error_code
 from advisor_shared.cloud import QueueWake
 
@@ -30,6 +30,12 @@ logger = logging.getLogger(__name__)
 
 class DeliveryLost(RuntimeError):
     """The consumer may no longer acknowledge this Queue delivery."""
+
+
+class RepairResult(_Stored):
+    scanned: int
+    republished: int
+    next_cursor: str | None
 
 
 def decode_wake(body: bytes) -> QueueWake:
@@ -240,8 +246,21 @@ class OutboxDispatcher:
 
     async def repair_pending(self) -> int:
         count = 0
-        async for snapshot in self.inbox.outboxes():
+        cursor = None
+        while True:
+            page = await self.repair_page(cursor=cursor)
+            count += page.republished
+            cursor = page.next_cursor
+            if cursor is None:
+                return count
+
+    async def repair_page(self, *, cursor: str | None = None, limit: int = 200) -> RepairResult:
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise ValueError("limit must be between 1 and 200")
+        page = await self.inbox.outbox_page(cursor=cursor, limit=limit)
+        count = 0
+        for snapshot in page.snapshots:
             if snapshot.needs_notification:
                 await self.notify(snapshot.partition_key, uuid4().hex)
                 count += 1
-        return count
+        return RepairResult(scanned=page.scanned, republished=count, next_cursor=page.next_cursor)

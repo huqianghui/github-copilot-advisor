@@ -133,9 +133,13 @@ class ContractTransport(AsyncHttpTransport):
         if operation == "list":
             names = sorted(name for name in self.blobs
                            if name.startswith(query.get("prefix", [""])[0]))
-            start = int(query.get("marker", ["0"])[0])
+            marker = query.get("marker", [""])[0]
+            if marker:
+                if not marker.startswith("after:"):
+                    return error_response(request, 400, "InvalidQueryParameterValue")
+                names = [name for name in names if name > marker.removeprefix("after:")]
             limit = int(query.get("maxresults", ["200"])[0])
-            selected = names[start:start + limit]
+            selected = names[:limit]
             root = ET.Element("EnumerationResults", ServiceEndpoint="https://memory.invalid/",
                               ContainerName="contract")
             blobs = ET.SubElement(root, "Blobs")
@@ -148,7 +152,7 @@ class ContractTransport(AsyncHttpTransport):
                 ET.SubElement(props, "Content-Length").text = str(len(self.blobs[item].body))
                 ET.SubElement(props, "BlobType").text = "BlockBlob"
             ET.SubElement(root, "NextMarker").text = (
-                str(start + len(selected)) if start + len(selected) < len(names) else "")
+                "after:" + selected[-1] if len(names) > len(selected) else "")
             return Response(request, 200, ET.tostring(root), {"content-type": "application/xml"})
         blob = self.blobs.get(name)
         if operation == "create":

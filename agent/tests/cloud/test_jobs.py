@@ -283,3 +283,81 @@ async def test_retention_does_not_start_or_wait_for_live_jobs(job_store, make_pa
         await job.mark_running()
         await asyncio.wait_for(job_store.prune(), 2)
         assert job.state == "running"
+
+
+async def test_known_unsent_delivery_retry_preserves_checkpoint_and_provider_delay(
+        job_store, make_payload, job_clock):
+    from advisor_shared.delivery import DeliveryFailure
+    payload = make_payload()
+    await job_store.submit(payload)
+    failure = DeliveryFailure(definitely_not_sent=True, retryable=True,
+                              safe_code="send_throttled", retry_after_seconds=120)
+    async with job_store.leased_job(payload.job_id) as job:
+        await job.mark_running()
+        await job.save_result(prepared())
+        timestamp = job.record.result_written_at
+        await job.mark_sending()
+        await job.retry_delivery(failure, retry_at=job_clock() + timedelta(seconds=1))
+        assert job.result == prepared()
+        assert job.record.result_written_at == timestamp
+        assert job.record.retry_at == job_clock() + timedelta(seconds=120)
+        with pytest.raises(JobStateError):
+            await job.mark_sending()
+    job_clock.advance(seconds=120)
+    async with job_store.leased_job(payload.job_id) as job:
+        await job.mark_sending()
+        assert job.record.delivery_attempts == 2
+        assert job.record.generation_attempts == 1
+
+
+@pytest.mark.parametrize("method", ["retry_delivery", "fail_delivery"])
+async def test_uncertain_send_never_accepts_a_retry_or_failure_proof(
+        job_store, make_payload, method):
+    from advisor_shared.delivery import DeliveryFailure
+    payload = make_payload()
+    await job_store.submit(payload)
+    async with job_store.leased_job(payload.job_id) as job:
+        await job.mark_running()
+        await job.save_result(prepared())
+        await job.mark_sending()
+        with pytest.raises(JobStateError):
+            await getattr(job, method)(DeliveryFailure(
+                definitely_not_sent=False, retryable=True, safe_code="send_timeout"))
+        assert job.state == "sending"
+
+
+async def test_definitive_delivery_rejection_can_fail_terminally(job_store, make_payload):
+    from advisor_shared.delivery import DeliveryFailure
+    payload = make_payload()
+    await job_store.submit(payload)
+    async with job_store.leased_job(payload.job_id) as job:
+        await job.mark_running()
+        await job.save_result(prepared())
+        await job.mark_sending()
+        await job.fail_delivery(DeliveryFailure(
+            definitely_not_sent=True, retryable=False, safe_code="send_rejected"))
+    assert (await job_store.read(payload.job_id)).state == "failed"
+
+
+async def test_prune_uses_one_total_budget_across_prefixes(job_store, make_payload, blob_gateway):
+    payload = make_payload()
+    await job_store.submit(payload)
+    result = await job_store.prune(limit=1)
+    assert result.scanned == 1
+    assert result.cursor is not None
+    next_result = await job_store.prune(limit=1, cursor=result.cursor)
+    assert next_result.scanned <= 1
+    assert await blob_gateway.read(f"payload/{payload.job_id}.json") is not None
+
+
+async def test_expired_payload_is_not_deleted_while_its_job_lease_is_active(
+        job_store, make_payload, blob_gateway, job_clock):
+    payload = make_payload()
+    await job_store.submit(payload)
+    async with job_store.leased_job(payload.job_id) as job:
+        await job.mark_running()
+        job_clock.advance(hours=25)
+        result = await job_store.prune()
+        assert result.skipped >= 1
+        assert await blob_gateway.read(f"payload/{payload.job_id}.json") is not None
+        assert (await job_store.read(payload.job_id)).state == "running"
