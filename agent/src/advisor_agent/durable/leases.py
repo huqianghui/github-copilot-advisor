@@ -1,5 +1,6 @@
 """Renew the actual mutable blob's lease and cancel work when ownership is lost."""
 import asyncio
+import logging
 from asyncio import sleep
 from contextlib import suppress
 from time import monotonic
@@ -7,6 +8,7 @@ from types import TracebackType
 from uuid import uuid4
 
 from azure.core.exceptions import HttpResponseError
+from azure.storage.blob import StorageErrorCode
 from azure.storage.blob.aio import BlobClient, BlobLeaseClient
 from typing_extensions import Self
 
@@ -15,6 +17,17 @@ _LEASE_SECONDS = 60
 _RENEW_SECONDS = 20
 _RENEW_TIMEOUT_SECONDS = 20
 _RELEASE_TIMEOUT_SECONDS = 20
+logger = logging.getLogger(__name__)
+_SERVICE_CODES = {code.value for code in StorageErrorCode} | {
+    "AuthorizationPermissionMismatch", "AuthorizationFailure",
+    "AuthenticationFailed", "NoAuthenticationInformation",
+}
+_ERROR_TYPES = {
+    "HttpResponseError", "ClientAuthenticationError", "ResourceModifiedError",
+    "ResourceNotFoundError", "ResourceExistsError", "ServiceRequestError",
+    "ServiceResponseError", "AzureError", "TimeoutError", "CancelledError",
+    "ConnectionError", "OSError", "LeaseLost", "ValueError", "RuntimeError",
+}
 
 
 class LeaseBusy(RuntimeError):
@@ -28,6 +41,18 @@ class LeaseLost(RuntimeError):
 def _error_code(error: HttpResponseError) -> str | None:
     code = getattr(error, "error_code", None)
     return getattr(code, "value", code)
+
+
+def _log_failure(event: str, error: BaseException) -> None:
+    error_type = next((cls.__name__ for cls in type(error).__mro__
+                       if cls.__name__ in _ERROR_TYPES), "OtherError")
+    status = getattr(error, "status_code", None)
+    code = _error_code(error) if isinstance(error, HttpResponseError) else None
+    logger.warning(event, extra={"telemetry": {
+        "error_type": error_type,
+        "http_status": status if type(status) is int and 100 <= status <= 599 else None,
+        "service_code": code if isinstance(code, str) and code in _SERVICE_CODES else "Unknown",
+    }})
 
 
 def _lease_rejected(error: HttpResponseError) -> bool:
@@ -103,11 +128,13 @@ class LeaseGuard:
                 async with asyncio.timeout(min(_RENEW_TIMEOUT_SECONDS, remaining)):
                     await self._lease.renew()
                 self._deadline = started + _LEASE_SECONDS
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
             if self._active:
+                _log_failure("blob.lease.renewal_failed", error)
                 self._lose()
             raise
-        except Exception:
+        except Exception as error:
+            _log_failure("blob.lease.renewal_failed", error)
             self._lose()
 
     def _lose(self) -> None:
@@ -140,8 +167,10 @@ class LeaseGuard:
             except asyncio.CancelledError as error:
                 cancelled = error
                 if cleanup.cancelled():
+                    _log_failure("blob.lease.cleanup_failed", error)
                     return None, cancelled
             except Exception as error:
+                _log_failure("blob.lease.cleanup_failed", error)
                 return error, cancelled
 
     async def __aexit__(self, _exc_type: type[BaseException] | None,

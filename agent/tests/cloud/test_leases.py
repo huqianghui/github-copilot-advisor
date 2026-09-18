@@ -437,3 +437,67 @@ async def test_unexpected_renewal_cancellation_also_stops_protected_work(
             tick.set()
             await asyncio.wait_for(asyncio.Event().wait(), 2)
     assert guard.lost.is_set()
+
+
+@pytest.mark.parametrize("operation", ["renew", "release"])
+@pytest.mark.parametrize("code,expected", [
+    ("AuthorizationPermissionMismatch", "AuthorizationPermissionMismatch"),
+    ("https://private.invalid/?token=private-token", "Unknown"),
+])
+async def test_failures_log_only_safe_metadata_and_preserve_primary_error(
+        storage_harness, renewal_tick, monkeypatch, caplog, operation, code, expected):
+    from advisor_shared.logging import TelemetryFormatter
+
+    gateway, _, transport = storage_harness
+    entered, tick, _ = renewal_tick
+    await gateway.create("context/a", b"private-body")
+    send = transport.send
+    failure = HttpResponseError("private-exception https://private.invalid/?token=private-token")
+    failure.status_code = 403
+    failure.error_code = code
+
+    async def broken(request, **kwargs):
+        if request.headers.get("x-ms-lease-action") == operation:
+            raise failure
+        return await send(request, **kwargs)
+
+    monkeypatch.setattr(transport, "send", broken)
+    with pytest.raises(LeaseLost if operation == "renew" else ValueError):
+        async with gateway.lease("context/a"):
+            if operation == "renew":
+                await asyncio.wait_for(entered.wait(), 2)
+                tick.set()
+                await asyncio.wait_for(asyncio.Event().wait(), 2)
+            else:
+                raise ValueError("primary failure")
+    records = [r for r in caplog.records if r.name == leases.__name__]
+    assert len(records) == 1
+    record = records[0]
+    assert record.telemetry == {
+        "error_type": "HttpResponseError", "http_status": 403, "service_code": expected}
+    assert record.exc_info is None
+    rendered = TelemetryFormatter().format(record)
+    assert "private-" not in rendered
+    assert "primary failure" not in rendered
+
+
+async def test_cancelled_owner_still_logs_suppressed_cleanup_error(
+        blob_gateway, fail_next_operation, caplog):
+    await blob_gateway.create("context/a", b"one")
+    entered = asyncio.Event()
+
+    async def work():
+        async with blob_gateway.lease("context/a"):
+            entered.set()
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(work())
+    await asyncio.wait_for(entered.wait(), 2)
+    fail_next_operation("release", 503, "ServerBusy")
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    records = [r for r in caplog.records if r.name == leases.__name__]
+    assert len(records) == 1
+    assert records[0].telemetry["http_status"] == 503
+    assert records[0].telemetry["service_code"] == "ServerBusy"
