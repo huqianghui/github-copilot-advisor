@@ -7,11 +7,12 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
 from typing import Annotated, Literal
+from uuid import uuid4
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 from advisor_agent.durable.blob import BlobGateway
-from advisor_agent.durable.leases import LeaseBusy, LeaseGuard, _log_failure
+from advisor_agent.durable.leases import LeaseBusy, LeaseGuard, LeaseLost, _log_failure
 from advisor_shared.cloud import PreparedTurn, TaskPayload
 from advisor_shared.delivery import DeliveryFailure
 
@@ -37,6 +38,10 @@ class JobStateError(RuntimeError):
 
 
 class JobExpired(JobStateError):
+    pass
+
+
+class JobQuarantined(JobStateError):
     pass
 
 
@@ -70,6 +75,15 @@ class TaskRef(_Stored):
     sequence: int = Field(ge=1, strict=True)
 
 
+class QuarantineRecord(_Stored):
+    version: Literal[1] = 1
+    code: Literal["invalid_wake", "job_missing", "invalid_job"]
+    body_digest: JobId
+    quarantined_at: AwareDatetime
+    job_id: JobId | None = None
+    sequence: int | None = Field(default=None, ge=1)
+
+
 class Receipt(TaskRef):
     state: JobState
     duplicate: bool
@@ -86,6 +100,11 @@ class JobRecord(_Stored):
     result_written_at: AwareDatetime | None = None
     generation_attempts: int = Field(default=0, ge=0)
     delivery_attempts: int = Field(default=0, ge=0)
+    history_attempts: int = Field(default=0, ge=0)
+    history_committed: bool = False
+    recovery_attempts: int = Field(default=0, ge=0)
+    recovery_trace_id: str | None = Field(default=None, pattern=r"^[a-f0-9]{32}$")
+    recovery_pending: bool = False
     retry_at: AwareDatetime | None = None
     failure_code: FailureCode | None = None
     terminal_at: AwareDatetime | None = None
@@ -114,7 +133,7 @@ class OutboxPage(_Stored):
 
 
 class PruneCursor(_Stored):
-    prefix: Literal["jobs/", "payload/", "terminal-metadata/"] = "jobs/"
+    prefix: Literal["jobs/", "payload/", "terminal-metadata/", "poison/"] = "jobs/"
     marker: str | None = Field(default=None, repr=False)
 
 
@@ -128,7 +147,7 @@ class PruneResult(_Stored):
 
     @property
     def cursors(self) -> dict[str, str | None]:
-        values = dict.fromkeys(("jobs/", "payload/", "terminal-metadata/", "_prefix"))
+        values = dict.fromkeys(("jobs/", "payload/", "terminal-metadata/", "poison/", "_prefix"))
         if self.cursor:
             values["_prefix"] = self.cursor.prefix
             values[self.cursor.prefix] = self.cursor.marker
@@ -291,6 +310,13 @@ class JobStore:
         if document is None:
             document = await self.gateway.read(name)
         if document is None:
+            quarantine = await self.gateway.read(f"poison/job-{job_id}.json")
+            if quarantine is not None:
+                value = QuarantineRecord.model_validate_json(quarantine.body)
+                if value.job_id != job_id or value.code != "job_missing":
+                    raise JobConflict("quarantine marker does not match its job")
+                if self.now() < value.quarantined_at + METADATA_RETENTION:
+                    raise JobQuarantined("job is quarantined due to missing durable state")
             return None
         record = JobRecord.model_validate_json(document.body)
         if record.job_id != job_id:
@@ -440,6 +466,17 @@ class JobStore:
         document = await self.gateway.read(name)
         if document is None:
             return
+        if prefix == "poison/":
+            marker = QuarantineRecord.model_validate_json(document.body)
+            expected = (f"poison/job-{marker.job_id}.json"
+                        if marker.code == "job_missing" and marker.job_id
+                        else f"poison/wake-{marker.body_digest}.json")
+            if name != expected:
+                raise JobConflict("quarantine path mismatch")
+            if self.now() >= marker.quarantined_at + METADATA_RETENTION:
+                await self.gateway.delete(name, etag=document.etag)
+                result.removed += 1
+            return
         if prefix == "payload/":
             payload = TaskPayload.model_validate_json(document.body)
             self._name(payload.job_id)
@@ -479,7 +516,7 @@ class JobStore:
             raise ValueError("limit must be between 1 and 200")
         if cursor is not None and cursors is not None:
             raise ValueError("use one cursor representation")
-        prefixes = ("jobs/", "payload/", "terminal-metadata/")
+        prefixes = ("jobs/", "payload/", "terminal-metadata/", "poison/")
         if cursor is None:
             prefix = (cursors or {}).get("_prefix") or "jobs/"
             cursor = PruneCursor(prefix=prefix, marker=(cursors or {}).get(prefix))
@@ -493,6 +530,8 @@ class JobStore:
                     await self._prune_candidate(current.prefix, name, result)
                 except LeaseBusy:
                     result.skipped += 1
+                except LeaseLost:
+                    raise
                 except Exception as error:
                     if not continue_on_error:
                         raise
@@ -531,6 +570,10 @@ class LeasedJob:
     @property
     def result(self) -> PreparedTurn | None:
         return self.record.result
+
+    @property
+    def result_written_at(self) -> datetime | None:
+        return self.record.result_written_at
 
     def assert_active(self) -> None:
         if self.guard is None:
@@ -578,6 +621,37 @@ class LeasedJob:
         await self._save(state="result_ready", result=prepared,
                          result_written_at=_utc(written_at or self.store.now()))
 
+    async def mark_committing(self) -> None:
+        self._require("result_ready", "retry_wait")
+        if self.result is None:
+            raise JobStateError("history commit requires a saved result")
+        await self._save(history_attempts=self.record.history_attempts + 1)
+
+    async def mark_history_committed(self) -> None:
+        self._require("result_ready", "retry_wait")
+        if self.result is None:
+            raise JobStateError("history commit requires a saved result")
+        await self._save(history_committed=True)
+
+    async def note_recovery(self) -> None:
+        self._require("pending_notify", "queued", "running", "retry_wait", "result_ready", "sending")
+        if self.record.recovery_pending:
+            return
+        await self._save(recovery_attempts=self.record.recovery_attempts + 1,
+                         recovery_trace_id=uuid4().hex, recovery_pending=True)
+
+    async def confirm_recovery(self) -> None:
+        self._require("pending_notify", "queued", "running", "retry_wait", "result_ready", "sending")
+        if not self.record.recovery_trace_id:
+            raise JobStateError("recovery notification has no reservation")
+        await self._save(recovery_pending=False)
+
+    async def cleanup_terminal(self) -> None:
+        if not self.record.terminal:
+            raise JobStateError("job is not terminal")
+        self.assert_active()
+        await self.store._clean_terminal(self.record)
+
     async def mark_sending(self) -> None:
         self._require("result_ready", "retry_wait")
         if self.result is None or (self.record.retry_at and self.store.now() < self.record.retry_at):
@@ -611,7 +685,8 @@ class LeasedJob:
                          retry_at=_utc(retry_at or self.store.now()))
 
     async def _terminal(self, state: JobState, **changes) -> None:
-        await self._save(state=state, terminal_at=self.store.now(), result=None, retry_at=None, **changes)
+        await self._save(state=state, terminal_at=self.store.now(), result=None, retry_at=None,
+                         recovery_pending=False, **changes)
         await self.store._clean_terminal(self.record)
         self.payload = None
 

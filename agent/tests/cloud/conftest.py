@@ -1,5 +1,6 @@
 """The same gateway contracts run through the real SDK against memory or Azurite."""
 from collections import deque
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import format_datetime
@@ -89,7 +90,8 @@ class ContractTransport(AsyncHttpTransport):
     """Implements wire-level preconditions, never bypassing SDK serialization."""
 
     def __init__(self, real=False):
-        self.inner = AioHttpTransport() if real else None
+        # Loopback tests must not consult developer proxy/netrc credentials.
+        self.inner = AioHttpTransport(use_env_settings=False) if real else None
         self.blobs = {}
         self.failures = deque()
         self.calls = []
@@ -217,8 +219,8 @@ class ContractTransport(AsyncHttpTransport):
         raise AssertionError(f"unsupported contract operation: {operation}")
 
 
-@pytest.fixture
-async def storage_harness(request):
+@asynccontextmanager
+async def _blob_harness(request):
     from azure.storage.blob.aio import ContainerClient
     from advisor_agent.durable.blob import BlobGateway
 
@@ -246,6 +248,18 @@ async def storage_harness(request):
                 await container.delete_container()
         finally:
             await gateway.aclose()
+
+
+@pytest.fixture
+async def storage_harness(request):
+    async with _blob_harness(request) as harness:
+        yield harness
+
+
+@pytest.fixture
+async def history_storage_harness(request):
+    async with _blob_harness(request) as harness:
+        yield harness
 
 
 @pytest.fixture
@@ -307,9 +321,13 @@ def make_payload(job_clock):
 
 
 @pytest.fixture
-def job_store(blob_gateway, job_clock):
-    from advisor_agent.durable.jobs import JobStore
-    return JobStore(blob_gateway, bot_id="bot-a", utc_clock=job_clock)
+def job_store(blob_gateway, job_clock, request):
+    from advisor_agent.durable.jobs import InboxStore, JobStore
+    # The stress contract verifies serialization, not the loaded workstation's
+    # latency. Production keeps its five-second admission deadline.
+    wait = 15 if request.config.getoption("--cloud-store") == "azurite" else 5
+    return JobStore(blob_gateway, bot_id="bot-a", utc_clock=job_clock,
+                    inbox=InboxStore(blob_gateway, lease_wait_seconds=wait))
 
 
 class QueueTransport(ContractTransport):
@@ -350,7 +368,7 @@ class QueueTransport(ContractTransport):
             message = {
                 "id": str(uuid4()), "receipt": str(uuid4()), "inserted": now,
                 "expires": now + timedelta(seconds=int(query.get("messagettl", ["604800"])[0])),
-                "visible": clock, "count": 0,
+                "visible": clock + int(query.get("visibilitytimeout", ["0"])[0]), "count": 0,
                 "body": ET.fromstring(request.body).findtext("MessageText"),
             }
             self.messages[message["id"]] = message
@@ -384,8 +402,8 @@ class QueueTransport(ContractTransport):
         })
 
 
-@pytest.fixture
-async def queue_harness(request):
+@asynccontextmanager
+async def _queue_harness(request):
     from azure.storage.queue.aio import QueueClient
     from advisor_agent.durable.queue import SessionQueue
 
@@ -415,5 +433,126 @@ async def queue_harness(request):
 
 
 @pytest.fixture
+async def queue_harness(request):
+    async with _queue_harness(request) as harness:
+        yield harness
+
+
+@pytest.fixture
+async def poison_queue_harness(request):
+    async with _queue_harness(request) as harness:
+        yield harness
+
+
+@pytest.fixture
 def session_queue(queue_harness):
     return queue_harness[0]
+
+
+@pytest.fixture
+async def worker_case(job_store, job_clock, make_payload, history_storage_harness,
+                      session_queue, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from advisor_agent.durable.history import BlobHistoryStore
+    from advisor_agent.durable.leases import LeaseLost
+    from advisor_agent.durable.queue import OutboxDispatcher
+    from advisor_agent.durable.worker import SessionWorker
+    from advisor_shared.cloud import PreparedTurn
+
+    events = []
+
+    class Executor:
+        prepare_calls = 0
+        send_calls = 0
+        prepare_error = None
+        send_error = None
+        validation_error = None
+        pause = None
+
+        def __init__(self):
+            self.sent = []
+            self.histories = []
+            self.entered = asyncio.Event()
+
+        def validate(self, payload):
+            events.append("validate")
+            if self.validation_error:
+                raise self.validation_error
+
+        async def prepare(self, payload, history):
+            self.prepare_calls += 1
+            events.append("prepare")
+            self.histories.append((payload.activity["id"], list(history)))
+            self.entered.set()
+            if self.pause is not None:
+                await self.pause.wait()
+            if self.prepare_error:
+                raise self.prepare_error
+            text = payload.activity["text"]
+            return PreparedTurn(
+                reply={"type": "message", "text": f"answer:{text}"},
+                history=[{"role": "user", "content": text},
+                         {"role": "assistant", "content": f"answer:{text}"}], outcome="success")
+
+        async def send(self, payload, prepared):
+            self.send_calls += 1
+            events.append("send")
+            if self.send_error:
+                raise self.send_error
+            self.sent.append(payload.activity["id"])
+            return "reply-id"
+
+    history = BlobHistoryStore(history_storage_harness[0], utc_clock=job_clock)
+    executor = Executor()
+    outbox = OutboxDispatcher(job_store.inbox, session_queue)
+    worker = SessionWorker(job_store, history, outbox, executor)
+    case = SimpleNamespace(jobs=job_store, history=history, executor=executor, outbox=outbox,
+                           worker=worker, clock=job_clock, events=events,
+                           history_gateway=history_storage_harness[0], queue=session_queue,
+                           history_client=history_storage_harness[1], payloads={})
+    history_read = history._model_history
+
+    async def record_read(snapshot):
+        events.append("history")
+        return await history_read(snapshot)
+
+    monkeypatch.setattr(history, "_model_history", record_read)
+
+    async def accept(activity_id="a", user="a", *, notify=True):
+        payload = make_payload(activity_id=activity_id, user=user, text=f"question:{activity_id}")
+        case.payloads[activity_id] = payload
+        # Set up an accepted turn as ingress would: replay the identical request
+        # after transient admission loss. Worker failures are never retried here.
+        for attempt in range(3):
+            try:
+                receipt = await job_store.submit(payload)
+                if notify:
+                    await outbox.notify(payload.partition_key, payload.trace_id)
+                return receipt
+            except (LeaseLost, TimeoutError):
+                if attempt == 2:
+                    raise
+
+    def partition(user="a"):
+        return make_payload(user=user).partition_key
+
+    def fail_once_at(point):
+        write = case.history_gateway.write
+        fired = False
+
+        async def injected(name, *args, **kwargs):
+            nonlocal fired
+            eligible = name.startswith("context/") and not fired
+            if eligible and point == "before_history_commit":
+                fired = True
+                raise ConnectionError("injected history commit failure")
+            result = await write(name, *args, **kwargs)
+            if eligible and point == "after_history_commit":
+                fired = True
+                raise ConnectionError("injected history commit acknowledgement loss")
+            return result
+        monkeypatch.setattr(case.history_gateway, "write", injected)
+
+    case.accept, case.partition, case.fail_once_at = accept, partition, fail_once_at
+    return case

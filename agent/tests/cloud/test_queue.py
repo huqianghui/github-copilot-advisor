@@ -383,3 +383,8 @@ async def test_outbox_repair_is_paged_and_resumable(job_store, make_payload, ses
     second = await dispatcher.repair_page(cursor=first.next_cursor, limit=1)
     assert second.scanned == 1 and second.republished == 1
     assert await dispatcher.repair_pending() == 1
+
+
+async def test_retry_wake_is_not_visible_before_its_requested_delay(session_queue):
+    await session_queue.publish(QueueWake(partition_key="p", trace_id="t"), delay_seconds=30)
+    assert [delivery async for delivery in session_queue.receive()] == []

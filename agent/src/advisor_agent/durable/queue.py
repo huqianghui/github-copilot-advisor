@@ -75,12 +75,15 @@ class SessionQueue:
         if self._closed:
             raise RuntimeError("session queue is closed")
 
-    async def publish(self, wake: QueueWake) -> None:
+    async def publish(self, wake: QueueWake, *, delay_seconds: int = 0) -> None:
         self._ensure_open()
+        if type(delay_seconds) is not int or not 0 <= delay_seconds < _WAKE_TTL_SECONDS:
+            raise ValueError("wake delay must be shorter than its 24-hour TTL")
         body = wake.model_dump_json()
         if len(body.encode("utf-8")) > _MAX_BYTES:
             raise ValueError("queue wake exceeds 64 KiB")
-        await self._client.send_message(body, time_to_live=_WAKE_TTL_SECONDS)
+        await self._client.send_message(
+            body, time_to_live=_WAKE_TTL_SECONDS, visibility_timeout=delay_seconds)
 
     async def receive(self) -> AsyncIterator[Delivery]:
         """One ACA delivery per poll. Use async with delivery for automatic renewal."""
@@ -237,11 +240,15 @@ class OutboxDispatcher:
     def __init__(self, inbox: InboxStore, queue: SessionQueue):
         self.inbox, self.queue = inbox, queue
 
-    async def notify(self, partition_key: str, trace_id: str) -> None:
+    async def notify(self, partition_key: str, trace_id: str, *, delay_seconds: int = 0) -> None:
         snapshot = await self.inbox.snapshot_outbox(partition_key)
         if not snapshot.pending_count:
             return
-        await self.queue.publish(QueueWake(partition_key=partition_key, trace_id=trace_id))
+        wake = QueueWake(partition_key=partition_key, trace_id=trace_id)
+        if delay_seconds:
+            await self.queue.publish(wake, delay_seconds=delay_seconds)
+        else:
+            await self.queue.publish(wake)
         await self.inbox.confirm_notified(partition_key, snapshot.generation)
 
     async def repair_pending(self) -> int:

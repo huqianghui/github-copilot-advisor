@@ -361,3 +361,21 @@ async def test_expired_payload_is_not_deleted_while_its_job_lease_is_active(
         assert result.skipped >= 1
         assert await blob_gateway.read(f"payload/{payload.job_id}.json") is not None
         assert (await job_store.read(payload.job_id)).state == "running"
+
+
+async def test_continue_on_error_does_not_swallow_prune_lease_loss(
+        job_store, make_payload, job_clock, blob_gateway, expire_lease, monkeypatch):
+    from advisor_agent.durable.leases import LeaseLost
+    payload = make_payload()
+    await job_store.submit(payload)
+    job_clock.advance(hours=25)
+    write = blob_gateway.write
+
+    async def lose(name, *args, **kwargs):
+        if name == f"jobs/{payload.job_id}.json":
+            await expire_lease(name)
+        return await write(name, *args, **kwargs)
+
+    monkeypatch.setattr(blob_gateway, "write", lose)
+    with pytest.raises(LeaseLost):
+        await job_store.prune(limit=1, continue_on_error=True)
