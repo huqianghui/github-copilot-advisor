@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "cases": [
+    {"case_id": "kb-01", "question": "How can a team organize non-sensitive repository instructions for a coding assistant?"},
+    {"case_id": "kb-02", "question": "What checks help distinguish an authentication error from an unavailable knowledge index?"},
+    {"case_id": "web-01", "question": "Which official documentation explains how to review suggestions from a coding assistant?"},
+    {"case_id": "history-01", "question": "Summarize the fictional team's previously discussed rollout checks without adding facts."}
+  ],
+  "seeded_history": [
+    {"role": "user", "content": "We are a fictional team evaluating a coding assistant on a sample repository."},
+    {"role": "assistant", "content": "Use a non-sensitive sample repository and record the configuration."},
+    {"role": "user", "content": "Our first check is whether repository instructions are loaded."},
+    {"role": "assistant", "content": "Keep a small documented instruction and verify its observed effect."},
+    {"role": "user", "content": "Our second check is reviewing generated changes."},
+    {"role": "assistant", "content": "Review the diff and run relevant tests before accepting changes."},
+    {"role": "user", "content": "Our third check is separating authentication failures from service outages."},
+    {"role": "assistant", "content": "Record safe error categories without storing tokens."},
+    {"role": "user", "content": "Our fourth check is verifying that a knowledge lookup really ran."},
+    {"role": "assistant", "content": "Use the observed lookup events rather than the question's name."},
+    {"role": "user", "content": "Our fifth check is that different users do not share conversation context."},
+    {"role": "assistant", "content": "Use distinct fictional users and inspect the returned behavior."},
+    {"role": "user", "content": "Our sixth check is preserving order within one conversation."},
+    {"role": "assistant", "content": "Measure this separately from independent-user throughput."},
+    {"role": "user", "content": "Our seventh check is bounded waiting for a complete answer."},
+    {"role": "assistant", "content": "Keep unfinished work distinct from a completed failure."},
+    {"role": "user", "content": "Our eighth check is avoiding sensitive content in reports."},
+    {"role": "assistant", "content": "Store identifiers, durations and categories, not conversation bodies."},
+    {"role": "user", "content": "Our final check is documenting limitations of a small experiment."},
+    {"role": "assistant", "content": "Report the actual sample count and do not infer an absolute capacity limit."}
+  ]
+}
