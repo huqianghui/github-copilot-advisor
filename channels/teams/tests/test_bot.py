@@ -87,6 +87,25 @@ def test_handler_registered_for_message_activity():
     assert handler.__name__ == "on_message"
 
 
+async def test_reply_preparation_returns_rendered_reply_and_forwards_turn_id():
+    from teams_adapter.bot import _activity_to_dict
+    from teams_adapter.processing import prepare_reply
+
+    class TurnCore(StubCore):
+        async def handle(self, request, *, turn_id=None):
+            self.turn_id = turn_id
+            return await super().handle(request)
+
+    core = TurnCore()
+    prepared = await prepare_reply(
+        _activity_to_dict(group_activity()), [], core,
+        bot_id=BOT_ID, turn_id="job-123")
+    assert prepared.reply == {"type": "message", "text": "答案", "entities": []}
+    assert prepared.outcome == "success"
+    assert core.turn_id == "job-123"
+    assert core.requests[0].text == "登录失败"
+
+
 async def test_handler_sends_only_answer_typing_is_owned_by_middleware():
     core = StubCore()
     handler = register_handlers(_agent_app(), core)
@@ -108,6 +127,27 @@ async def test_handler_times_render_and_send_without_inline_typing():
     assert {"teams.message", "teams.render", "teams.send"} <= stages.keys()
     assert "teams.typing" not in stages
     assert stages["teams.send"].parent_span_id == stages["teams.message"].span_id
+    assert "outcome" not in stages["teams.send"].attributes
+
+
+@pytest.mark.parametrize("outcome", ["identity_unavailable", "image_fetch_failed"])
+async def test_direct_failure_reply_preserves_send_outcome_telemetry(outcome):
+    from advisor_shared.telemetry import trace_scope
+
+    core = StubCore()
+    activity = group_activity()
+    if outcome == "identity_unavailable":
+        activity.conversation.id = ""
+    else:
+        activity.text = "<at>A</at>"
+        activity.attachments = [_image_attachment()]
+    context = FakeTurnContext(activity)
+    with trace_scope() as trace:
+        await register_handlers(_agent_app(), core)(context, TurnState())
+    send = next(timing for timing in trace.timings if timing.name == "teams.send")
+    assert send.attributes["outcome"] == outcome
+    assert core.requests == []
+    assert len(context.sent) == 1
 
 
 async def test_failed_reply_send_is_timed_and_propagates():
@@ -143,6 +183,16 @@ async def test_ignores_group_message_without_mention():
     ctx = FakeTurnContext(group_activity(mentions_bot=False))
     await handler(ctx, TurnState())
     assert core.requests == [] and ctx.sent == []
+
+
+async def test_ignored_message_does_not_convert_input_files():
+    handler = register_handlers(_agent_app(), StubCore())
+    context = FakeTurnContext(group_activity(mentions_bot=False))
+    state = TurnState()
+    state.temp.input_files = [InputFile(
+        content=b"unconverted", content_type="image/*", content_url=None)]
+    await handler(context, state)
+    assert context.sent == []
 
 
 async def test_core_error_sends_fallback():
