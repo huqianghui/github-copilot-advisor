@@ -38,8 +38,9 @@ your corporate PyPI proxy before running `uv sync`.
 索引写入必须携带目标索引 Blob 的租约和 ETag;缺失/损坏的有效归档明确报错,
 不会伪装成正常空历史。异步读取返回前再次过滤到期消息,读取失败时清理其余并行读取。
 
-这些状态接口尚未接入默认 Teams 启动入口。当前离线故障注入测试不是实际 Azure Blob
-租约或云端部署通过的证据;存储集成验证和接线进度见云部署计划。
+这些状态接口尚未接入默认 Teams 启动入口。已有 72 项 SDK/Azurite 存储契约和
+5 项真实 SDK/Azurite 持久历史集成测试通过;它们不验证 Azure RBAC 或云端部署。
+本地运行方法见 [存储契约说明](deploy/local/README.md),接线进度见云部署计划。
 
 ## 分级日志与延迟分析
 

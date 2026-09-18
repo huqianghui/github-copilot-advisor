@@ -48,13 +48,15 @@ Docker。不增加 Redis、Service Bus、历史摘要或新的 Agent 框架。
 |---|---|
 | 1 | `cefb657`:认证/DTO 与 factory,224 项针对测试通过 |
 | 2 | `780baf5`:本地 30 天保留、20 条窗口及原子提交,106 项针对测试通过 |
-| 3 | Blob/租约实现进行中;Docker 引擎未运行,独立 Azurite 启动也受阻 |
-| 4 | 缓冲区、组件复用、持久历史算法及故障恢复离线测试通过;实际网关/存储集成未完成 |
+| 3 | `b1e97f2`:72 项 SDK memory 契约与 72 项真实 Azurite 契约通过;安全诊断日志复核修正进行中 |
+| 4 | `39680cc`:缓冲区/组件/历史算法通过针对测试;另有 5 项真实 SDK/Azurite 持久历史集成测试通过 |
 | 13 | 仅离线 IaC 实现/编译进行中,没有创建云资源 |
 
 已有离线回归(排除正在开发的 `agent/tests/cloud`)为 683 passed、19 integration deselected,
 附带 19 条原有 aiohttp AppKey/RequestKey 提示。后续持久历史及相关针对测试为 101 passed。
-条件对象测试实现不能替代实际 Azure Storage/Azurite 的租约契约测试。
+独立 Azurite 的内存模式启动成功,未启动全局 Docker,测试进程已停止。
+实际协议测试验证了条件写入、租约、重建存储对象后的历史、用户隔离和故障恢复;
+Azurite 仍不能证明 Azure RBAC 或云部署可用。
 尚未执行实际云部署、模型数据面冒烟、真实 Teams 验收或性能实验。
 
 ### 0.1 依赖及宿主事实
