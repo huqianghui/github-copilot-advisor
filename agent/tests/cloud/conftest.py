@@ -265,3 +265,44 @@ def fail_next_operation(storage_harness):
     def fail(operation, status=503, code="ServerBusy"):
         storage_harness[2].failures.append((operation, status, code))
     return fail
+
+
+@pytest.fixture
+def job_clock():
+    from datetime import timedelta
+
+    class Clock:
+        value = datetime(2026, 9, 18, tzinfo=timezone.utc)
+
+        def __call__(self):
+            return self.value
+
+        def advance(self, **kwargs):
+            self.value += timedelta(**kwargs)
+    return Clock()
+
+
+@pytest.fixture
+def make_payload(job_clock):
+    from teams_adapter.extract import build_conversation_key
+    from advisor_shared.cloud import TaskPayload
+    from advisor_agent.durable.jobs import make_job_id
+
+    def make(activity_id="activity-a", user="user-a", bot_id="bot-a", text="private-question"):
+        activity = {
+            "type": "message", "id": activity_id, "text": text,
+            "from": {"id": user}, "recipient": {"id": bot_id},
+            "conversation": {"id": "conversation;thread=full", "conversationType": "personal"},
+            "channelData": {"tenant": {"id": "tenant-a"}},
+        }
+        partition = build_conversation_key(activity)
+        return TaskPayload(
+            job_id=make_job_id(bot_id, partition, activity_id), partition_key=partition,
+            activity=activity, accepted_at=job_clock(), trace_id="trace-a", target="teams")
+    return make
+
+
+@pytest.fixture
+def job_store(blob_gateway, job_clock):
+    from advisor_agent.durable.jobs import JobStore
+    return JobStore(blob_gateway, bot_id="bot-a", utc_clock=job_clock)
