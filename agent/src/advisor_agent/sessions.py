@@ -8,7 +8,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, Protocol
 from uuid import uuid4
 
-from advisor_shared.cloud import HistoryMessage
+from pydantic import ConfigDict, TypeAdapter
+
+from advisor_shared.cloud import HistoryMessage, TurnMessage
 from advisor_shared.telemetry import step
 
 HISTORY_RETENTION_SECONDS = 30 * 24 * 60 * 60
@@ -152,3 +154,58 @@ class InMemorySessionStore:
             role="assistant", content=assistant_content, written_at=timestamp,
             turn_id=turn_id, sequence=sequence)
         self._data[key] = [*records, user, assistant]
+
+
+_history_adapter = TypeAdapter(
+    list[TurnMessage], config=ConfigDict(extra="forbid", hide_input_in_errors=True))
+
+
+class BufferedSessionStore:
+    """One turn's private snapshot and staged delta; no durable writes."""
+
+    def __init__(self, history: list[dict], *, partition_key: str | None = None):
+        self._history = _history_adapter.validate_python(history)
+        self._delta: list[TurnMessage] = []
+        self._partition_key: str | None = None
+        self.turn_id: str | None = None
+        self.written_at: datetime | None = None
+        if partition_key is not None:
+            self._bind(partition_key)
+
+    def _bind(self, key: str) -> None:
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("partition key must not be empty")
+        if self._partition_key is None:
+            self._partition_key = key
+        elif self._partition_key != key:
+            raise ValueError("buffer cannot cross session partitions")
+
+    @property
+    def delta(self) -> list[TurnMessage]:
+        return [message.copy() for message in self._delta]
+
+    async def get(self, key: str) -> list[dict]:
+        self._bind(key)
+        return [dict(message) for message in self._history]
+
+    async def append_turn(
+        self, key: str, user_content: str, assistant_content: str, *,
+        turn_id: str, written_at: datetime | None = None,
+    ) -> None:
+        if not isinstance(turn_id, str) or not turn_id.strip():
+            raise ValueError("turn_id must not be empty")
+        timestamp = _aware_utc(written_at) if written_at is not None else None
+        messages = _history_adapter.validate_python([
+            {"role": "user", "content": user_content},
+            {"role": "assistant", "content": assistant_content},
+        ])
+        self._bind(key)
+        if self._delta:
+            if self.turn_id != turn_id:
+                raise ValueError("buffer can hold only one turn")
+            if self._delta != messages:
+                raise ValueError("turn_id was staged with different content")
+            return
+        self.turn_id = turn_id
+        self.written_at = timestamp
+        self._delta = messages

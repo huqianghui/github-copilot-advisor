@@ -1,4 +1,5 @@
 """生产装配:渠道 adapter 只调用 build_advisor(),不接触内部组件。"""
+from collections.abc import Callable
 from contextlib import AsyncExitStack
 import os
 from pathlib import Path
@@ -8,6 +9,7 @@ from azure.search.documents.aio import SearchClient
 from openai import AsyncAzureOpenAI, Timeout
 from openai.lib.azure import API_KEY_SENTINEL
 
+from advisor_agent.backend import AgentBackend
 from advisor_agent.core import AdvisorCore
 from advisor_agent.diagnostics import NetworkDiagnostics
 from advisor_agent.escalation import EscalationConfig
@@ -22,10 +24,11 @@ from advisor_agent.search.knowledge import KnowledgeSearchClient
 from advisor_agent.search.web import (
     BraveProvider, TavilyProvider, WebSearchChain, validate_seconds,
 )
-from advisor_agent.sessions import InMemorySessionStore
+from advisor_agent.sessions import InMemorySessionStore, SessionStore
 from advisor_agent.tools import AdvisorTools
 from advisor_agent.usage import CopilotUsageClient
 from advisor_shared.azure_auth import AzureAuthSettings, AzureCredentials
+from advisor_shared.events import AdvisorEvent
 
 # openai SDK 的默认 connect 超时是 5s。实测本环境到 Azure OpenAI endpoint 的
 # 成功连接耗时(13 次采样)中位数约 8s、最大 10.9s,只有 2 次落在 5s 内 ——
@@ -78,7 +81,7 @@ class _CredentialHttpClient(DiagnosticAsyncHttpClient):
 class AzureAdvisor(AdvisorCore):
     """An advisor with explicit shutdown of its factory-owned Azure resources."""
 
-    def __init__(self, backend: MAFBackend, *, channel_name: str,
+    def __init__(self, backend: AgentBackend, *, channel_name: str,
                  azure_clients: tuple[AsyncAzureOpenAI | SearchClient, ...],
                  credential_owner: AzureCredentials | None):
         super().__init__(backend, InMemorySessionStore(), channel_name=channel_name)
@@ -95,6 +98,28 @@ class AzureAdvisor(AdvisorCore):
                 stack.push_async_callback(self._credential_owner.aclose)
             for client in self._azure_clients:
                 stack.push_async_callback(client.close)
+
+
+class AdvisorComponents:
+    """Own heavy clients once; create independent, non-owning turn cores."""
+
+    def __init__(self, owner: AzureAdvisor):
+        self._owner = owner
+
+    def new_core(
+        self, sessions: SessionStore, *,
+        event_sink: Callable[[AdvisorEvent], None] | None = None,
+    ) -> AdvisorCore:
+        if self._owner._azure_closed:
+            raise RuntimeError("Advisor components are closed")
+        return AdvisorCore(
+            self._owner.backend, sessions,
+            planner=self._owner.planner, evaluator=self._owner.evaluator,
+            event_sink=self._owner.event_sink if event_sink is None else event_sink,
+            channel_name=self._owner.channel_name)
+
+    async def aclose(self) -> None:
+        await self._owner.aclose()
 
 
 def _endpoint(value: str | None, name: str) -> str:
@@ -196,3 +221,9 @@ def build_advisor(
         backend, channel_name=channel_name,
         azure_clients=(embed_client, search_client, chat_client),
         credential_owner=credentials if owned else None)
+
+
+def build_components(
+    channel_name: str = "generic", *, credentials: AzureCredentials | None = None,
+) -> AdvisorComponents:
+    return AdvisorComponents(build_advisor(channel_name, credentials=credentials))

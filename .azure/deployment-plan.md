@@ -120,7 +120,7 @@ remain explicit execution gates, rather than assumed passes.
 |---|---|
 | Design approval | Complete |
 | Implementation plan | Execution authorized on 2026-09-18 |
-| Application changes and local regressions | In progress: authentication and history foundations |
+| Application changes and local regressions | Auth/local history verified; staged/persistent history passes offline fault tests, real Blob integration pending |
 | Infrastructure/package generation | Not started |
 | Azure policy, quota and permission validation | Not completed |
 | Azure deployment validation | Not started |
