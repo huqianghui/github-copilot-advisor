@@ -2,10 +2,12 @@
 
 ## Status
 
-Executing the approved implementation plan. Authentication and history foundations
-have been tested, and the infrastructure templates compile. Application/runtime
-wiring, packaging and deployment scripts are still in progress. Azure deployment
-validation, provisioning and load tests have not started.
+Executing the approved implementation plan. Durable storage/worker recovery has
+passed scoped review and real SDK/Azurite contracts. Native Functions host smoke
+has passed with offline JWKS/model/Teams boundaries. Final benchmark/host/script
+integration and whole-workspace verification remain in progress.
+Read-only Azure readiness checks have begun and found blockers; the plan is
+**not Validated**. Provisioning and cloud load tests have not started.
 This document must not be interpreted as approval to skip deployment validation.
 
 ## Approved design
@@ -69,8 +71,9 @@ This document must not be interpreted as approval to skip deployment validation.
 | `deploy/bench/Run.ps1` | Bounded same-region experiments |
 | `deploy/Cleanup.ps1` | Preview and confirm exact owned-resource deletion |
 
-The PowerShell entry points in this table are still planned. The target and shared
-Bicep modules now exist and have passed local compiler-contract tests.
+The PowerShell entry points in this table now exist and are undergoing integration
+verification. The target and shared Bicep modules passed local compiler-contract
+tests. Their existence or test results are not authorization/capacity evidence.
 
 | Resource | Planned count | Initial configuration |
 |---|---|---|
@@ -126,10 +129,43 @@ remain explicit execution gates, rather than assumed passes.
 |---|---|
 | Design approval | Complete |
 | Implementation plan | Execution authorized on 2026-09-18 |
-| Application changes and local regressions | Auth/history foundations verified; 72 Azurite storage contracts and 5 persistent-history integration tests passed; cloud runtime wiring incomplete |
-| Infrastructure/package generation | IaC committed as 32310b9; 40 compiler contracts passed; packaging/scripts incomplete |
-| Azure policy, quota and permission validation | Not completed |
-| Azure deployment validation | Not started |
+| Application changes and local regressions | Durable recovery accepted through e242443; native Functions offline-boundary smoke passed; final benchmark/runtime integration and full regression pending |
+| Infrastructure/package generation | IaC 40 compiler contracts passed; explicit dataset packaging 52 tests passed; final current-source Linux image verification blocked |
+| Azure policy, quota and permission validation | Partial read-only checks; directory permission and Flex quota unverified |
+| Azure deployment validation | Not completed; no ARM Apply |
 | ACA and Flex provisioning | Not started |
 | Cloud functional verification | Not started |
 | Latency/concurrency experiments and reports | Not started |
+
+## 7. Validation Proof
+
+These observations are partial gates, not deployment approval.
+
+| Command/check | Observed result | Scope |
+|---|---|---|
+| `az account show` with subscription/tenant/state projection | Expected subscription and tenant, Enabled | Read-only context; no account switch |
+| ARG Function App/plan inventory | Existing FC1 app in Southeast Asia identified for quota lookup | Read-only; no existing resource modifications |
+| `GET .../sites/cdc-test-dify-feishu/detectors/FunctionFlexQuota?api-version=2024-11-01` | Returned region-selection form only | No numeric quota evidence |
+| AppLens read-only quota diagnostic | 403 AccessDenied at 2026-09-18T10:35:17Z | Tool could not obtain quota evidence; not proof quota is zero |
+| `Ensure-BenchmarkIdentity.ps1 -Mode WhatIf -Stage Register` | `graph_directory_role_unverified` | No directory registration or role grant created |
+| `docker version --format '{{json .Server}}'` | Linux engine HTTP 500 on API v1.56 | Final image build/import proof blocked; no service changes |
+| `pytest deploy\tools\tests\test_package.py -q` | 52 passed | Includes current explicit dataset/UTF-8/size/hash rules and real locked context builds, not a Linux image build |
+| Native Core Tools + isolated Azurite smoke | Four functions, health 200, unauthenticated messages 401, ignored traffic unstored, one fixture reply, dedupe | JWKS/model/Teams offline; children stopped; not actual Azure/Teams |
+| `pytest ...test_quarantine_regressions.py ...test_jobs.py ...test_maintenance.py` | 78 passed memory and 78 actual Azurite after e242443 | Terminal repair scoped review PASS; not managed-identity proof |
+
+Outstanding recipe checks before status can become `Validated`:
+
+- [ ] Final application build, complete offline regression and artifact integrity.
+- [ ] Current Bicep compilation and ARM template validation.
+- [ ] Current WhatIf preview for the intended parameters.
+- [ ] Azure Policy, applicable quota and required permission validation.
+- [ ] Static role review for every final identity/data-operation relationship.
+- [ ] Resolve the directory-permission, Flex-capacity and Linux-build blockers.
+
+Flex `maximumInstanceCount` applies per function scale group, not to the combined
+HTTP/Queue/Timer instance count. Capacity projection must account for these groups
+and does not reserve quota. Published regional default quota is not evidence of
+the subscription's current remaining capacity.
+
+See the [experiment status report](../deploy/reports/summary.md) for the distinction
+between verified local behavior and all still-unmeasured cloud outcomes.

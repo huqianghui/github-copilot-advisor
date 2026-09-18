@@ -16,7 +16,18 @@ workspace member packages into the venv, so their imports
 (`advisor_shared.*`, `ingestion.*`, `advisor_agent.*`, `teams_adapter.*`)
 will fail. Always use `--all-packages`.
 
-## Offline deployment packaging (Task 12)
+For native Functions entry tests, retain the optional SDK:
+
+```powershell
+uv sync --all-packages --extra functions
+.\.venv\Scripts\python.exe -m pytest shared\tests agent\tests channels\teams\tests ingestion\tests deploy\tools\tests -m "not integration" -q
+```
+
+Do not run a plain dependency sync in parallel with another test/build: it can
+remove the Functions extra from the shared environment. Integration tests that
+use real model credentials are separate from this offline suite.
+
+## Offline deployment packaging
 
 `advisor-deploy` packages only `advisor-shared`, `advisor-agent`, and
 `advisor-teams`. It exports their online dependency closure from the existing
@@ -59,11 +70,24 @@ the packager never creates placeholder Functions code.
 
 ACA outputs are a **staged build context**, not a copy of the repository.
 Only the two approved YAML files, three wheels, requirements, Docker files,
-and non-secret manifest are staged. Docker's allowlist excludes the manifest
+and non-secret manifest are staged by default. Docker's allowlist excludes the manifest
 and anything outside those runtime inputs. The image runs as UID 10001.
 Third-party dependencies retain environment markers from the universal lock;
 the local workspace wheels must be `py3-none-any`, never Windows wheels or a
 Windows venv.
+
+For experiment targets only, explicitly add
+`--benchmark-cases-config deploy\bench\cases.json` (PowerShell:
+`-BenchmarkCasesConfig deploy\bench\cases.json`). This includes the approved
+dataset as `runtime-config/benchmark-cases.json` in either target artifact.
+No dataset is selected implicitly. The shared validator enforces UTF-8 JSON,
+unique fields/case IDs, the 4 MiB limit, and exactly 20 alternating seed
+messages; the package manifest also records its exact byte hash. The driver
+and target verify the same canonical dataset digest at run registration.
+This does not enable the benchmark API; enabling it additionally requires
+the isolated identity, fixed callback, budgets and deployment gates.
+The benchmark driver has a separate two-wheel context, built with
+`deploy\bench\Build.ps1`; it is not part of either application package.
 
 Add `--build-image advisor-local:experiment` to the Python `package` command
 (or `-BuildImage advisor-local:experiment` to `Package.ps1`) for an **optional

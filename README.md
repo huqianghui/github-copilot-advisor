@@ -3,7 +3,7 @@
 面向企业用户的 GitHub Copilot 问答 agent:群聊 @提问 → 知识库/实时检索 →
 分级升级(通用建议 → 工单指引 → CSAM/CSA)。
 
-## 结构(monorepo,三个独立 project)
+## 结构(uv workspace)
 
 | 目录 | 职责 | 运行 |
 |---|---|---|
@@ -11,6 +11,7 @@
 | `ingestion/` | 数据抓取→清洗→LLM 提炼→写入 AI Search | `uv run python -m ingestion run` |
 | `agent/` | MAF + Azure OpenAI 编排与工具 | (库,由渠道装配) |
 | `channels/teams/` | Teams Bot Framework 薄壳 | `uv run python -m teams_adapter` |
+| `deploy/` | 本地存储验证、ACA/Flex 部署、压测及报告 | 见[部署说明](deploy/README.md) |
 
 依赖方向:`channels/* → agent → shared`,`ingestion → shared`。
 
@@ -26,6 +27,23 @@ cp .env.example .env         # 填 Azure/GitHub 凭据
 uv run python -m ingestion run   # 灌知识库
 uv run --env-file .env python -m teams_adapter  # 启动 Teams bot(见 docs/teams-setup.md)
 ```
+
+## 运行与部署方式
+
+- **本地开发**:保留上面的启动命令,默认 `direct` + 进程内历史;重启会丢失历史。
+- **Container Apps**:持久 Blob/Queue + 后台 worker,起始 0.25 vCPU/0.5 GiB,
+  支持常驻 1 副本与缩容到 0 的实验模式。
+- **Functions Flex Consumption**:原生 HTTP/Queue/Timer 入口,起始 512 MB,
+  不配置 Always Ready。两套云环境使用独立资源组、Bot 和托管身份。
+- Azure OpenAI/Search 显式选择 Key 或 Entra,认证失败不自动回退;
+  主实验使用托管身份。GitHub Token、Tavily/Brave Key 保持原方式。
+- 历史按租户 + 完整会话/线程 + 用户隔离,每条保存 30 天,
+  模型只读取该分区最近 20 条有效历史。群内回复仍公开。
+
+入口:[部署与安全门槛](deploy/README.md) · [本地存储验证](deploy/local/README.md) ·
+[压测工具与口径](deploy/bench/README.md) · [实验状态/报告](deploy/reports/summary.md)。
+**当前尚未完成云部署或云端性能实验**;本地测试、健康检查与 HTTP 202
+不代表真实云端问答或 Teams 客户端验收通过。
 
 ## 回答策略
 
@@ -53,7 +71,7 @@ uv run --env-file .env python -m teams_adapter  # 启动 Teams bot(见 docs/team
 
 - 设计 spec:`docs/superpowers/specs/2026-08-21-copilot-advisor-design.md`
 - 图片输入设计:`docs/superpowers/specs/2026-09-04-image-input-design.md`
-- 云部署与性能实验设计(待实现):[设计文档](docs/superpowers/specs/2026-09-17-cloud-deployment-experiments-design.md)
+- 云部署与性能实验设计:[设计文档](docs/superpowers/specs/2026-09-17-cloud-deployment-experiments-design.md)
 - 云部署与性能实验实现计划:[任务清单](docs/superpowers/plans/2026-09-17-cloud-deployment-experiments.md)
 - **已知问题清单**:[docs/known-issues.md](docs/known-issues.md)
 - AI Search 索引配置与灌数:[docs/search-index-setup.md](docs/search-index-setup.md)

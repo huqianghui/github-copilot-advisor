@@ -50,6 +50,9 @@ Docker。不增加 Redis、Service Bus、历史摘要或新的 Agent 框架。
 | 2 | `780baf5`:本地 30 天保留、20 条窗口及原子提交,106 项针对测试通过 |
 | 3 | `b1e97f2`:72 项 SDK memory 契约与 72 项真实 Azurite 契约通过;安全诊断日志复核修正进行中 |
 | 4 | `39680cc`:缓冲区/组件/历史算法通过针对测试;另有 5 项真实 SDK/Azurite 持久历史集成测试通过 |
+| 5-7 | 持久任务/Queue/worker 已实现;`b1d9b19`、`e242443` 修复隔离竞争和损坏终态恢复,两轮限定复核通过;最新 78 项 memory + 78 项真实 Azurite 针对契约通过 |
+| 9-10 | 原生 Core Tools + 独立 Azurite 冒烟通过;JWKS/模型/Teams 使用离线边界,不代表云端问答;最终 benchmark 接线仍在进行 |
+| 12 | 安全打包已实现;显式实验数据集打包 52 项测试通过;当前 Docker Linux 引擎 HTTP 500,最终镜像验证尚未完成 |
 | 13 | `32310b9`:19 项 IaC/测试产物,40 项编译契约通过;三套入口编译成功,没有创建云资源 |
 
 已有离线回归(排除正在开发的 `agent/tests/cloud`)为 683 passed、19 integration deselected,
@@ -71,7 +74,7 @@ Azurite 仍不能证明 Azure RBAC 或云部署可用。
 - `continue_conversation` 接收的是保留原字段的 `Activity`,不是另一版本 SDK 的
   `ConversationReference` 参数签名。不要照搬其他语言/旧 Bot Framework 的调用。
 - 新旧 embedding 均为 `text-embedding-3-large` 版本 1;实际索引为 3072 维。
-  配置相容性已查证,真实数据面冒烟未执行。
+  配置相容性及本地配置凭据的数据面冒烟已通过;新云托管身份尚未验证。
 - Functions 工具已提供 `http-trigger-python-azd` 基线,支持显式 `VNET_ENABLED=false`。
   工具未提供 Storage Queue 模板;Queue Trigger 必须采用官方 Python v2 绑定示例,
   不擅自替换为 Service Bus 或引入另一套 Agent 模板。
