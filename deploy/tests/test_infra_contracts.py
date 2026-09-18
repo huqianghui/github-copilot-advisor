@@ -207,9 +207,10 @@ def test_aca_has_new_basic_registry_and_bootstrap_flag(compiled_infra):
 def test_benchmark_is_one_temporary_opt_in_clock_observer(compiled_infra):
     bench = compiled_infra("bench")
     assert default(bench, "enabled") is False
+    assert default(bench, "deployApp") is False
     apps = of_type(bench, "Microsoft.App/containerApps")
     assert len(apps) == 1
-    assert all(app.get("condition") for app in apps)
+    assert all(app["condition"] == "[and(parameters('enabled'), parameters('deployApp'))]" for app in apps)
     identity = only(bench, "Microsoft.ManagedIdentity/userAssignedIdentities")
     assert "copy" not in identity
     assert not of_type(bench, "Microsoft.Storage/storageAccounts")
@@ -397,7 +398,7 @@ def test_benchmark_ingress_requires_entra_not_anonymous_access(compiled_infra):
     auth_configs = of_type(template, "Microsoft.App/containerApps/authConfigs")
     assert len(auth_configs) == 1
     for auth in auth_configs:
-        assert auth["condition"] == "[parameters('enabled')]"
+        assert auth["condition"] == "[and(parameters('enabled'), parameters('deployApp'))]"
         props = auth["properties"]
         assert props["platform"]["enabled"] is True
         assert props["globalValidation"]["unauthenticatedClientAction"] == "Return401"

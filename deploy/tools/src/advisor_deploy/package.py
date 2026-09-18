@@ -27,6 +27,7 @@ MAX_FILE = 128 * 1024 * 1024
 MAX_TOTAL = 256 * 1024 * 1024
 FORBIDDEN = {".env", ".venv", "venv", ".state", ".git", "__pycache__", "tests", "test", "dev", "ingestion", "advisor_ingestion"}
 HASH = re.compile(r"[0-9a-f]{64}")
+BENCHMARK_DATASET = "runtime-config/benchmark-cases.json"
 
 
 def _bad(message: str) -> ValueError:
@@ -35,6 +36,15 @@ def _bad(message: str) -> ValueError:
 
 def _digest(content: bytes) -> str:
     return sha256(content).hexdigest()
+
+
+def _benchmark_dataset(content: bytes) -> None:
+    from advisor_shared.benchmark import parse_dataset
+
+    try:
+        parse_dataset(content)
+    except ValueError:
+        raise _bad("benchmark dataset missing or invalid") from None
 
 
 def _safe_name(name: str) -> None:
@@ -299,6 +309,9 @@ def validate_package(path: Path) -> PackageManifest:
             raise _bad("payload hash mismatch")
     required = {"requirements.txt", "runtime-config/escalation.yaml", "runtime-config/diagnostics.yaml"}
     required |= {"Dockerfile", "Dockerfile.dockerignore"} if manifest.target == "aca" else {"function_app.py", "host.json"}
+    if BENCHMARK_DATASET in files:
+        _benchmark_dataset(files[BENCHMARK_DATASET])
+        required.add(BENCHMARK_DATASET)
     wheels = {name for name in files if name.startswith("wheels/") and name.endswith(".whl")}
     if set(files) != required | wheels or len(wheels) != 3:
         raise _bad("unexpected or missing deployment entries")
@@ -384,6 +397,7 @@ def _write_zip(path: Path, files: dict[str, bytes]) -> None:
 def build_package(
     target: str, output: Path, *, repo_root: Path | None = None,
     escalation_config: Path | None = None, diagnostics_config: Path | None = None,
+    benchmark_cases_config: Path | None = None,
 ) -> PackageManifest:
     if target not in {"aca", "functions"}:
         raise _bad("unknown target")
@@ -400,6 +414,17 @@ def build_package(
         "runtime-config/escalation.yaml": approved_file(escalation_config),
         "runtime-config/diagnostics.yaml": approved_file(diagnostics_config),
     }
+    dataset = None
+    if benchmark_cases_config is not None:
+        source = Path(benchmark_cases_config)
+        try:
+            if (source.suffix.lower() != ".json" or has_link(source)
+                    or not source.is_file() or source.stat().st_size > 4 * 1024 * 1024):
+                raise _bad("benchmark dataset missing or invalid")
+            dataset = source.read_bytes()
+        except OSError:
+            raise _bad("benchmark dataset missing or invalid") from None
+        _benchmark_dataset(dataset)
     try:
         lock_bytes = (repo / "uv.lock").read_bytes()
         lock = tomllib.loads(lock_bytes.decode())
@@ -439,6 +464,8 @@ def build_package(
                 _run(["uv", "build", "--package", name, "--wheel", "--out-dir", str(wheels)], repo, work)
             files = {name: (source_directory / name).read_bytes() for name in entry_files}
             files.update({name: path.read_bytes() for name, path in configs.items()})
+            if dataset is not None:
+                files[BENCHMARK_DATASET] = dataset
             for wheel in sorted(wheels.glob("*.whl")):
                 content = wheel.read_bytes()
                 _wheel(wheel.name, content)

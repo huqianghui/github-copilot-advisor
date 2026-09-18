@@ -74,6 +74,35 @@ def test_valid_functions_zip_is_inspected_without_extraction(tmp_path, artifact_
     assert not manifest.linux_imports_verified
 
 
+def test_optional_benchmark_dataset_is_hash_checked_and_available_to_the_host(tmp_path, artifact_files):
+    root = Path(__file__).resolve().parents[3]
+    dataset = (root / "deploy" / "bench" / "cases.json").read_bytes()
+    artifact_files["runtime-config/benchmark-cases.json"] = dataset
+    manifest = verify(write_zip(tmp_path / "benchmark.zip", artifact_files))
+    assert manifest.files["runtime-config/benchmark-cases.json"] == hashlib.sha256(dataset).hexdigest()
+
+
+@pytest.mark.parametrize("dataset", [
+    b'{"version":1,"cases":[],"seeded_history":[]}',
+    b'{"version":1,"version":2,"cases":[],"seeded_history":[]}',
+    b'not-json',
+])
+def test_package_rejects_invalid_opted_in_benchmark_data(tmp_path, artifact_files, dataset):
+    artifact_files["runtime-config/benchmark-cases.json"] = dataset
+    with pytest.raises(ValueError, match="benchmark dataset"):
+        verify(write_zip(tmp_path / "invalid-dataset.zip", artifact_files))
+
+
+@pytest.mark.parametrize("invalid_format", ["utf16", "oversized"])
+def test_benchmark_dataset_rejects_non_utf8_or_oversized_valid_json(tmp_path, artifact_files, invalid_format):
+    root = Path(__file__).resolve().parents[3]
+    dataset = (root / "deploy" / "bench" / "cases.json").read_text(encoding="utf-8")
+    content = dataset.encode("utf-16") if invalid_format == "utf16" else dataset.encode() + b" " * (4 * 1024 * 1024)
+    artifact_files["runtime-config/benchmark-cases.json"] = content
+    with pytest.raises(ValueError, match="benchmark dataset"):
+        verify(write_zip(tmp_path / "dataset-format.zip", artifact_files))
+
+
 @pytest.mark.parametrize("name", [
     ".env", "nested/.env", ".venv/Lib/site.py", "tests/test_secret.py", ".state/jobs.json",
     "ingestion/__init__.py", "dev/settings.json", "../escape", "/absolute", "C:/escape",
@@ -266,9 +295,11 @@ def test_real_aca_build_is_reproducible_and_inspected_end_to_end(tmp_path, monke
     diagnostics = approved / "diagnostics.yaml"
     escalation.write_text("contacts: []\n", encoding="utf-8")
     diagnostics.write_text("checks: []\n", encoding="utf-8")
+    cases = live_root / "deploy" / "bench" / "cases.json"
     output = root / "deploy" / "out" / "context"
     manifest = build_package(
         "aca", output, repo_root=root, escalation_config=escalation, diagnostics_config=diagnostics,
+        benchmark_cases_config=cases,
     )
     inspected = verify(output)
     assert manifest == inspected
@@ -276,6 +307,7 @@ def test_real_aca_build_is_reproducible_and_inspected_end_to_end(tmp_path, monke
     assert not (output / ".env").exists()
     assert not (output / "advisor_deploy").exists()
     assert (output / "runtime-config" / "escalation.yaml").read_bytes() == escalation.read_bytes()
+    assert (output / "runtime-config" / "benchmark-cases.json").read_bytes() == cases.read_bytes()
     result = subprocess.run(
         [sys.executable, "-m", "advisor_deploy", "verify-package", str(output)],
         capture_output=True, text=True, check=False,
@@ -284,6 +316,7 @@ def test_real_aca_build_is_reproducible_and_inspected_end_to_end(tmp_path, monke
     assert json.loads(result.stdout)["files"] == manifest.files
     second = build_package(
         "aca", output, repo_root=root, escalation_config=escalation, diagnostics_config=diagnostics,
+        benchmark_cases_config=cases,
     )
     assert manifest.content_sha256 == second.content_sha256
     assert manifest.files == second.files

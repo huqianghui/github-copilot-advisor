@@ -4,6 +4,7 @@ param(
     [Parameter(Mandatory)][string]$Output,
     [Parameter(Mandatory)][string]$EscalationConfig,
     [Parameter(Mandatory)][string]$DiagnosticsConfig,
+    [string]$BenchmarkCasesConfig,
     [string]$BuildImage
 )
 
@@ -18,6 +19,10 @@ $packageArguments = @(
     '--target', $Target, '--output', $Output,
     '--escalation-config', $EscalationConfig, '--diagnostics-config', $DiagnosticsConfig
 )
+if ($BenchmarkCasesConfig) {
+    $BenchmarkCasesConfig = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($BenchmarkCasesConfig)
+    $packageArguments += @('--benchmark-cases-config', $BenchmarkCasesConfig)
+}
 if ($BuildImage) {
     if ($Target -ne 'aca') { throw 'Local image building is ACA-only.' }
     $packageArguments += @('--build-image', $BuildImage)

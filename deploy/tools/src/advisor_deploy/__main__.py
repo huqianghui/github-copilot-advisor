@@ -22,13 +22,22 @@ def _metadata_overrides(assignments: list[str]) -> dict[str, str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["smoke"]:
+        from advisor_deploy.smoke import main as smoke_main
+
+        # Keep the smoke parser's body-free errors, including invalid arguments.
+        return smoke_main(argv[1:])
     parser = argparse.ArgumentParser(prog="advisor-deploy")
     commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("smoke", help="Probe an owned deployment; unobserved checks remain not_run")
     package = commands.add_parser("package")
     package.add_argument("--target", choices=("aca", "functions"), required=True)
     package.add_argument("--output", type=Path, required=True)
     package.add_argument("--escalation-config", type=Path)
     package.add_argument("--diagnostics-config", type=Path)
+    package.add_argument("--benchmark-cases-config", type=Path,
+                         help="Explicit opt-in approved JSON dataset for experiment targets")
     package.add_argument("--env-file", type=Path, help="Explicit opt-in; no default .env is read")
     package.add_argument("--build-image", metavar="LOCAL_TAG", help="Optional local Linux build/import check; never pushes")
     verify = commands.add_parser("verify-package")
@@ -63,6 +72,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError("invalid package: image build is ACA-only")
             manifest = build_package(
                 args.target, args.output, escalation_config=escalation, diagnostics_config=diagnostics,
+                benchmark_cases_config=args.benchmark_cases_config,
             )
             if args.build_image:
                 manifest = build_image(args.output, args.build_image)

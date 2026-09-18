@@ -7,3 +7,4 @@
 !runtime-config/
 !runtime-config/escalation.yaml
 !runtime-config/diagnostics.yaml
+!runtime-config/benchmark-cases.json
