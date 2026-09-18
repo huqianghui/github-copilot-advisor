@@ -1,6 +1,7 @@
 """AdvisorCore:planner → tool loop → evaluator 管线,事件与兜底(spec 7.1/10.1/10.2)。"""
 import logging
 from typing import Callable
+from uuid import uuid4
 
 from advisor_agent.backend import AgentBackend
 from advisor_agent.extensions import (
@@ -56,7 +57,11 @@ class AdvisorCore:
         self.channel_name = channel_name
         self._turns = SessionTurnCoordinator()
 
-    async def handle(self, request: AdvisorRequest) -> AdvisorResponse:
+    async def handle(self, request: AdvisorRequest, *,
+                     turn_id: str | None = None) -> AdvisorResponse:
+        if turn_id is not None and (not isinstance(turn_id, str) or not turn_id.strip()):
+            raise ValueError("turn_id must not be empty")
+        turn_id = turn_id if turn_id is not None else uuid4().hex
         identity = _request_identity(request)
         with trace_scope() as trace:
             with step("agent.turn", channel=self.channel_name) as timing:
@@ -66,7 +71,7 @@ class AdvisorCore:
                             planned = await self.planner.plan(request)
                             if _request_identity(planned) != identity:
                                 raise ValueError("planner changed request identity")
-                        response, event = await self._handle_turn(planned, run)
+                        response, event = await self._handle_turn(planned, run, turn_id)
                 if event.error is not None:
                     timing.status = "degraded"
             event.trace_id = trace.trace_id
@@ -75,7 +80,8 @@ class AdvisorCore:
             return response
 
     async def _handle_turn(self, request: AdvisorRequest,
-                           run: RunContext) -> tuple[AdvisorResponse, AdvisorEvent]:
+                           run: RunContext,
+                           turn_id: str) -> tuple[AdvisorResponse, AdvisorEvent]:
         with step("session.read"):
             history = await self.sessions.get(request.conversation_key)
         # 必须在 planner 之后求值:planner 会换掉 request 对象。
@@ -112,10 +118,9 @@ class AdvisorCore:
             with step("answer.evaluate"):
                 response = await self.evaluator.evaluate(request, response)
             with step("session.write"):
-                await self.sessions.append(
-                    request.conversation_key, "user", marked_text)
-                await self.sessions.append(
-                    request.conversation_key, "assistant", response.markdown)
+                await self.sessions.append_turn(
+                    request.conversation_key, marked_text, response.markdown,
+                    turn_id=turn_id)
 
         event = AdvisorEvent(
             conversation_key=request.conversation_key,

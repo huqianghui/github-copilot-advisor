@@ -19,6 +19,18 @@ will fail. Always use `--all-packages`.
 If PyPI is blocked or slow on your network, set `UV_INDEX_URL` to point at
 your corporate PyPI proxy before running `uv sync`.
 
+## 历史保存与模型上下文
+
+默认按每条消息写入时间保存 30 天,达到 30 天即不再返回;新活动不延长旧消息寿命。
+先按租户/会话线程/发送者定位分区,再选择该分区最近 20 条有效历史给模型。
+20 条是历史消息数量,不是 20 轮问答,也不包含系统提示、当前问题或当前工具结果。
+较早的有效历史不因模型窗口限制被删除,但本次不自动摘要或检索这些历史。
+
+`AdvisorCore` 对成功问答一次提交用户/助手两条消息,失败不提交半轮历史。
+可传入 `turn_id` 为存储提交提供幂等标识;这不代表直接模式会跳过重复的模型调用,
+也不代表已经实现跨实例队列或 exactly-once 发送。
+本地默认仍为内存存储,重启会丢失数据,不能据此承诺跨重启保留 30 天。
+
 ## 分级日志与延迟分析
 
 Teams 入口使用标准 Python `logging`,不需要额外日志依赖或云资源。

@@ -2,8 +2,9 @@
 
 ## Status
 
-Planning. The design has been approved; runtime implementation, infrastructure
-generation, deployment validation, provisioning and load tests have not started.
+Executing the approved implementation plan. Authentication and local history
+foundations are being implemented and tested. Infrastructure generation,
+deployment validation, provisioning and load tests have not started.
 This document must not be interpreted as approval to skip deployment validation.
 
 ## Approved design
@@ -118,8 +119,8 @@ remain explicit execution gates, rather than assumed passes.
 | Gate | State |
 |---|---|
 | Design approval | Complete |
-| Implementation plan | Written, pending execution handoff |
-| Application changes and local regressions | Not started |
+| Implementation plan | Execution authorized on 2026-09-18 |
+| Application changes and local regressions | In progress: authentication and history foundations |
 | Infrastructure/package generation | Not started |
 | Azure policy, quota and permission validation | Not completed |
 | Azure deployment validation | Not started |

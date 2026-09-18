@@ -1,17 +1,50 @@
-"""会话存储:v1 内存实现,接口留给 Cosmos DB/Redis(spec 7.4)。"""
+"""Per-partition history retention, model windows and local turn coordination."""
 import asyncio
-import time
+import math
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Protocol
+from uuid import uuid4
+
+from advisor_shared.cloud import HistoryMessage
 from advisor_shared.telemetry import step
+
+HISTORY_RETENTION_SECONDS = 30 * 24 * 60 * 60
+
+
+def _aware_utc(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("history timestamp must be timezone-aware")
+    return value.astimezone(timezone.utc)
+
+
+def _validate_settings(limit: int, retention: float) -> None:
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise ValueError("history message limit must be a positive integer")
+    if not math.isfinite(retention) or retention <= 0:
+        raise ValueError("history retention must be finite and positive")
+
+
+def select_history(
+    records: list[HistoryMessage], now: datetime, limit: int = 20,
+    *, ttl_seconds: float = HISTORY_RETENTION_SECONDS,
+) -> list[dict[str, str]]:
+    _validate_settings(limit, ttl_seconds)
+    cutoff = _aware_utc(now) - timedelta(seconds=ttl_seconds)
+    valid = [record for record in records if record.written_at > cutoff]
+    return [{"role": record.role, "content": record.content}
+            for record in valid[-limit:]]
 
 
 class SessionStore(Protocol):
     async def get(self, key: str) -> list[dict]: ...
 
-    async def append(self, key: str, role: str, content: str) -> None: ...
+    async def append_turn(
+        self, key: str, user_content: str, assistant_content: str, *,
+        turn_id: str, written_at: datetime | None = None,
+    ) -> None: ...
 
 
 @dataclass
@@ -45,24 +78,77 @@ class SessionTurnCoordinator:
 
 
 class InMemorySessionStore:
-    def __init__(self, max_turns: int = 20, ttl_seconds: float = 3600,
-                 clock: Callable[[], float] = time.monotonic):
-        self._data: dict[str, tuple[float, list[dict]]] = {}
+    def __init__(
+        self, max_turns: int = 20, ttl_seconds: float = HISTORY_RETENTION_SECONDS,
+        clock: Callable[[], float] | None = None, *,
+        utc_clock: Callable[[], datetime] | None = None,
+    ):
+        _validate_settings(max_turns, ttl_seconds)
+        if clock is not None and utc_clock is not None:
+            raise ValueError("choose clock or utc_clock, not both")
+        self._data: dict[str, list[HistoryMessage]] = {}
         self.max_turns = max_turns
         self.ttl = ttl_seconds
-        self.clock = clock
+        if clock is not None:
+            origin, started = clock(), datetime.now(timezone.utc)
+            self._utc_clock = lambda: started + timedelta(seconds=clock() - origin)
+        else:
+            self._utc_clock = utc_clock or (lambda: datetime.now(timezone.utc))
+
+    def _retained(self, key: str) -> list[HistoryMessage]:
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("session key must not be empty")
+        cutoff = _aware_utc(self._utc_clock()) - timedelta(seconds=self.ttl)
+        records = [record for record in self._data.get(key, [])
+                   if record.written_at > cutoff]
+        if records:
+            self._data[key] = records
+        else:
+            self._data.pop(key, None)
+        return records
 
     async def get(self, key: str) -> list[dict]:
-        entry = self._data.get(key)
-        if not entry:
-            return []
-        touched, messages = entry
-        if self.clock() - touched > self.ttl:
-            del self._data[key]
-            return []
-        return list(messages)
+        return select_history(
+            self._retained(key), self._utc_clock(), self.max_turns,
+            ttl_seconds=self.ttl)
+
+    async def read_archive(self, key: str) -> list[HistoryMessage]:
+        return [record.model_copy(deep=True) for record in self._retained(key)]
 
     async def append(self, key: str, role: str, content: str) -> None:
-        messages = await self.get(key)
-        messages.append({"role": role, "content": content})
-        self._data[key] = (self.clock(), messages[-self.max_turns:])
+        if role not in {"user", "assistant"}:
+            raise ValueError("history role must be user or assistant")
+        if not isinstance(content, str):
+            raise ValueError("history content must be text")
+        records = self._retained(key)
+        message = HistoryMessage(
+            role=role, content=content, written_at=_aware_utc(self._utc_clock()),
+            turn_id=uuid4().hex,
+            sequence=max((record.sequence for record in records), default=0) + 1,
+        )
+        self._data[key] = [*records, message]
+
+    async def append_turn(
+        self, key: str, user_content: str, assistant_content: str, *,
+        turn_id: str, written_at: datetime | None = None,
+    ) -> None:
+        if not isinstance(turn_id, str) or not turn_id.strip():
+            raise ValueError("turn_id must not be empty")
+        if not isinstance(user_content, str) or not isinstance(assistant_content, str):
+            raise ValueError("history content must be text")
+        timestamp = _aware_utc(written_at if written_at is not None else self._utc_clock())
+        records = self._retained(key)
+        existing = [record for record in records if record.turn_id == turn_id]
+        if existing:
+            if [(record.role, record.content) for record in existing] != [
+                ("user", user_content), ("assistant", assistant_content),
+            ]:
+                raise ValueError("turn_id was already committed with different content")
+            return
+        sequence = max((record.sequence for record in records), default=0) + 1
+        user = HistoryMessage(role="user", content=user_content, written_at=timestamp,
+                              turn_id=turn_id, sequence=sequence)
+        assistant = HistoryMessage(
+            role="assistant", content=assistant_content, written_at=timestamp,
+            turn_id=turn_id, sequence=sequence)
+        self._data[key] = [*records, user, assistant]
