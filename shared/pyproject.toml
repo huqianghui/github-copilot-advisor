@@ -7,6 +7,7 @@ dependencies = [
     "pydantic>=2.7",
     "azure-core[aio]>=1.30,<2",
     "azure-identity>=1.19,<2",
+    "pyjwt[crypto]>=2.10,<3",
 ]
 
 [build-system]

@@ -10,3 +10,6 @@ superpowers-plugin
 agent/tests/output/
 .state/
 agent/escalation.yaml
+deploy/out/
+deploy/functions/local.settings.json
+deploy/reports/raw/

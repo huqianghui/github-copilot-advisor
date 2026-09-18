@@ -1,7 +1,9 @@
 # Development
 
-This repo is a `uv` workspace with four members: `shared`, `ingestion`,
-`agent` and `channels/teams`.
+This repo is a `uv` workspace with five members: `shared`, `ingestion`,
+`agent`, `channels/teams` and the deployment tools in `deploy/tools`.
+The workspace/tooling remains compatible with Python 3.11; cloud artifacts
+explicitly target Python 3.12.
 
 ## Setup
 
@@ -13,6 +15,175 @@ Plain `uv sync` only installs the root project — it will **not** install the
 workspace member packages into the venv, so their imports
 (`advisor_shared.*`, `ingestion.*`, `advisor_agent.*`, `teams_adapter.*`)
 will fail. Always use `--all-packages`.
+
+## Offline deployment packaging (Task 12)
+
+`advisor-deploy` packages only `advisor-shared`, `advisor-agent`, and
+`advisor-teams`. It exports their online dependency closure from the existing
+`uv.lock` with `--locked --no-dev --no-editable --no-emit-workspace
+--emit-index-url`, then builds three pure-Python wheels. Every local wheel
+reference in `requirements.txt` has its own SHA-256 hash. Ingestion, deployment
+tools, tests, development dependencies, `.env`, `.state`, and local virtual
+environments are not deployment inputs.
+
+Direct packaging requires both approved YAML files as explicit caller inputs;
+there is **no example fallback**. Configuration import additionally supports
+the existing tracked `agent/diagnostics.yaml` app default, described below.
+The following paths are placeholders for your approved files:
+
+```powershell
+uv run --locked --no-sync --package advisor-deploy python -m advisor_deploy package `
+  --target aca --output deploy\out\aca-context `
+  --escalation-config C:\approved\escalation.yaml `
+  --diagnostics-config C:\approved\diagnostics.yaml
+uv run --locked --no-sync --package advisor-deploy python -m advisor_deploy verify-package deploy\out\aca-context
+
+# Equivalent checked PowerShell wrapper; never starts Docker or deploys resources.
+.\deploy\shared\Package.ps1 -Target aca -Output deploy\out\aca-context `
+  -EscalationConfig C:\approved\escalation.yaml -DiagnosticsConfig C:\approved\diagnostics.yaml
+```
+
+Outputs must be named artifacts inside this repository's `deploy/out/`.
+Rebuilding replaces only an already-valid owned artifact, after the new
+candidate passes validation. Unknown existing directories/files, links,
+concurrent builds of the same output, and attempts to nest an artifact inside
+another artifact are rejected rather than deleted. Scratch work stays in the
+ignored project output tree and is removed after each build.
+
+For Functions, use `--target functions --output deploy\out\functions.zip`.
+The ZIP root contains `function_app.py`, `host.json`, `requirements.txt`,
+`runtime-config/`, `wheels/`, and `package-manifest.json`. The real entry files
+must already exist in `deploy/functions/`, and `advisor-teams` must declare its
+locked `functions` extra. Missing prerequisites produce an explicit error;
+the packager never creates placeholder Functions code.
+
+ACA outputs are a **staged build context**, not a copy of the repository.
+Only the two approved YAML files, three wheels, requirements, Docker files,
+and non-secret manifest are staged. Docker's allowlist excludes the manifest
+and anything outside those runtime inputs. The image runs as UID 10001.
+Third-party dependencies retain environment markers from the universal lock;
+the local workspace wheels must be `py3-none-any`, never Windows wheels or a
+Windows venv.
+
+Add `--build-image advisor-local:experiment` to the Python `package` command
+(or `-BuildImage advisor-local:experiment` to `Package.ps1`) for an **optional
+local** `linux/amd64` image build. It requires an already-running Linux Docker
+engine and access to the configured corporate index. This operation pulls
+`python:3.12-slim`, records its resolved digest, passes that digest to the
+build, and checks online imports plus missing-configuration failure in a
+network-disabled container. It never starts the engine, pushes an image, or
+calls a model. Plain packaging records `base_image_digest=null` and
+`linux_imports_verified=false`; do not call those artifacts Linux-validated.
+These checks do not validate the later queued runtime or an end-to-end Bot.
+
+The manifest records target, Python/platform, subscription deployment scope,
+lock hash, approved dependency index, every packaged file hash, and image
+verification status. Verification reads ZIPs in memory without extraction and
+checks duplicate/traversing entries, nested wheel contents, module metadata,
+required inputs, hash coverage, and unexpected files. Hashes detect corruption;
+the manifest is **not a signature or an attestation from a trusted builder**.
+Keep artifacts and their provenance within the approved deployment workflow.
+
+### Explicit configuration import
+
+`load_deploy_config(env_file, target, *, overrides=None)` does not read `.env`
+implicitly or merge the shell environment. It accepts an explicitly supplied
+existing local file, including the setting names in `.env.example`, without
+rewriting it. Truly unknown, duplicate, or malformed assignments remain errors.
+Local `CONNECTIONS__*` Bot settings, preexisting identity/storage endpoints and
+keys, and alternate OpenAI credentials are recognized but **never copied**.
+Cloud hosts use their newly provisioned managed identity. The safe summary
+lists ignored names, not their values. Local `ADVISOR_ENTRA_CREDENTIAL=azure_cli`
+is recognized and replaced by the cloud managed-identity setting.
+
+Supply missing deployment metadata or explicit auth-mode changes in the
+keyword-only `overrides: Mapping[str, str]` overlay. Its keys use the same
+allowlist/environment-variable names and its values receive the same checks:
+
+```python
+from pathlib import Path
+from advisor_deploy.config import load_deploy_config
+
+config = load_deploy_config(
+    Path("explicit-local-config.env"),
+    "aca",
+    overrides={
+        "AZURE_OPENAI_RESOURCE_ID": approved_model_resource_id,
+        "AZURE_SEARCH_RESOURCE_ID": approved_search_resource_id,
+        "AZURE_OPENAI_AUTH_MODE": "entra",
+        "AZURE_SEARCH_AUTH_MODE": "entra",
+        "DIAGNOSTICS_CONFIG": str(approved_diagnostics_path),
+    },
+)
+```
+
+CLI `config` and `package --env-file` also accept repeated
+`--set NAME=VALUE` flags for **non-secret** metadata. Credential names are
+rejected in command-line overlays; do not put secrets on a process command line.
+Neither overlays nor config import alter the original file.
+
+Dotenv values are parsed as data without shell execution or `${...}`
+interpolation. `SecretSettings` and `DeployConfig` hide secret values in
+representations; `public_summary()` and CLI output contain names, not values.
+The later deployment boundary must explicitly call
+`secret_settings.reveal_for_deployment()` to populate Bicep's secure
+`secretSettings` parameter; do not log or persist that returned dictionary.
+
+Required inputs are `AZURE_OPENAI_RESOURCE_ID`, `AZURE_SEARCH_RESOURCE_ID`,
+`AZURE_OPENAI_ENDPOINT`, `AZURE_SEARCH_ENDPOINT`,
+`AZURE_OPENAI_CHAT_DEPLOYMENT`, `AZURE_SEARCH_INDEX`, and `ESCALATION_CONFIG`.
+Inputs may come from the file or overlay. The embedding deployment defaults
+to the application's existing `text-embedding-3-large` name; diagnostics
+defaults to the actual tracked `agent/diagnostics.yaml` in this repository.
+These are explicit app defaults, not example-file fallbacks; a missing tracked
+file still fails, and either value can be overridden. Escalation is always
+explicit, with no fallback.
+YAML source paths are relative to the supplied file (or explicit absolute
+paths). They map to `/app/runtime-config/` for ACA and
+`/home/site/wwwroot/runtime-config/` for Functions.
+Source files and all parent directories reject symlinks and Windows
+junction/reparse points, and forbidden locations are checked again after
+resolving the path.
+
+Supported optional groups:
+
+- `AZURE_SUBSCRIPTION_ID` is constrained to the approved subscription;
+  `AZURE_LOCATION` to `southeastasia`; `AZURE_ENV_NAME` sets the environment.
+- `AZURE_OPENAI_AUTH_MODE` and `AZURE_SEARCH_AUTH_MODE` are `entra` (default)
+  or `key`. Unused Azure keys are discarded, not carried into Entra deployments.
+  State remains Entra-only and the credential source remains managed identity.
+- Secrets: `AZURE_OPENAI_API_KEY`, `AZURE_SEARCH_API_KEY`, `GITHUB_TOKEN`,
+  `TAVILY_API_KEY`, `BRAVE_API_KEY`. Other local Bot credentials are not imported.
+- `ADVISOR_MAX_INSTANCES` (1–1000, default 40),
+  `ADVISOR_WORKER_PARALLELISM` (1–32, default 4).
+- Existing KB/GitHub/Web budget values, `ADVISOR_LOG_LEVEL`,
+  `ADVISOR_LOG_FORMAT`, and `AZURE_OPENAI_API_VERSION` are validated and
+  forwarded through Bicep's allowlisted `runtimeSettings` object to both
+  hosts. Their absent-value defaults match the existing application.
+  Application `DEBUG` does not turn on SDK HTTP/body DEBUG logging.
+- ACA: `ACA_MIN_REPLICAS` (0/1), `ACA_RESOURCE_PROFILE`
+  (`quarter`/`half`/`one`/`two`), `ACA_DEPLOY_APP`, and `ACA_IMAGE`
+  (repository:tag or repository@sha256:digest, without the registry hostname).
+- Functions: `FUNCTIONS_INSTANCE_MEMORY_MB` (512/2048/4096) and
+  `FUNCTIONS_PACKAGE_IDENTIFIER` (the non-secret artifact identifier).
+- Benchmark: explicit `BENCHMARK_ENABLED=true`, audience/API client ID,
+  comma-separated allowed principal/client IDs, receiver URL and audience.
+  Incomplete benchmark configuration fails closed.
+
+`python -m advisor_deploy config --target aca --env-file PATH` prints only a
+redacted summary. `package --env-file PATH` can obtain the two approved YAML
+paths from the same validated file instead of the two explicit path flags.
+Neither command sends configuration anywhere. `DeployConfig.parameters`
+matches the **subscription-scoped** ACA/Flex entry templates. The separate
+benchmark template is resource-group-scoped and is not a packaging target.
+
+```powershell
+uv run --locked --no-sync --package advisor-deploy python -m pytest deploy\tools\tests -q
+```
+
+The suite inspects real compiled parameter contracts and real `uv`-built
+online wheels, verifies an identical rebuild, and tests hostile ZIP/config
+fixtures. It does not read the repository's real `.env` or require Azure login.
 
 ## Corporate networks
 

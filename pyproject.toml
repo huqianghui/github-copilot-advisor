@@ -6,7 +6,7 @@ requires-python = ">=3.11"
 dependencies = []
 
 [tool.uv.workspace]
-members = ["shared", "ingestion", "agent", "channels/teams"]
+members = ["shared", "ingestion", "agent", "channels/teams", "deploy/tools"]
 
 [tool.uv.sources]
 advisor-shared = { workspace = true }
@@ -26,7 +26,7 @@ dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "respx>=0.21"]
 
 [tool.pytest.ini_options]
 testpaths = ["shared/tests", "ingestion/tests", "agent/tests",
-             "channels/teams/tests"]
+             "channels/teams/tests", "deploy/tools/tests"]
 asyncio_mode = "auto"
 markers = ["integration: requires real Azure/GitHub resources"]
 addopts = "-m 'not integration'"

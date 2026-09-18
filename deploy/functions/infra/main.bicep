@@ -12,6 +12,8 @@ param embeddingDeploymentName string
 param searchIndexName string
 @description('Directory in the package containing the approved escalation.yaml and diagnostics.yaml; never upload .env.')
 param runtimeConfigPath string
+@description('Non-secret application budgets/logging only; shared settings ignore unrecognized keys.')
+param runtimeSettings object = {}
 @description('Non-secret package digest/version. OneDeploy uploads the package separately.')
 param packageIdentifier string
 @allowed(['entra', 'key'])
@@ -127,6 +129,7 @@ module settings '../../shared/infra/settings.bicep' = {
     embeddingDeploymentName: embeddingDeploymentName
     searchIndexName: searchIndexName
     runtimeConfigPath: runtimeConfigPath
+    runtimeSettings: runtimeSettings
     openaiAuthMode: openaiAuthMode
     searchAuthMode: searchAuthMode
     workerParallelism: workerParallelism

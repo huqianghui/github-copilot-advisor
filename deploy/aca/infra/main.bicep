@@ -14,6 +14,8 @@ param embeddingDeploymentName string
 param searchIndexName string
 @description('Directory in the image containing the approved escalation.yaml and diagnostics.yaml; never upload .env.')
 param runtimeConfigPath string
+@description('Non-secret application budgets/logging only; shared settings ignore unrecognized keys.')
+param runtimeSettings object = {}
 @description('Repository:tag or repository@sha256:digest; required when deployApp=true.')
 param image string = ''
 @description('Bootstrap with false, push the image to the NEW registry, then redeploy with true.')
@@ -138,6 +140,7 @@ module settings '../../shared/infra/settings.bicep' = {
     embeddingDeploymentName: embeddingDeploymentName
     searchIndexName: searchIndexName
     runtimeConfigPath: runtimeConfigPath
+    runtimeSettings: runtimeSettings
     openaiAuthMode: openaiAuthMode
     searchAuthMode: searchAuthMode
     workerParallelism: workerParallelism

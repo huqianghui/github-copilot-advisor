@@ -8,6 +8,7 @@ param modelDeploymentName string
 param embeddingDeploymentName string
 param searchIndexName string
 param runtimeConfigPath string
+param runtimeSettings object = {}
 @allowed(['entra', 'key'])
 param openaiAuthMode string
 @allowed(['entra', 'key'])
@@ -32,6 +33,13 @@ output settings object = {
   AZURE_OPENAI_CHAT_DEPLOYMENT: modelDeploymentName
   AZURE_OPENAI_EMBEDDING_DEPLOYMENT: embeddingDeploymentName
   AZURE_SEARCH_INDEX: searchIndexName
+  AZURE_OPENAI_API_VERSION: string(runtimeSettings.?AZURE_OPENAI_API_VERSION ?? '2024-10-21')
+  KB_SEARCH_BUDGET_SECONDS: string(runtimeSettings.?KB_SEARCH_BUDGET_SECONDS ?? '12')
+  GITHUB_SEARCH_BUDGET_SECONDS: string(runtimeSettings.?GITHUB_SEARCH_BUDGET_SECONDS ?? '4')
+  WEB_SEARCH_BUDGET_SECONDS: string(runtimeSettings.?WEB_SEARCH_BUDGET_SECONDS ?? '12')
+  WEB_SEARCH_ATTEMPT_TIMEOUT_SECONDS: string(runtimeSettings.?WEB_SEARCH_ATTEMPT_TIMEOUT_SECONDS ?? '6')
+  ADVISOR_LOG_LEVEL: string(runtimeSettings.?ADVISOR_LOG_LEVEL ?? 'INFO')
+  ADVISOR_LOG_FORMAT: string(runtimeSettings.?ADVISOR_LOG_FORMAT ?? 'json')
   ESCALATION_CONFIG: '${runtimeConfigPath}/escalation.yaml'
   DIAGNOSTICS_CONFIG: '${runtimeConfigPath}/diagnostics.yaml'
   ADVISOR_STORAGE_ACCOUNT_NAME: storageAccountName

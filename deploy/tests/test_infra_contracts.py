@@ -490,3 +490,17 @@ def test_aca_profile_selection_is_explicit_and_uses_valid_pairs(compiled_infra, 
     assert pair["memory"] == memory
     container = only(app, "Microsoft.App/containerApps")["properties"]["template"]["containers"][0]
     assert container["resources"] == "[variables('resourceProfiles')[parameters('resourceProfile')]]"
+
+
+@pytest.mark.parametrize("target", ["aca", "functions"])
+def test_approved_runtime_budgets_and_logging_reach_both_hosts(compiled_infra, target):
+    template = compiled_infra(target)
+    assert default(template, "runtimeSettings") == {}
+    assert argument(template, "settings", "runtimeSettings") == "[parameters('runtimeSettings')]"
+    settings = body(template, "settings")["outputs"]["settings"]["value"]
+    for name in ("KB_SEARCH_BUDGET_SECONDS", "GITHUB_SEARCH_BUDGET_SECONDS", "WEB_SEARCH_BUDGET_SECONDS",
+                 "WEB_SEARCH_ATTEMPT_TIMEOUT_SECONDS", "ADVISOR_LOG_LEVEL", "ADVISOR_LOG_FORMAT"):
+        assert "runtimeSettings" in settings[name]
+        assert name in settings[name]
+    assert settings["ADVISOR_ENTRA_CREDENTIAL"] == "managed_identity"
+    assert settings["CONNECTIONS__SERVICE_CONNECTION__SETTINGS__AUTHTYPE"] == "UserManagedIdentity"

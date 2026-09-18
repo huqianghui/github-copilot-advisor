@@ -1,0 +1,9 @@
+*
+!Dockerfile
+!Dockerfile.dockerignore
+!requirements.txt
+!wheels/
+!wheels/*.whl
+!runtime-config/
+!runtime-config/escalation.yaml
+!runtime-config/diagnostics.yaml
