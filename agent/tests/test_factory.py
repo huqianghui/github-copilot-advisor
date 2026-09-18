@@ -85,6 +85,23 @@ def test_factory_wires_web_budget_independently_of_openai(azure_env, monkeypatch
     _assert_hardened(core.backend._client, "chat remains unchanged")
 
 
+async def test_factory_honors_configured_embedding_deployment(azure_env, monkeypatch):
+    monkeypatch.setenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "kb-embedding-eastasia")
+    core = build_advisor("teams")
+    try:
+        assert core.backend._tools._combined.kb.embed_model == "kb-embedding-eastasia"
+        _assert_hardened(core.backend._tools._combined.kb.embed, "embedding client")
+    finally:
+        await core.aclose()
+
+
+@pytest.mark.parametrize("value", ["", " ", "\t"])
+def test_factory_rejects_empty_embedding_deployment(azure_env, monkeypatch, value):
+    monkeypatch.setenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", value)
+    with pytest.raises(ValueError, match="AZURE_OPENAI_EMBEDDING_DEPLOYMENT"):
+        build_advisor("teams")
+
+
 @pytest.mark.parametrize("name", [
     "WEB_SEARCH_BUDGET_SECONDS", "WEB_SEARCH_ATTEMPT_TIMEOUT_SECONDS"])
 @pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "not-a-number"])

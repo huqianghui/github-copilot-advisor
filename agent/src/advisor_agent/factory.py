@@ -175,6 +175,10 @@ def build_advisor(
     web_timeout = validate_seconds(
         os.environ.get("WEB_SEARCH_ATTEMPT_TIMEOUT_SECONDS", "6"),
         "WEB_SEARCH_ATTEMPT_TIMEOUT_SECONDS")
+    embedding_deployment = os.environ.get(
+        "AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "text-embedding-3-large")
+    if not embedding_deployment.strip():
+        raise ValueError("AZURE_OPENAI_EMBEDDING_DEPLOYMENT must be configured")
     owned = credentials is None
     credentials = credentials or AzureCredentials(AzureAuthSettings.from_env(os.environ))
     search_endpoint = _endpoint(credentials.settings.search_endpoint, "AZURE_SEARCH_ENDPOINT")
@@ -188,7 +192,7 @@ def build_advisor(
         search_auth,
     )
     combined = CombinedSearch(
-        KnowledgeSearchClient(search_client, embed_client),
+        KnowledgeSearchClient(search_client, embed_client, embed_model=embedding_deployment),
         GitHubLiveSearchClient(),
         budget_seconds=kb_budget,
         live_budget_seconds=live_budget,
