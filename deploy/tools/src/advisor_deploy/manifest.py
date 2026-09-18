@@ -7,7 +7,7 @@ import json
 import os
 import re
 
-from advisor_deploy.config import SUBSCRIPTION
+from advisor_deploy.config import SUBSCRIPTION, _resource_id
 from advisor_deploy.paths import has_link
 
 
@@ -56,8 +56,18 @@ def group_id(target: str) -> str:
     return f"/subscriptions/{SUBSCRIPTION}/resourceGroups/{GROUPS[target]}"
 
 
+def is_provider_auxiliary(identifier: object) -> bool:
+    if not isinstance(identifier, str):
+        return False
+    prefix, _, name = identifier.rpartition("/")
+    return (prefix.lower() == (group_id("functions") + "/providers/microsoft.insights/actiongroups").lower()
+            and name == "Application Insights Smart Detection")
+
+
 def arm_parts(identifier: object) -> list[str]:
-    if not isinstance(identifier, str) or not re.fullmatch(r"/[A-Za-z0-9_./()-]+", identifier):
+    if not isinstance(identifier, str) or (
+        not re.fullmatch(r"/[A-Za-z0-9_./()-]+", identifier) and not is_provider_auxiliary(identifier)
+    ):
         raise fail("invalid_resource_id")
     parts = identifier.split("/")
     if any(part in {"", ".", ".."} for part in parts[1:]) or len(parts) < 5:
@@ -73,6 +83,8 @@ def experiment_resource(identifier: object) -> str:
     parts = arm_parts(identifier)
     if parts[4].lower() not in {value.lower() for value in GROUPS.values()}:
         raise fail("outside experiment ownership")
+    if is_provider_auxiliary(identifier):
+        return str(identifier)
     if len(parts) > 5:
         resource_type = (parts[6] + "/" + parts[7]).lower()
         if resource_type not in RESOURCE_TYPES or "microsoft.authorization" in identifier.lower():
@@ -214,10 +226,18 @@ def _validate_manifest(data: object) -> dict:
     dependencies = data["dependencies"]
     if not isinstance(dependencies, dict) or set(dependencies) - {"openai", "search"}:
         raise fail("invalid_dependencies")
+    if not isinstance(data["summary"], dict):
+        raise fail("invalid_summary")
     for kind, identifier in dependencies.items():
-        parts = arm_parts(identifier)
-        expected = {"openai": "microsoft.cognitiveservices/accounts", "search": "microsoft.search/searchservices"}[kind]
-        if len(parts) != 9 or (parts[6] + "/" + parts[7]).lower() != expected or parts[4].lower() in {g.lower() for g in GROUPS.values()}:
+        expected = {"openai": "Microsoft.CognitiveServices/accounts", "search": "Microsoft.Search/searchServices"}[kind]
+        if not isinstance(identifier, str):
+            raise fail("invalid_dependencies")
+        try:
+            _resource_id(identifier, expected, "dependency",
+                         auth_mode=data["summary"].get(kind + "_auth", "entra"))
+        except ValueError:
+            raise fail("invalid_dependencies") from None
+        if identifier.split("/")[4].lower() in {g.lower() for g in GROUPS.values()}:
             raise fail("dependency_must_remain_outside_experiment")
     if not isinstance(data["summary"], dict) or set(data["summary"]) - {
         "location", "profile", "memory_mb", "max_instances", "worker_parallelism", "min_replicas", "openai_auth", "search_auth",
@@ -298,7 +318,11 @@ def read_json(path: Path) -> dict:
 
 
 def load_manifest(path: Path) -> dict:
-    return validate_manifest(read_json(path))
+    data = validate_manifest(read_json(path))
+    if any(is_provider_auxiliary(value) for value in data["owned_resource_ids"]):
+        from advisor_deploy.provider_auxiliary import validate_saved_provenance
+        validate_saved_provenance(path, data)
+    return data
 
 
 def write_manifest(path: Path, data: dict, repo: Path) -> None:
@@ -306,6 +330,9 @@ def write_manifest(path: Path, data: dict, repo: Path) -> None:
     path = path.absolute()
     if has_link(path) or not path.is_relative_to(repo / "deploy" / "out") or path.suffix != ".json":
         raise fail("manifest_output_scope")
+    if any(is_provider_auxiliary(value) for value in data["owned_resource_ids"]):
+        from advisor_deploy.provider_auxiliary import validate_saved_provenance
+        validate_saved_provenance(path, data)
     if path.exists():
         previous = load_manifest(path)
         if (previous["run_id"], previous["target"]) != (data["run_id"], data["target"]):

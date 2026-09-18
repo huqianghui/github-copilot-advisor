@@ -45,7 +45,6 @@ var hostSettings = {
   APPLICATIONINSIGHTS_CONNECTION_STRING: insights.properties.ConnectionString
   ADVISOR_MAINTENANCE_SCHEDULE: '0 */5 * * * *'
   ADVISOR_PACKAGE_IDENTIFIER: packageIdentifier
-  FUNCTIONS_WORKER_PROCESS_COUNT: '1'
   AzureFunctionsJobHost__extensions__queues__batchSize: string(workerParallelism)
   AzureFunctionsJobHost__extensions__queues__newBatchThreshold: '0'
   AzureFunctionsJobHost__extensions__queues__maxDequeueCount: '5'

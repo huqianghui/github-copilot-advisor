@@ -1,4 +1,4 @@
-"""Credential-free workload and deployment bounds; local exceptions stay on loopback."""
+"""Credential-free bounded smoke/stress plans; unauthenticated tests stay on loopback."""
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Literal
@@ -76,7 +76,7 @@ class DeploymentBounds(WireModel):
     dedicated_benchmark_audience: str
     results_account_url: str
     config_verified: Literal[True]
-    cloud_smoke_verified: Literal[True]
+    cloud_smoke_verified: bool = Field(strict=True)
     capacity_verified: Literal[True]
     entra_registration_verified: Literal[True]
     valid_until: str
@@ -114,11 +114,12 @@ class ResultsPlan(WireModel):
 
 
 class RunPlan(WireModel):
+    """Cloud smoke is an operator-reviewed functional bootstrap, never a stress run."""
     target_url: str
     callback_url: str
     expected_target_id: str = Field(min_length=1, max_length=1024)
     local_test: bool = False
-    profile: Literal["warm", "concurrency", "cold", "local-smoke"] = "concurrency"
+    profile: Literal["warm", "concurrency", "cold", "local-smoke", "cloud-smoke"] = "concurrency"
     scenario: Scenario = "real_agent"
     history_mode: HistoryMode = "empty"
     case_ids: list[Identifier] = Field(min_length=1)
@@ -159,6 +160,8 @@ class RunPlan(WireModel):
             raise ValueError("minimum duration exceeds submission bound")
         if self.cold_target > self.cold_attempts:
             raise ValueError("cold target exceeds attempt bound")
+        if self.profile == "cloud-smoke" and self.local_test:
+            raise ValueError("cloud-smoke requires the authenticated cloud boundary")
         for value in (self.target_url, self.callback_url):
             parsed = urlsplit(value)
             if (parsed.username or parsed.password or parsed.query or parsed.fragment
@@ -193,10 +196,20 @@ class RunPlan(WireModel):
                 or self.max_requests > deployment.max_requests_per_run
                 or self.max_submit_seconds > deployment.max_submit_seconds):
             raise ValueError("plan exceeds deployment manifest bounds")
-        if (self.min_seconds < 180 or self.target_completions < 50
-                or self.request_timeout_seconds != 600 or self.drain_seconds != 600
+        if (self.request_timeout_seconds != 600 or self.drain_seconds != 600
                 or self.trend_seconds != 60):
             raise ValueError("cloud sampling must use the approved observation limits")
+        if self.profile == "cloud-smoke":
+            if (self.concurrency_levels != [1] or self.min_seconds != 0
+                    or not 1 <= self.target_completions <= 5
+                    or self.max_requests != self.target_completions
+                    or self.max_submit_seconds > 600):
+                raise ValueError("cloud-smoke requires one slot and an explicit 1-5 request budget")
+        else:
+            if not deployment.cloud_smoke_verified:
+                raise ValueError("cloud stress profiles require completed smoke verification")
+            if self.min_seconds < 180 or self.target_completions < 50:
+                raise ValueError("cloud sampling must use the approved observation limits")
         if self.profile == "cold" and (deployment.host_mode == "aca-resident"
                                        or self.zero_evidence_path is None):
             raise ValueError("cold runs need a zero-capable target and control-plane evidence file")

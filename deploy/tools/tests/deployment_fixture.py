@@ -9,8 +9,8 @@ import time
 from uuid import UUID, uuid5
 
 
-SUB = "adca540e-984c-4cab-bc86-5d38bf979841"
-TENANT = "11111111-1111-1111-1111-111111111111"
+SUB = "18827cdf-a4e8-4316-a7ba-a4499139a3ec"
+TENANT = "4bc8a937-2b77-44c4-8790-dfc0068162f2"
 PRINCIPAL = "22222222-2222-2222-2222-222222222222"
 CLIENT = "33333333-3333-3333-3333-333333333333"
 ROLE_IDS = {
@@ -276,6 +276,20 @@ def main():
     if args[:3] == ["role", "assignment", "delete"]:
         state["roles"].pop(option("--ids"), None)
         output()
+    if args[:2] == ["acr", "run"] or args[:3] in (["acr", "task", "show-run"], ["acr", "task", "logs"]):
+        from test_remote_acr import RemoteCli
+        clean = list(args)
+        for flag, count in (("--subscription", 2), ("--output", 2), ("--only-show-errors", 1)):
+            if flag in clean:
+                index = clean.index(flag)
+                del clean[index:index + count]
+        remote = RemoteCli(Path.cwd(), defect=state.get("remote_defect"))
+        remote.runs = state.get("remote_runs", {})
+        result = remote.run(clean, "fixture", mutation=clean[:2] == ["acr", "run"])
+        state["remote_runs"] = remote.runs
+        if isinstance(result, str):
+            text(result)
+        output(result)
     if args[:2] == ["acr", "login"]:
         output({"loginServer": "fixture.azurecr.io", "accessToken": "fixture-acr-token"})
     if args[:3] == ["acr", "repository", "show"]:

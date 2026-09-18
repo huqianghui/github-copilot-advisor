@@ -20,7 +20,7 @@ from advisor_deploy.render import digest
 
 
 ROOT = Path(__file__).resolve().parents[3]
-SUB = "adca540e-984c-4cab-bc86-5d38bf979841"
+SUB = "18827cdf-a4e8-4316-a7ba-a4499139a3ec"
 
 
 @pytest.fixture
@@ -488,7 +488,7 @@ def test_benchmark_grants_only_three_owned_identities_and_tracks_exact_ids(workf
     for target, suffix in (("aca", "aca"), ("functions", "flex")):
         group = f"/subscriptions/{SUB}/resourceGroups/rg-copilot-advisor-{suffix}-exp"
         record = new_manifest(target, case.run_id, "fixture", "a" * 64, "b" * 64)
-        record["tenant_id"] = "11111111-1111-1111-1111-111111111111"
+        record["tenant_id"] = "4bc8a937-2b77-44c4-8790-dfc0068162f2"
         record["owned_resource_ids"] = [group]
         for label in ([target, "driver"] if target == "aca" else [target]):
             identifier = group + "/providers/Microsoft.ManagedIdentity/userAssignedIdentities/" + label

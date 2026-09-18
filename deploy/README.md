@@ -6,18 +6,18 @@ subscription, register providers, enable keys, relax authentication, or adopt
 an unrecorded resource group/application.
 
 Prerequisites: PowerShell 7.4+, Azure CLI/Bicep, the configured workspace
-`.venv`, and the Task 12 packaging tools. Docker must already be running for
-ACA **Apply**; scripts do not start or stop it.
+`.venv`, and the Task 12 packaging tools. Select the image strategy explicitly:
+`ACA_BUILD_MODE=acr` uses guarded ACR Tasks without local Docker;
+`ACA_BUILD_MODE=local` (the compatibility default) requires a running local
+Linux Docker engine. Neither strategy starts or repairs Docker.
 
 Client `docker --version` output is not daemon readiness. If server-side
 requests return HTTP 500 or time out (as observed on the Linux engine), remain
-at WhatIf. The current ACA Apply workflow supports the checked local Linux
-build/import/push path only. An alternative remote Linux verification and
-immutable-image publication strategy must be explicitly approved and tested
-before using Apply; no automatic fallback, daemon restart, context switch, or
-global API-version change is performed. Earlier successful artifact checks
+at WhatIf **for local mode**. ACR mode is an independently approved strategy,
+not automatic fallback. No daemon restart, context switch, or global
+API-version change is performed. Earlier successful artifact checks
 are historical evidence, not proof of current daemon availability.
-After validating the explicit Apply confirmation, ACA performs a server-side
+After validating the explicit Apply confirmation, local ACA performs a server-side
 Linux-engine readiness check **before bootstrap creates or updates resources**;
 it checks again before building. A readiness failure leaves Apply blocked.
 The checked CLI resolves the local daemon once: `DOCKER_CONTEXT` takes
@@ -27,7 +27,7 @@ with `--host`, including commands using the private credential directory.
 Changing `DOCKER_CONFIG` never selects another daemon; remote endpoints and
 failed context resolution are rejected without fallback or global changes.
 
-### Recorded live blockers (2026-09-18)
+### Historical readiness observations (2026-09-18)
 
 The parent ran read-only readiness probes; these are not deployment evidence:
 
@@ -35,16 +35,20 @@ The parent ran read-only readiness probes; these are not deployment evidence:
 | --- | --- | --- |
 | Dedicated benchmark identity | `graph_directory_role_unverified` from Register/WhatIf | No directory creation or role grant is authorized by the scripts. |
 | Flex regional capacity | AppLens quota diagnosis returned 403; detector GET returned only a form; portal requires sign-in | No measured limit/usage evidence has been accepted. Published defaults remain unusable. |
-| Local Linux Docker | Server API returned HTTP 500 | ACA Apply remains blocked before bootstrap. No remote-build option or daemon repair is introduced. |
+| Local Linux Docker | Server API returned HTTP 500 | Local-mode Apply remains blocked before bootstrap. Explicit ACR mode avoids this gate; cloud task/probe success is still required. |
 
-Resolving these gates and performing actual application/deployment acceptance
-remain parent/operator actions. Do not weaken checks or fabricate evidence to
-turn this table green.
+On 2026-09-19 the operator explicitly switched to the subscription below.
+The new account's directory and Azure role-assignment permissions passed live
+checks; the isolated benchmark API registration now exists. ACR mode removes
+the local Docker dependency but still requires a successful cloud build/probe.
+The actual Flex regional quota remains a separate gate; the operator approved
+empty, unpublished Flex bootstrap solely to obtain its diagnostic.
 
 ## Fixed boundaries
 
-- Subscription: `adca540e-984c-4cab-bc86-5d38bf979841`; active CLI context must
+- Subscription: `18827cdf-a4e8-4316-a7ba-a4499139a3ec`; active CLI context must
   already match, in Azure public cloud.
+- Tenant: `4bc8a937-2b77-44c4-8790-dfc0068162f2`.
 - Region: `southeastasia`.
 - ACA group: `rg-copilot-advisor-aca-exp`.
 - Flex group: `rg-copilot-advisor-flex-exp`.
@@ -52,6 +56,11 @@ turn this table green.
   template is **resource-group-scoped**, in the owned ACA group.
 - Existing OpenAI/Search resources are dependencies, never cleanup targets.
   Existing local Bots and unrelated registries/registrations are not reused.
+- The operator explicitly approved Key access to the two original model/Search
+  resources in the former subscription. Only those exact external IDs are
+  allowlisted, and only with explicit Key mode. Preflight checks their data-plane
+  endpoints, embedding dimension and index schema without old-tenant ARM/RBAC.
+  This does not authorize owning, mutating or deleting those dependencies.
 
 `Get-AdvisorDeploymentArguments -Target aca|functions|bench` in
 `shared/Azure.ps1` selects the correct ARM scope. Subscription deployments do
@@ -73,10 +82,12 @@ Paths are relative to the plan file unless absolute. Example `aca.json`:
   "artifact": "../aca-context",
   "manifest": "../runs/aca-ownership.json",
   "overrides": {
-    "AZURE_OPENAI_RESOURCE_ID": "/subscriptions/adca540e-984c-4cab-bc86-5d38bf979841/resourceGroups/APPROVED-DEPENDENCY-GROUP/providers/Microsoft.CognitiveServices/accounts/APPROVED-MODEL",
-    "AZURE_SEARCH_RESOURCE_ID": "/subscriptions/adca540e-984c-4cab-bc86-5d38bf979841/resourceGroups/APPROVED-DEPENDENCY-GROUP/providers/Microsoft.Search/searchServices/APPROVED-SEARCH",
-    "AZURE_OPENAI_AUTH_MODE": "entra",
-    "AZURE_SEARCH_AUTH_MODE": "entra"
+    "AZURE_SUBSCRIPTION_ID": "18827cdf-a4e8-4316-a7ba-a4499139a3ec",
+    "ACA_BUILD_MODE": "acr",
+    "AZURE_OPENAI_RESOURCE_ID": "/subscriptions/adca540e-984c-4cab-bc86-5d38bf979841/resourceGroups/rg-ai-services-all/providers/Microsoft.CognitiveServices/accounts/cdc-ai-foundry-southeastasia-res",
+    "AZURE_SEARCH_RESOURCE_ID": "/subscriptions/adca540e-984c-4cab-bc86-5d38bf979841/resourceGroups/rg-playground-aiservices/providers/Microsoft.Search/searchServices/cdc-playground-ai-search",
+    "AZURE_OPENAI_AUTH_MODE": "key",
+    "AZURE_SEARCH_AUTH_MODE": "key"
   }
 }
 ```
@@ -177,6 +188,66 @@ and group cleanup. New resources are recorded from ARM deployment receipts,
 not adopted merely because they appear in a group. Partial failures retain
 known IDs and pending/unverified role IDs; incomplete discovery blocks cleanup.
 
+### Recovering a failed or partial ARM deployment
+
+Failed deployments can have both `outputResources=null` and `outputs=null`.
+Recovery then follows sanitized deployment **operation** targets, traversing
+subscription- and group-scoped nested deployments. Only successful `Create`
+leaf operations (or ARM output-resource receipts) establish ownership;
+`Read`, `Action`, failed leaf writes and unrelated inventory entries do not.
+Failed nested deployments are still traversed for successful children.
+Partial discoveries persist even if a later receipt read fails.
+
+Apply preserves its original CLI/provider failure. Ownership-tag restoration
+or receipt-discovery failures are reported separately and recorded in the
+non-secret `<ledger-stem>.recovery.json`, never substituted for that failure.
+
+```powershell
+.\deploy\shared\Reconcile.ps1 -OutputsFile deploy\out\runs\functions-ownership.json
+# Inspect the preview, then repeat with:
+# -Mode Apply -Confirmation <exact RECONCILE token>
+```
+
+Reconcile validates the active subscription/tenant, recorded run/group owner
+and exact run-bound root deployment name. WhatIf changes neither Azure nor
+the ledger. Apply performs the same **read-only Azure requests** and updates
+only the local ledger after confirmation. It binds receipt-proven role IDs
+to principal IDs read from receipt-owned UAMIs, without requiring root
+outputs or synthesizing successful application outputs. Unrelated resources,
+foreign scopes/principals and incomplete traversal remain blockers.
+When only the inventory comparison finds extra resources, reconciliation can
+still record the independently proven subset and validated roles. It lists
+the unrecorded IDs, keeps `discovery_complete=false` and
+`resume_allowed=false`, and never adopts those extras. An extra platform- or
+policy-created action group is not owned merely because it appears in inventory.
+
+One narrowly bounded provider auxiliary is supported: the exact
+`microsoft.insights/actiongroups/Application Insights Smart Detection` ID in
+the owned **Flex** experiment group and approved subscription. Reconciliation
+requires fresh-group and Application Insights resource receipts, the global
+enabled `SmartDetect` resource metadata, and an actual successful action-group
+write after the ledger's creation time. It reads the bounded Activity Log
+creation window and verifies the earliest successful writer through Graph:
+application `3af5a1e8-2459-45cb-8683-bcd6cccbcc13`, owned by Microsoft's tenant
+`f8cdef31-a31e-4b4a-93e4-5f571e91255a`. Display name alone is never identity proof.
+
+Preview remains read-only. Confirmed local reconciliation atomically persists
+`<ledger-stem>.provider-auxiliary.json` **before** adding that ID to the ledger.
+The non-secret record binds the run, group, receipt-backed component, Activity
+Log event/correlation/time and verified caller. Manifest loads and writes
+require that bound record whenever this auxiliary is owned. This does not
+permit spaces in other ARM paths or authorize any other action-group name,
+group, subscription or caller. Missing/truncated activity, unavailable Graph
+proof or unknown resources stay blocked. No generic adoption switch or Azure
+mutation is introduced; future cleanup still needs its separate confirmation.
+
+A failed empty bootstrap can resume with its original Functions plan and
+`-BootstrapOnly` only after reconciliation completes and pending roles are
+resolved. Preview again for a fresh bootstrap confirmation. Status remains
+`failed` during reconciliation; resume must finish infrastructure readback
+before it becomes `infrastructure_ready`. Full deployment still requires
+actual quota evidence, and reconciliation never publishes code.
+
 The existing resource-group Bicep module replaces tags. Without changing IaC,
 the scripts restore the guard tag in `finally` after deployments to a group
 whose ownership was already established. An abrupt process termination can
@@ -234,6 +305,29 @@ configured list whenever another independently scaled trigger is added.
 This fresh-evidence headroom gate is conservative admission policy—not a
 reservation, guaranteed capacity, or a strict total execution bound.
 
+#### Explicit empty Flex bootstrap for quota diagnostics
+
+If the subscription has no Function App on which to run the quota diagnostic,
+the separately approved `functions/Deploy.ps1 -BootstrapOnly` phase can create
+empty infrastructure. Preview with `-BootstrapOnly`; Apply must repeat that
+flag and supply its exact phase-bound confirmation. Normal/full confirmation
+is different and still requires fresh approved regional capacity evidence.
+
+Bootstrap requires Python 3.12/512-MB support, benchmark endpoints disabled,
+registered providers, ownership/ARM permissions and ARM validate/what-if.
+It creates no code, always-ready instances or benchmark traffic, skips
+dependency data-plane/model probes, and stops after receipt/RBAC and
+runtime/identity/settings readback. It does **not** call `config-zip`.
+Existing recorded Function Apps cannot use this new-empty-app phase.
+
+The ledger ends at `infrastructure_ready`, not `deployed`. Its non-secret
+`<ledger-stem>.bootstrap.json` companion records
+`regional_capacity=unknown_deferred`, code/dependency probes `not_run`,
+artifact/configuration bindings and the app ID for the real quota diagnostic.
+This record is **not quota evidence**. Obtain the actual diagnostic, then
+preview a normal/full deployment with `-CapacityEvidenceHash` before any code
+publication. Bootstrap resources can incur costs and remain ledger-owned.
+
 For a new ACA environment, its consumption-core quota is checked after the
 approved bootstrap and before image publication/application startup. This
 gate can leave owned bootstrap resources (including billable Basic ACR)
@@ -243,9 +337,53 @@ behind; the manifest records them for reviewed cleanup.
 
 ACA: create only the approved new group → subscription bootstrap with
 `deployApp=false` → read back roles/environment quota → rebuild the verified
-staged context against a recorded Python 3.12 base digest → isolated Docker
-login via stdin → push only to the newly owned registry → retrieve digest →
+staged context against a recorded Python 3.12 base digest → verify Linux
+imports/configuration rejection → push only to the newly owned registry → retrieve digest →
 subscription application deployment using `repository@sha256:...`.
+
+#### ACR cloud image strategy
+
+Put `"ACA_BUILD_MODE": "acr"` in the plan's non-secret `overrides`. It is
+approval-bound metadata, never an ARM runtime setting. Both WhatIf and Apply
+avoid local Docker in this mode. Only approved Apply schedules quick tasks,
+after owned registry bootstrap and capacity checks:
+
+1. A Linux/amd64 quick task pulls official `python:3.12-slim` and inspects its
+   resolved digest in ACR. No local engine or unapproved base-image fallback.
+2. A second quick task builds from that immutable digest and the sealed
+   allowlisted context. Application closure remains three workspace wheels;
+   observer closure remains two. Hashed locked requirements are unchanged.
+3. A dependent, non-root, **network-disabled** container checks Linux/amd64,
+   payload hashes, imports, and rejection of missing configuration. Only its
+   explicit success proof permits inspect/push steps. Build success alone is
+   not Linux verification.
+4. The guard verifies successful run ID/status, proof, image labels/ID,
+   run-specific output-image digest and digest-addressed registry readback.
+   `<ownership-ledger-stem>.acr.json` records source-file, artifact/lock/config,
+   task/probe/log hashes, base/build run IDs, image ID and immutable reference.
+   The original package/context metadata remains unchanged: this sidecar,
+   not an old local `linux_imports_verified` flag, is cloud verification.
+
+Only copied approved payload files and the generated task/probe definition
+enter the private ACR source upload. The repository, environment file, ARM
+private files, CLI credentials and runtime secrets never enter that context,
+task variables or build arguments. No public pipeline/Git upload, registry
+admin login, persistent scheduled task, new identity or role assignment is
+introduced. ACR uses its existing quick-task registry access.
+
+The caller needs registry-scoped quick-run/source-upload/run-read/log-read
+actions and image readback permission; the guard checks these but grants
+nothing. ACR Tasks permissions can confer substantial registry data-plane
+power; use an approved least-privilege operator. Basic ACR, stored images,
+source/log storage and cloud task compute can incur costs even when tests
+fail. Each task has a 1,200-second service timeout; local polling is bounded.
+Failure may leave owned bootstrap resources, run records, or an image whose
+publication succeeded before readback failed. Reconcile those records; do not
+claim deployment/application acceptance or silently retry through local mode.
+
+References: [ACR multi-step YAML](https://learn.microsoft.com/azure/container-registry/container-registry-tasks-reference-yaml),
+[quick-run CLI](https://learn.microsoft.com/cli/azure/acr#az-acr-run),
+[Tasks permissions](https://learn.microsoft.com/azure/role-based-access-control/built-in-roles/containers#container-registry-tasks-contributor).
 
 Flex: approved group/infrastructure → exact role readback → supported
 `az functionapp deployment source config-zip --build-remote true` (Flex
@@ -339,13 +477,19 @@ The stages are separate and default to `-Mode WhatIf`:
    **driver MI itself**; callback allowlists contain the two target app MIs.
    Grant the existing `Benchmark.Invoke` role to those three identities with
    `Ensure-BenchmarkIdentity.ps1 -Stage Grant`.
-3. Build the isolated benchmark context/image using the harness's
+3. Build the isolated benchmark context using the harness's
    `bench/Build.ps1` / `advisor_deploy.bench.build` interfaces. The deployment
    helper verifies its exact two-wheel closure, current source/lock snapshot,
    dataset/Dockerfile bytes, intended target/config hashes, MI bindings,
    approved API audience/scope, existing storage and bounded RunPlan.
-4. **Publish**: preview the exact context digest and verified local image ID.
-   Apply requires the returned confirmation, current Linux daemon readiness,
+4. **Publish**: set `"build_mode": "acr"` in the benchmark deployment plan to
+   preview the exact unbuilt context and cloud strategy. Apply performs the
+   same cloud build/probe/push sequence above; no local image ID is required
+   beforehand. The observer's cloud proof is saved alongside its deployment
+   state as `<state-stem>.acr.json`. App rechecks that proof and live run/image
+   readback. For explicit `"build_mode": "local"` (default), build the image
+   first and preview its context digest and local image ID. Apply in local
+   mode requires the returned confirmation, current Linux daemon readiness,
    image-ID/platform/entrypoint readback, and in-image hashes of the locked
    requirements, two wheels, RunPlan and dataset. Only then does it authenticate
    to the owned ACR via stdin and push that image ID. The digest emitted by
@@ -360,7 +504,8 @@ Each Apply needs the exact confirmation returned by the corresponding
 WhatIf. A sidecar stores bootstrap identity/endpoint and immutable image/plan
 provenance; deletion authority remains in the ACA ledger. Partial or uncertain
 receipt discovery is recorded and blocks reuse/cleanup until reconciled.
-Docker failure leaves Publish blocked; no remote-build fallback is added.
+Docker failure leaves local Publish blocked. Cloud mode never falls back to
+local publication, and its failed/missing Linux proof always blocks App.
 
 ### Starting the default-off observer without another app registration
 

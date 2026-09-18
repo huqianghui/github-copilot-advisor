@@ -152,8 +152,10 @@ def _prepare(path, repo, cli):
     from advisor_deploy.operations import account, assert_owned_group, _graph_owner
     data = read_json(path)
     required = {"format", "run_id", "environment_name", "aca_manifest", "functions_manifest", "api_manifest", "state_file"}
-    if set(data) - required - {"context"} or not required <= data.keys() or data["format"] != "advisor-bench-deploy-v1":
+    if set(data) - required - {"context", "build_mode"} or not required <= data.keys() or data["format"] != "advisor-bench-deploy-v1":
         raise fail("invalid_benchmark_deployment_plan")
+    if data.get("build_mode", "local") not in {"local", "acr"}:
+        raise fail("invalid_benchmark_build_mode")
     run_id = guid(data["run_id"])
     environment = data["environment_name"]
     if not isinstance(environment, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", environment):
@@ -164,7 +166,10 @@ def _prepare(path, repo, cli):
             if not isinstance(data[name], str):
                 raise fail("invalid_benchmark_plan_path")
             paths[name] = (path.parent / data[name]).absolute()
-            if has_link(paths[name]) or not paths[name].is_relative_to(repo / "deploy" / "out"):
+            if has_link(paths[name]):
+                raise fail("benchmark_plan_path_scope")
+            paths[name] = paths[name].resolve()
+            if not paths[name].is_relative_to(repo / "deploy" / "out"):
                 raise fail("benchmark_plan_path_scope")
     aca, functions, api = (load_manifest(paths[name]) for name in ("aca_manifest", "functions_manifest", "api_manifest"))
     if aca["target"] != "aca" or functions["target"] != "functions" or api["target"] != "benchmark" or aca["run_id"] != run_id:
@@ -215,7 +220,7 @@ def _prepare(path, repo, cli):
     return data, paths, aca, functions, api, state, selected
 
 
-def _verify_context(path, repo, state, aca, functions, api):
+def _verify_context(path, repo, state, aca, functions, api, require_linux=True):
     from advisor_deploy.bench.build import _locked_registry, _snapshot, verify_context
     from advisor_deploy.bench.plan import load_plan
     import tomllib
@@ -237,7 +242,7 @@ def _verify_context(path, repo, state, aca, functions, api):
             raise fail("benchmark_context_input_changed")
     run = load_plan(path / "run.json")
     validate_run_bindings(run, state, aca, functions, api)
-    if not manifest["linux_imports_verified"] or not manifest["base_image_digest"] or not manifest["image_id"]:
+    if require_linux and (not manifest["linux_imports_verified"] or not manifest["base_image_digest"] or not manifest["image_id"]):
         raise fail("benchmark_linux_image_verification_required")
     return manifest, run
 
@@ -344,13 +349,15 @@ def _record(cli, repo, paths, aca, state, selected, deployment, approved, output
 def deploy_benchmark(path, repo, cli, private, stage, supplied_confirmation):
     from advisor_deploy.operations import confirmation, deployment_arguments, require_permissions, assert_owned_group, assert_known_graph_grants
     data, paths, aca, functions, api, state, selected = _prepare(path, repo, cli)
+    cloud_build = data.get("build_mode", "local") == "acr"
     if stage not in {"Bootstrap", "Publish", "App"}:
         raise fail("invalid_benchmark_stage")
     context = run = None
     if stage != "Bootstrap":
         if "context" not in paths:
             raise fail("benchmark_context_required")
-        context, run = _verify_context(paths["context"], repo, state, aca, functions, api)
+        context, run = (_verify_context(paths["context"], repo, state, aca, functions, api, False)
+                        if cloud_build else _verify_context(paths["context"], repo, state, aca, functions, api))
         if len(api["graph"]["grants"]) != 3 or state["identity_principal_id"] not in {
             grant["principal_id"] for grant in api["graph"]["grants"]
         }:
@@ -370,6 +377,8 @@ def deploy_benchmark(path, repo, cli, private, stage, supplied_confirmation):
         "image_id": context["image_id"] if context else None,
         "image_reference": state["image_reference"] if stage == "App" else None,
     }
+    if cloud_build:
+        intent["build_mode"] = "acr"
     token = confirmation("BENCH-" + stage.upper(), "aca", aca["run_id"], intent)
     report = {"ok": True, "mode": cli.mode, "stage": stage, "scope": "resourceGroup",
               "confirmation": token, "application_validation": "not_run"}
@@ -378,6 +387,24 @@ def deploy_benchmark(path, repo, cli, private, stage, supplied_confirmation):
             return report | {"image_id": context["image_id"], "context_digest": digest(context)}
         if supplied_confirmation != token:
             raise fail("benchmark_confirmation_required")
+        if cloud_build:
+            from advisor_deploy.remote_acr import TASK_ACTIONS, evidence_path, publish_image
+            require_permissions(cli, selected["registry"]["id"], TASK_ACTIONS)
+            proof = publish_image(
+                cli, context=paths["context"], files=context["files"],
+                binding={"context_sha256": digest(context), "run_plan_sha256": digest(run.model_dump()),
+                         "source_sha256": digest(context["source_sha256"]), "lock_sha256": context["lock_sha256"]},
+                registry=selected["registry"]["name"], kind="bench", evidence_path=evidence_path(paths["state_file"]),
+            )
+            current_context, current_run = _verify_context(paths["context"], repo, state, aca, functions, api, False)
+            if digest(current_context) != digest(context) or digest(current_run.model_dump()) != digest(run.model_dump()):
+                raise fail("benchmark_context_changed_during_build")
+            state.update(phase="published", context_digest=digest(context), run_plan_digest=digest(run.model_dump()),
+                         image_id=proof["image_id"], image_reference=proof["image_reference"],
+                         base_image_digest=proof["base_image_digest"])
+            _save_state(paths["state_file"], state, repo)
+            return report | {"image_reference": state["image_reference"], "context_digest": state["context_digest"],
+                             "acr_run_id": proof["run_id"]}
         require_permissions(cli, selected["registry"]["id"], ["Microsoft.ContainerRegistry/registries/push/write"])
         if cli.run(["info", "--format", "{{.OSType}}"], "benchmark_docker_readiness", tool="docker", raw=True) != "linux":
             raise fail("benchmark_linux_engine_required")
@@ -432,9 +459,16 @@ def deploy_benchmark(path, repo, cli, private, stage, supplied_confirmation):
                      base_image_digest=context["base_image_digest"])
         _save_state(paths["state_file"], state, repo)
         return report | {"image_reference": state["image_reference"], "context_digest": state["context_digest"]}
+    if stage == "App" and cloud_build:
+        from advisor_deploy.remote_acr import evidence_path, verify_evidence
+        verify_evidence(cli, evidence_path(paths["state_file"]), kind="bench", files=context["files"],
+                        binding={"context_sha256": digest(context), "run_plan_sha256": digest(run.model_dump()),
+                                 "source_sha256": digest(context["source_sha256"]), "lock_sha256": context["lock_sha256"]},
+                        image_reference=state["image_reference"], image_id=state["image_id"],
+                        registry=selected["registry"]["name"])
     if stage == "App" and (
         state["phase"] not in {"published", "app_deployed"} or state["context_digest"] != digest(context)
-        or state["run_plan_digest"] != digest(run.model_dump()) or state["image_id"] != context["image_id"]
+        or state["run_plan_digest"] != digest(run.model_dump()) or (not cloud_build and state["image_id"] != context["image_id"])
         or not re.fullmatch(r"[a-z0-9]+\.azurecr\.io/advisor-bench@sha256:[a-f0-9]{64}", state["image_reference"])
     ):
         raise fail("benchmark_published_image_approval_required")

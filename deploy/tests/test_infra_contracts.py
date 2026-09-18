@@ -279,7 +279,9 @@ def test_flex_binding_settings_use_explicit_uami_for_both_connections(compiled_i
         assert "primaryEndpoints.queue" in settings[f"{connection}__queueServiceUri"]
     assert "primaryEndpoints.blob" in settings["AzureWebJobsStorage__blobServiceUri"]
     assert not any("table" in name.lower() for name in settings)
-    assert settings["FUNCTIONS_WORKER_PROCESS_COUNT"] == "1"
+    assert "FUNCTIONS_WORKER_PROCESS_COUNT" not in settings
+    shared = body(template, "settings")["outputs"]["settings"]["value"]
+    assert "FUNCTIONS_WORKER_PROCESS_COUNT" not in shared
     assert settings["ADVISOR_MAINTENANCE_SCHEDULE"] == "0 */5 * * * *"
     assert settings["AzureFunctionsJobHost__extensions__queues__batchSize"] == "[string(parameters('workerParallelism'))]"
     assert settings["AzureFunctionsJobHost__extensions__queues__newBatchThreshold"] == "0"

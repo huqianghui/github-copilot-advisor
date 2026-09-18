@@ -5,7 +5,7 @@ from uuid import uuid4
 import pytest
 
 
-SUB = "adca540e-984c-4cab-bc86-5d38bf979841"
+SUB = "18827cdf-a4e8-4316-a7ba-a4499139a3ec"
 GROUP = f"/subscriptions/{SUB}/resourceGroups/rg-copilot-advisor-aca-exp"
 APP = GROUP + "/providers/Microsoft.App/containerApps/test-app"
 MODEL = f"/subscriptions/{SUB}/resourceGroups/rg-dependencies/providers/Microsoft.CognitiveServices/accounts/model"

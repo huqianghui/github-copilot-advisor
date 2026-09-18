@@ -33,7 +33,7 @@ def observer_case(workflow_case):
         app = group + ("/providers/Microsoft.App/containerApps/main" if target == "aca" else "/providers/Microsoft.Web/sites/main")
         bot = group + "/providers/Microsoft.BotService/botServices/main"
         ledger = new_manifest(target, case.run_id, "fixture", "a" * 64, "b" * 64)
-        ledger.update(tenant_id="11111111-1111-1111-1111-111111111111", status="deployed")
+        ledger.update(tenant_id="4bc8a937-2b77-44c4-8790-dfc0068162f2", status="deployed")
         ledger["owned_resource_ids"] = [group, identity, storage, app, bot]
         if target == "aca":
             ledger["owned_resource_ids"] += [
@@ -60,7 +60,7 @@ def observer_case(workflow_case):
         write_manifest(path, ledger, case.repo)
         manifests[target] = path
     api = new_manifest("benchmark", case.run_id, "api-fixture", "0" * 64, "0" * 64)
-    api["tenant_id"] = "11111111-1111-1111-1111-111111111111"
+    api["tenant_id"] = "4bc8a937-2b77-44c4-8790-dfc0068162f2"
     api["graph"] = {
         "application_id": "44444444-4444-4444-4444-444444444444",
         "client_id": "55555555-5555-5555-5555-555555555555",

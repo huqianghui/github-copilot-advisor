@@ -159,7 +159,7 @@ def test_existing_example_shape_reuses_local_config_without_editing_it(tmp_path,
     env = tmp_path / "fixture.env"
     env.write_text("\n".join(f"{key}='{value or ''}'" for key, value in values.items()), encoding="utf-8")
     original = env.read_bytes()
-    scope = "/subscriptions/adca540e-984c-4cab-bc86-5d38bf979841/resourceGroups/rg-dependencies/providers/"
+    scope = "/subscriptions/18827cdf-a4e8-4316-a7ba-a4499139a3ec/resourceGroups/rg-dependencies/providers/"
     config = load_deploy_config(env, target, overrides={
         "AZURE_OPENAI_RESOURCE_ID": scope + "Microsoft.CognitiveServices/accounts/model",
         "AZURE_SEARCH_RESOURCE_ID": scope + "Microsoft.Search/searchServices/search",
@@ -227,7 +227,7 @@ def test_runtime_source_rejects_real_junction_into_forbidden_directory(tmp_path,
 def test_cli_metadata_overlay_supports_existing_file_without_resource_ids(config_case):
     path = config_case(AZURE_OPENAI_RESOURCE_ID=None, AZURE_SEARCH_RESOURCE_ID=None)
     original = path.read_bytes()
-    scope = "/subscriptions/adca540e-984c-4cab-bc86-5d38bf979841/resourceGroups/rg-dependencies/providers/"
+    scope = "/subscriptions/18827cdf-a4e8-4316-a7ba-a4499139a3ec/resourceGroups/rg-dependencies/providers/"
     result = subprocess.run(
         [sys.executable, "-m", "advisor_deploy", "config", "--target", "aca", "--env-file", str(path),
          "--set", "AZURE_OPENAI_RESOURCE_ID=" + scope + "Microsoft.CognitiveServices/accounts/model",

@@ -4,7 +4,7 @@ from dataclasses import replace
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
-from uuid import UUID, uuid5
+from uuid import UUID, uuid4, uuid5
 import argparse
 import base64
 import fnmatch
@@ -16,10 +16,11 @@ import subprocess
 import sys
 import time
 
-from advisor_deploy.config import SUBSCRIPTION
+from advisor_deploy.config import SUBSCRIPTION, TENANT, _resource_id
 from advisor_deploy.manifest import (
     GROUPS, ROLES, arm_parts, experiment_resource, fail, group_id, guid, load_manifest,
     new_manifest, read_json, timestamp, validate_cleanup_scope, validate_manifest, validate_role, write_manifest,
+    is_provider_auxiliary,
 )
 from advisor_deploy.package import BASE_IMAGE, MANIFEST, validate_package
 from advisor_deploy.render import PrivateFiles, command_environment, digest, load_plan, parameters_file, verify_current_artifact
@@ -176,6 +177,8 @@ def account(cli: Cli) -> dict:
         raise fail("active_subscription_mismatch")
     if result.get("environmentName", "AzureCloud") != "AzureCloud" or result.get("state", "Enabled") != "Enabled":
         raise fail("unsupported_cloud_or_subscription")
+    if str(result.get("tenantId", "")).lower() != TENANT:
+        raise fail("active_tenant_mismatch")
     guid(result.get("tenantId"))
     return result
 
@@ -269,7 +272,7 @@ def _runtime_record(value):
     return low, high, supported
 
 
-def require_capacity(plan, cli: Cli, approved_evidence: str | None) -> None:
+def require_capacity(plan, cli: Cli, approved_evidence: str | None, *, bootstrap_only=False) -> None:
     if plan.target != "functions":
         # New ACA environment quota is not measurable before creation.
         return
@@ -280,6 +283,8 @@ def require_capacity(plan, cli: Cli, approved_evidence: str | None) -> None:
         raise fail("flex_runtime_capacity_unverified")
     if type(settings["instanceMemoryMB"]) is not int or settings["instanceMemoryMB"] not in supported_memory:
         raise fail("flex_runtime_memory_unsupported")
+    if bootstrap_only:
+        return
     # HTTP routes share one group; the queue and timer each scale separately.
     # Revisit this list whenever another non-HTTP trigger is added.
     projected_memory_mb = len(FLEX_SCALE_GROUPS) * settings["maxInstances"] * settings["instanceMemoryMB"]
@@ -311,13 +316,22 @@ def dependency_checks(plan, cli: Cli) -> None:
     parameters = plan.config.parameters
     for kind in ("openai", "search"):
         identifier = parameters[kind + "ResourceId"]
+        mode = parameters[kind + "AuthMode"]
+        resource_type = {"openai": "Microsoft.CognitiveServices/accounts", "search": "Microsoft.Search/searchServices"}[kind]
+        _resource_id(identifier, resource_type, "dependency", auth_mode=mode)
+        name = identifier.split("/")[-1]
+        endpoint = parameters[kind + "Endpoint"].rstrip("/")
+        expected = f"https://{name}.{'openai.azure.com' if kind == 'openai' else 'search.windows.net'}"
+        if mode == "key":
+            if endpoint != expected:
+                raise fail("dependency_endpoint_mismatch")
+            continue
         data = cli.run(["resource", "show", "--ids", identifier], kind + "_resource")
         if str(data.get("id", "")).lower() != identifier.lower():
             raise fail("dependency_resource_mismatch")
         if str(data.get("location", "")).lower().replace(" ", "") != "southeastasia":
             raise fail("dependency_region_mismatch")
         properties = data.get("properties", {})
-        mode = parameters[kind + "AuthMode"]
         if mode == "key" and properties.get("disableLocalAuth"):
             raise fail("explicit_key_auth_disabled")
         if mode == "entra":
@@ -330,14 +344,17 @@ def dependency_checks(plan, cli: Cli) -> None:
         trusted = {expected, str(properties.get("endpoint", "")).rstrip("/")}
         if endpoint not in trusted:
             raise fail("dependency_endpoint_mismatch")
-    model = arm_parts(parameters["openaiResourceId"])
-    for deployment_name in ("modelDeploymentName", "embeddingDeploymentName"):
-        data = cli.run([
-            "cognitiveservices", "account", "deployment", "show", "--resource-group", model[4],
-            "--name", model[-1], "--deployment-name", parameters[deployment_name],
-        ], "model_deployment")
-        if not isinstance(data, dict) or not data.get("properties", {}).get("model"):
-            raise fail("model_deployment_unverified")
+    if parameters["openaiAuthMode"] == "key":
+        _key_model_probes(plan, cli)
+    else:
+        model = arm_parts(parameters["openaiResourceId"])
+        for deployment_name in ("modelDeploymentName", "embeddingDeploymentName"):
+            data = cli.run([
+                "cognitiveservices", "account", "deployment", "show", "--resource-group", model[4],
+                "--name", model[-1], "--deployment-name", parameters[deployment_name],
+            ], "model_deployment")
+            if not isinstance(data, dict) or not data.get("properties", {}).get("model"):
+                raise fail("model_deployment_unverified")
     headers = None
     resource = "https://search.azure.com"
     if parameters["searchAuthMode"] == "key":
@@ -352,7 +369,42 @@ def dependency_checks(plan, cli: Cli) -> None:
         raise fail("search_vector_dimensions_mismatch")
 
 
-def preflight(plan, cli: Cli, *, approved_evidence=None) -> tuple[dict, dict]:
+def _key_model_probes(plan, cli: Cli) -> None:
+    parameters = plan.config.parameters
+    headers = cli.private.json({"api-key": plan.config.secret_settings["AZURE_OPENAI_API_KEY"],
+                                "Content-Type": "application/json"})
+    base = parameters["openaiEndpoint"].rstrip("/") + "/openai/deployments/"
+    version = parameters["runtimeSettings"]["AZURE_OPENAI_API_VERSION"]
+    probes = (
+        ("embedding_key_probe", parameters["embeddingDeploymentName"], "embeddings",
+         {"input": "Deployment readiness probe."}),
+        ("model_key_probe", parameters["modelDeploymentName"], "chat/completions",
+         {"messages": [{"role": "user", "content": "Reply OK."}], "max_completion_tokens": 8}),
+    )
+    for phase, deployment, operation, body in probes:
+        payload = cli.private.json(body)
+        # Readiness inference is data-plane work, not an ARM or directory mutation.
+        result = cli.run([
+            "rest", "--method", "post", "--url", base + deployment + "/" + operation + "?api-version=" + version,
+            "--headers", "@" + str(headers), "--body", "@" + str(payload), "--skip-authorization-header",
+        ], phase, mutation=False)
+        if not isinstance(result, dict):
+            raise fail("model_data_plane_unverified")
+        if phase == "embedding_key_probe":
+            rows = result.get("data")
+            vector = rows[0].get("embedding") if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict) else None
+            if not isinstance(vector, list) or len(vector) != 3072:
+                raise fail("embedding_dimensions_mismatch")
+        elif not isinstance(result.get("choices"), list) or not result["choices"]:
+            raise fail("model_data_plane_unverified")
+
+
+def preflight(plan, cli: Cli, *, approved_evidence=None, bootstrap_only=False) -> tuple[dict, dict]:
+    if bootstrap_only and (
+        plan.target != "functions" or plan.config.parameters["instanceMemoryMB"] != 512
+        or plan.config.parameters["benchmarkEnabled"]
+    ):
+        raise fail("flex_bootstrap_requires_empty_512mb_profile")
     context = account(cli)
     if plan.config.parameters["benchmarkEnabled"]:
         if plan.benchmark_manifest is None:
@@ -382,10 +434,14 @@ def preflight(plan, cli: Cli, *, approved_evidence=None) -> tuple[dict, dict]:
             or identity.get("principalId") != driver["principal_id"]):
             raise fail("benchmark_only_driver_may_submit")
     existing = load_manifest(plan.manifest_path) if plan.manifest_path.exists() else None
+    if bootstrap_only and existing and existing["outputs"].get("app_id"):
+        raise fail("flex_bootstrap_requires_unpublished_infrastructure")
     if existing and (existing["run_id"], existing["target"], existing["environment_name"]) != (
         plan.run_id, plan.target, plan.config.parameters["environmentName"]
     ):
         raise fail("manifest_ownership_collision")
+    if existing and (not existing["discovery_complete"] or existing["pending_role_assignment_ids"]):
+        raise fail("ownership_discovery_incomplete")
     exists = cli.run(["group", "exists", "--name", plan.group], "group_exists")
     if exists and not existing:
         raise fail("resource_group_ownership_collision")
@@ -414,10 +470,14 @@ def preflight(plan, cli: Cli, *, approved_evidence=None) -> tuple[dict, dict]:
         *(["Microsoft.App/managedEnvironments/write", "Microsoft.App/containerApps/write", "Microsoft.ContainerRegistry/registries/write"]
           if plan.target == "aca" else ["Microsoft.Web/serverfarms/write", "Microsoft.Web/sites/write"]),
     ])
-    dependency_checks(plan, cli)
-    require_capacity(plan, cli, approved_evidence)
+    if not bootstrap_only:
+        dependency_checks(plan, cli)
+    require_capacity(plan, cli, approved_evidence, bootstrap_only=bootstrap_only)
     manifest["tenant_id"] = context["tenantId"]
-    token = confirmation("APPLY", plan.target, plan.run_id, [plan.artifact.content_sha256, plan.configuration_digest])
+    intent = [plan.artifact.content_sha256, plan.configuration_digest]
+    if plan.target == "functions":
+        intent.append("bootstrap_only" if bootstrap_only else "full")
+    token = confirmation("APPLY", plan.target, plan.run_id, intent)
     report = {
         "ok": True, "target": plan.target, "scope": "subscription", "resource_group": plan.group,
         "confirmation": token, "artifact_digest": plan.artifact.content_sha256,
@@ -427,6 +487,10 @@ def preflight(plan, cli: Cli, *, approved_evidence=None) -> tuple[dict, dict]:
     if plan.target == "aca" and not exists:
         report["pending_gates"].append("new_environment_vcpu_quota")
     if plan.target == "functions":
+        report["phase"] = "bootstrap_only" if bootstrap_only else "full"
+        report["regional_capacity"] = "unknown_deferred" if bootstrap_only else "confirmed"
+        if bootstrap_only:
+            report["pending_gates"] += ["flex_regional_capacity", "dependency_data_plane"]
         projected_memory_mb = len(FLEX_SCALE_GROUPS) * plan.config.parameters["maxInstances"] * plan.config.parameters["instanceMemoryMB"]
         report["capacity_projection"] = {
             "scale_groups": list(FLEX_SCALE_GROUPS), "memory_mb": projected_memory_mb,
@@ -435,72 +499,257 @@ def preflight(plan, cli: Cli, *, approved_evidence=None) -> tuple[dict, dict]:
     return report, manifest
 
 
-def _record_receipts(plan, cli: Cli, manifest: dict, deployment_name: str) -> None:
-    root = cli.run(["deployment", "sub", "show", "--name", deployment_name], "deployment_receipts")
+def _receipt_deployment_args(identifier, allowed_groups, *, operations=False):
+    if not isinstance(identifier, str):
+        raise fail("nested_deployment_scope")
+    prefix = rf"/subscriptions/{SUBSCRIPTION}"
+    match = re.fullmatch(prefix + r"/providers/Microsoft.Resources/deployments/([A-Za-z0-9_.()-]+)",
+                         identifier, re.IGNORECASE)
+    group = None
+    if match:
+        scope, name = "sub", match[1]
+    else:
+        parts = arm_parts(identifier)
+        if (len(parts) != 9 or [p.lower() for p in parts[6:8]] != ["microsoft.resources", "deployments"]
+                or parts[4].lower() not in allowed_groups):
+            raise fail("nested_deployment_scope")
+        scope, group, name = "group", parts[4], parts[8]
+    args = ["deployment", "operation", scope, "list"] if operations else ["deployment", scope, "show"]
+    args += ["--name", name]
+    if group:
+        args += ["--resource-group", group]
+    # Neither request/response bodies nor outputs/parameters enter recovery logs.
+    query = ("[].{operationId:operationId,properties:{provisioningOperation:properties.provisioningOperation,"
+             "provisioningState:properties.provisioningState,targetResource:properties.targetResource}}"
+             if operations else "{id:id,properties:{provisioningState:properties.provisioningState,outputResources:properties.outputResources}}")
+    return args + ["--query", query]
+
+
+def _record_receipts(plan, cli: Cli, manifest: dict, deployment_name: str, *, persist=True, receipt_ids=None) -> None:
+    dependencies = {
+        plan.config.parameters[kind + "ResourceId"].lower()
+        for kind in ("openai", "search") if plan.config.parameters[kind + "AuthMode"] == "entra"
+    }
+    allowed_groups = {plan.group.lower()} | {arm_parts(identifier)[4].lower() for identifier in dependencies}
+    root = f"/subscriptions/{SUBSCRIPTION}/providers/Microsoft.Resources/deployments/{deployment_name}"
     queue = [(root, 0)]
-    owned = set(manifest["owned_resource_ids"])
-    pending = set(manifest["pending_role_assignment_ids"])
+    owned = {value.lower(): value for value in manifest["owned_resource_ids"]}
+    pending = {value.lower(): value for value in manifest["pending_role_assignment_ids"]}
     seen = set()
-    while queue:
-        deployment, depth = queue.pop()
-        if depth > 16:
-            raise fail("deployment_receipt_depth")
-        receipts = deployment.get("properties", {}).get("outputResources")
-        if not isinstance(receipts, list):
-            raise fail("deployment_receipts_unavailable")
-        for receipt in receipts:
-            identifier = receipt.get("id", "")
-            if identifier in seen:
+    manifest["discovery_complete"] = False
+
+    def save():
+        manifest["owned_resource_ids"] = sorted(owned.values())
+        resolved = {role["id"].lower() for role in manifest["role_assignments"]}
+        manifest["pending_role_assignment_ids"] = sorted(v for k, v in pending.items() if k not in resolved)
+        manifest["updated_at"] = timestamp()
+        if persist:
+            write_manifest(plan.manifest_path, manifest, plan.repository)
+
+    def read(args, phase, identifier):
+        try:
+            return cli.run(args, phase)
+        except Exception as error:
+            error.receipt_deployment = identifier
+            raise
+
+    try:
+        while queue:
+            deployment_id, depth = queue.pop()
+            if deployment_id.lower() in seen:
                 continue
-            seen.add(identifier)
-            if len(seen) > 500:
+            seen.add(deployment_id.lower())
+            if depth > 16 or len(seen) > 500:
                 raise fail("deployment_receipt_limit")
-            if "/providers/microsoft.resources/deployments/" in identifier.lower():
-                parts = identifier.split("/")
-                if len(parts) != 9 or parts[2].lower() != SUBSCRIPTION:
-                    raise fail("nested_deployment_scope")
-                allowed_groups = {plan.group.lower()} | {
-                    arm_parts(plan.config.parameters[name])[4].lower() for name in ("openaiResourceId", "searchResourceId")
-                }
-                if parts[4].lower() not in allowed_groups:
-                    raise fail("nested_deployment_scope")
-                child = cli.run(["deployment", "group", "show", "--resource-group", parts[4], "--name", parts[-1]], "nested_receipts")
-                queue.append((child, depth + 1))
-            elif "/providers/microsoft.authorization/roleassignments/" in identifier.lower():
-                arm_parts(identifier)
-                pending.add(identifier)
-            else:
-                experiment_resource(identifier)
-                if arm_parts(identifier)[4].lower() != plan.group.lower():
-                    raise fail("receipt_group_mismatch")
-                owned.add(identifier)
-    manifest["owned_resource_ids"] = sorted(owned)
-    manifest["pending_role_assignment_ids"] = sorted(pending - {role["id"] for role in manifest["role_assignments"]})
-    manifest["discovery_complete"] = True
-    manifest["updated_at"] = timestamp()
-    write_manifest(plan.manifest_path, manifest, plan.repository)
-    current = inventory(cli, manifest)
-    if any(resource["id"].lower() not in {value.lower() for value in owned} for resource in current):
-        raise fail("unrecorded_resource_collision")
+            args = _receipt_deployment_args(deployment_id, allowed_groups)
+            deployment = read(args, "deployment_receipts", deployment_id)
+            if not isinstance(deployment, dict) or (
+                deployment.get("id") and deployment["id"].lower() != deployment_id.lower()
+            ):
+                raise fail("deployment_receipt_identity_mismatch")
+            properties = deployment.get("properties")
+            if not isinstance(properties, dict):
+                raise fail("deployment_receipts_unavailable")
+            state = properties.get("provisioningState")
+            if state is not None and state not in {"Succeeded", "Failed", "Canceled", "Cancelled"}:
+                raise fail("deployment_receipts_not_terminal")
+            receipts = properties.get("outputResources")
+            if receipts is not None and not isinstance(receipts, list):
+                raise fail("deployment_receipts_unavailable")
+            targets = [(item.get("id") if isinstance(item, dict) else None) for item in receipts or []]
+            if receipts is None or state in {"Failed", "Canceled", "Cancelled"}:
+                operations = read(_receipt_deployment_args(deployment_id, allowed_groups, operations=True),
+                                  "deployment_operation_receipts", deployment_id)
+                if not isinstance(operations, list) or len(operations) > 2000:
+                    raise fail("deployment_operations_unavailable")
+                for operation in operations:
+                    entry = operation.get("properties") if isinstance(operation, dict) else None
+                    if not isinstance(entry, dict):
+                        raise fail("deployment_operation_invalid")
+                    if entry.get("provisioningOperation") != "Create":
+                        continue
+                    target = entry.get("targetResource")
+                    identifier = target.get("id") if isinstance(target, dict) else None
+                    if not isinstance(identifier, str):
+                        raise fail("deployment_operation_target_missing")
+                    nested = "/providers/microsoft.resources/deployments/" in identifier.lower()
+                    # Failed nested deployments may contain successful creates.
+                    # Read/Action and failed leaf writes never prove ownership.
+                    if nested or entry.get("provisioningState") == "Succeeded":
+                        targets.append(identifier)
+            for identifier in targets:
+                if not isinstance(identifier, str):
+                    raise fail("deployment_receipt_invalid")
+                if "/providers/microsoft.resources/deployments/" in identifier.lower():
+                    _receipt_deployment_args(identifier, allowed_groups)
+                    queue.append((identifier, depth + 1))
+                elif "/providers/microsoft.authorization/roleassignments/" in identifier.lower():
+                    parts = arm_parts(identifier)
+                    scope = "/".join(parts[:-4])
+                    if [p.lower() for p in parts[-4:-1]] != ["providers", "microsoft.authorization", "roleassignments"]:
+                        raise fail("receipt_role_scope_mismatch")
+                    guid(parts[-1])
+                    if scope.lower() not in dependencies and arm_parts(scope)[4].lower() != plan.group.lower():
+                        raise fail("receipt_role_scope_mismatch")
+                    pending.setdefault(identifier.lower(), identifier)
+                else:
+                    experiment_resource(identifier)
+                    if arm_parts(identifier)[4].lower() != plan.group.lower():
+                        raise fail("receipt_group_mismatch")
+                    if receipt_ids is not None:
+                        receipt_ids.add(identifier)
+                    # This exact auxiliary always requires its separate provider
+                    # provenance; an ordinary ARM receipt cannot bypass it.
+                    if not is_provider_auxiliary(identifier):
+                        owned.setdefault(identifier.lower(), identifier)
+                if len(owned) + len(pending) > 500:
+                    raise fail("deployment_receipt_limit")
+            save()
+        unknown = sorted(resource["id"] for resource in inventory(cli, manifest) if resource["id"].lower() not in owned)
+        if unknown:
+            error = fail("unrecorded_resource_collision")
+            error.unrecorded_resource_ids = unknown
+            raise error
+        manifest["discovery_complete"] = True
+    finally:
+        save()
 
 
-def _record_roles(plan, cli: Cli, manifest: dict) -> None:
+def _record_roles(plan, cli: Cli, manifest: dict, *, partial=False, persist=True) -> None:
     outputs = manifest["outputs"]
+    identities = {}
+    if partial:
+        for identifier in manifest["owned_resource_ids"]:
+            if "/providers/microsoft.managedidentity/userassignedidentities/" not in identifier.lower():
+                continue
+            identity = cli.run(["identity", "show", "--ids", identifier, "--query",
+                                "{id:id,principalId:principalId,clientId:clientId,tenantId:tenantId}"], "receipt_identity_readback")
+            if identity.get("id", "").lower() != identifier.lower() or identity.get("tenantId", "").lower() != manifest["tenant_id"]:
+                raise fail("receipt_identity_mismatch")
+            principal = guid(identity.get("principalId"))
+            guid(identity.get("clientId"))
+            if principal in identities:
+                raise fail("receipt_identity_ambiguous")
+            identities[principal] = identifier
     for identifier in list(manifest["pending_role_assignment_ids"]):
         value = cli.rest("get", ARM + identifier + "?api-version=2022-04-01", "role_readback")
         properties = value.get("properties", {})
+        principal = properties.get("principalId")
+        identity_id = identities.get(str(principal).lower()) if partial else outputs["identity_id"]
+        if not identity_id or (not partial and principal != outputs["identity_principal_id"]):
+            raise fail("role_principal_mismatch")
         record = {
             "id": identifier, "scope": "/".join(identifier.split("/")[:-4]),
-            "identity_id": outputs["identity_id"], "principal_id": properties.get("principalId"),
+            "identity_id": identity_id, "principal_id": principal,
             "role_definition_id": properties.get("roleDefinitionId"),
         }
-        if record["principal_id"] != outputs["identity_principal_id"]:
-            raise fail("role_principal_mismatch")
+        if partial and arm_parts(record["scope"])[4].lower() == plan.group.lower() and (
+            record["scope"].lower() not in {v.lower() for v in manifest["owned_resource_ids"]}
+        ):
+            raise fail("receipt_role_scope_not_owned")
         validate_role(record, manifest["owned_resource_ids"])
         manifest["role_assignments"] = [role for role in manifest["role_assignments"] if role["id"] != identifier] + [record]
         manifest["pending_role_assignment_ids"].remove(identifier)
-        write_manifest(plan.manifest_path, manifest, plan.repository)
-    require_runtime_roles(plan, manifest)
+        if persist:
+            write_manifest(plan.manifest_path, manifest, plan.repository)
+    if not partial:
+        require_runtime_roles(plan, manifest)
+
+
+def reconcile_receipts(path, repo, cli, deployment_name=None, supplied_confirmation=None):
+    from copy import deepcopy
+    from types import SimpleNamespace
+    from advisor_deploy.paths import has_link
+    if not path.is_relative_to(repo / "deploy" / "out") or ".." in path.parts or has_link(path):
+        raise fail("reconcile_manifest_scope")
+    original = load_manifest(path)
+    if original["target"] not in {"aca", "functions"} or original["status"] not in {"failed", "provisioning", "infrastructure_ready"}:
+        raise fail("reconcile_partial_deployment_required")
+    context = account(cli)
+    if original["tenant_id"] != context["tenantId"]:
+        raise fail("tenant_changed")
+    expected = f"advisor-{original['target']}-{original['run_id']}-"
+    deployment_name = deployment_name or expected + "infra"
+    if deployment_name not in {expected + suffix for suffix in (("infra", "app") if original["target"] == "aca" else ("infra",))}:
+        raise fail("reconcile_deployment_scope")
+    group = cli.run(["group", "show", "--name", original["resource_group"]], "reconcile_group_ownership")
+    if (group.get("id", "").lower() != group_id(original["target"]).lower()
+            or group.get("tags", {}).get(OWNER_TAG) != original["run_id"]
+            or group_id(original["target"]).lower() not in {v.lower() for v in original["owned_resource_ids"]}):
+        raise fail("resource_group_ownership_collision")
+    parameters = {}
+    for kind in ("openai", "search"):
+        parameters[kind + "AuthMode"] = original["summary"].get(kind + "_auth", "key")
+        if parameters[kind + "AuthMode"] == "entra":
+            parameters[kind + "ResourceId"] = original["dependencies"][kind]
+    plan = SimpleNamespace(repository=repo, manifest_path=path, group=original["resource_group"],
+                           target=original["target"], config=SimpleNamespace(parameters=parameters))
+    proposed = deepcopy(original)
+    unknown = []
+    receipt_ids = set()
+    try:
+        _record_receipts(plan, cli, proposed, deployment_name, persist=False, receipt_ids=receipt_ids)
+    except ValueError as error:
+        if str(error) != "deployment guard: unrecorded_resource_collision" or not getattr(error, "unrecorded_resource_ids", None):
+            raise
+        unknown = error.unrecorded_resource_ids
+    from advisor_deploy.provider_auxiliary import prove_auxiliary, save_provenance
+    proofs, auxiliary_errors, remaining = [], [], []
+    for identifier in unknown:
+        if not is_provider_auxiliary(identifier):
+            remaining.append(identifier)
+            continue
+        try:
+            proof = prove_auxiliary(cli, proposed, receipt_ids, identifier)
+        except (ValueError, CliFailure) as error:
+            auxiliary_errors.append({"resource_id": identifier, **_recovery_error(error)})
+            remaining.append(identifier)
+        else:
+            proofs.append(proof)
+            proposed["owned_resource_ids"].append(identifier)
+    unknown = remaining
+    proposed["owned_resource_ids"].sort()
+    proposed["discovery_complete"] = not unknown
+    _record_roles(plan, cli, proposed, partial=True, persist=False)
+    intent = [deployment_name, digest(original), proposed["owned_resource_ids"], proposed["role_assignments"],
+              unknown, proofs, auxiliary_errors]
+    token = confirmation("RECONCILE", original["target"], original["run_id"], intent)
+    report = {"ok": True, "mode": cli.mode, "confirmation": token, "deployment_name": deployment_name,
+              "status": original["status"], "resource_count": len(proposed["owned_resource_ids"]),
+              "role_count": len(proposed["role_assignments"]), "discovery_complete": proposed["discovery_complete"],
+              "resume_allowed": proposed["discovery_complete"] and not proposed["pending_role_assignment_ids"],
+              "blockers": ["unrecorded_resource_collision"] if unknown else [], "unrecorded_resource_ids": unknown,
+              "provider_auxiliary_evidence": proofs, "provider_auxiliary_errors": auxiliary_errors,
+              "application_validation": "not_run", "azure_mutations": False}
+    if cli.mode == "Apply":
+        if supplied_confirmation != token:
+            raise fail("reconcile_confirmation_required")
+        if read_json(path) != original:
+            raise fail("reconcile_manifest_changed")
+        for proof in proofs:
+            save_provenance(path, proposed, proof, repo)
+        write_manifest(path, proposed, repo)
+    return report
 
 
 def require_runtime_roles(plan, manifest: dict) -> None:
@@ -527,6 +776,40 @@ def require_runtime_roles(plan, manifest: dict) -> None:
         raise fail("required_application_roles_missing")
 
 
+def _recovery_error(error, phase=None):
+    code = error.code if isinstance(error, CliFailure) else (
+        str(error).removeprefix("deployment guard: ") if str(error).startswith("deployment guard: ") else "recovery_failed"
+    )
+    if not isinstance(code, str) or not re.fullmatch(r"[A-Za-z0-9_ :.-]{1,160}", code):
+        code = "recovery_failed"
+    result = {"phase": phase or (error.phase if isinstance(error, CliFailure) else "guard"), "code": code}
+    if getattr(error, "receipt_deployment", None):
+        result["deployment_id"] = error.receipt_deployment
+    return result
+
+
+def _save_recovery_report(plan, manifest, deployment_name, primary, errors):
+    from advisor_deploy.paths import has_link
+    path = plan.manifest_path.with_suffix(".recovery.json")
+    if not path.is_relative_to(plan.repository / "deploy" / "out") or ".." in path.parts or has_link(path):
+        raise fail("recovery_report_scope")
+    pending = path.with_name(path.name + "." + uuid4().hex + ".next")
+    value = {
+        "format": "advisor-receipt-recovery-v1", "deployment_name": deployment_name,
+        "run_id": plan.run_id, "primary_error": _recovery_error(primary) if primary else None,
+        "recovery_errors": errors, "discovery_complete": manifest["discovery_complete"],
+        "resource_count": len(manifest["owned_resource_ids"]),
+        "pending_role_count": len(manifest["pending_role_assignment_ids"]), "observed_at": timestamp(),
+    }
+    try:
+        with pending.open("x", encoding="utf-8", newline="\n") as stream:
+            json.dump(value, stream, sort_keys=True, indent=2)
+            stream.write("\n")
+        pending.replace(path)
+    finally:
+        pending.unlink(missing_ok=True)
+
+
 def _infra_apply(plan, cli: Cli, manifest: dict, parameters: Path, suffix: str) -> None:
     # This caller has already proved ownership (or created the new group).
     # The current RG Bicep module replaces tags, so restore the ownership marker
@@ -534,21 +817,47 @@ def _infra_apply(plan, cli: Cli, manifest: dict, parameters: Path, suffix: str) 
     deployment_name = f"advisor-{plan.target}-{plan.run_id}-{suffix}"
     manifest["discovery_complete"] = False
     write_manifest(plan.manifest_path, manifest, plan.repository)
+    primary = None
     try:
         result = cli.run(deployment_arguments(plan.target, "create",
             plan.repository / "deploy" / plan.target / "infra" / "main.bicep", parameters,
             deployment_name), "infrastructure_apply", mutation=True)
-        values = result.get("properties", {}).get("outputs", {})
+        values = result.get("properties", {}).get("outputs")
+        if not isinstance(values, dict):
+            raise fail("deployment_outputs_unavailable")
         outputs = {name: value["value"] for name, value in values.items()}
         _record_receipts(plan, cli, manifest, deployment_name)
         manifest["outputs"] = outputs
         manifest["pending_role_assignment_ids"] = sorted(set(manifest["pending_role_assignment_ids"]) | set(outputs.get("created_role_assignment_ids", [])))
         write_manifest(plan.manifest_path, manifest, plan.repository)
         _record_roles(plan, cli, manifest)
+    except BaseException as error:
+        primary = error
+        raise
     finally:
-        cli.run(["group", "update", "--name", plan.group, "--set", f"tags.{OWNER_TAG}={plan.run_id}"], "restore_ownership_tag", mutation=True)
+        failures = []
+        try:
+            cli.run(["group", "update", "--name", plan.group, "--set", f"tags.{OWNER_TAG}={plan.run_id}"], "restore_ownership_tag", mutation=True)
+        except Exception as error:
+            failures.append((_recovery_error(error, "restore_ownership_tag"), error))
         if not manifest["discovery_complete"]:
-            _record_receipts(plan, cli, manifest, deployment_name)
+            try:
+                _record_receipts(plan, cli, manifest, deployment_name)
+            except Exception as error:
+                failures.append((_recovery_error(error, "receipt_recovery"), error))
+        if primary is not None or failures:
+            diagnostics = [item for item, _ in failures]
+            try:
+                _save_recovery_report(plan, manifest, deployment_name, primary, diagnostics)
+            except Exception as error:
+                diagnostics.append(_recovery_error(error, "recovery_report"))
+                if primary is None and not failures:
+                    failures.append((diagnostics[-1], error))
+            if primary is not None:
+                primary.recovery_errors = diagnostics
+            elif failures:
+                failures[0][1].recovery_errors = diagnostics
+                raise failures[0][1]
 
 
 def verify_app(plan, cli: Cli, manifest: dict) -> None:
@@ -592,7 +901,6 @@ def verify_app(plan, cli: Cli, manifest: dict) -> None:
             "AdvisorQueue__queueServiceUri": outputs["queue_url"],
             "AzureWebJobsStorage__credential": "managedidentity", "AzureWebJobsStorage__clientId": outputs["identity_client_id"],
             "AzureWebJobsStorage__blobServiceUri": outputs["blob_url"], "AzureWebJobsStorage__queueServiceUri": outputs["queue_url"],
-            "FUNCTIONS_WORKER_PROCESS_COUNT": "1",
             "AzureFunctionsJobHost__extensions__queues__batchSize": str(params["workerParallelism"]),
             "AzureFunctionsJobHost__extensions__queues__newBatchThreshold": "0",
         }.items():
@@ -640,18 +948,20 @@ def build_current_image(plan, cli: Cli, tag: str):
     return validate_package(plan.artifact_path)
 
 
-def deploy(plan, cli: Cli, private: PrivateFiles, supplied_confirmation: str | None, approved_evidence=None) -> dict:
-    report, manifest = preflight(plan, cli, approved_evidence=approved_evidence)
+def deploy(plan, cli: Cli, private: PrivateFiles, supplied_confirmation: str | None, approved_evidence=None, *, bootstrap_only=False) -> dict:
+    report, manifest = preflight(plan, cli, approved_evidence=approved_evidence, bootstrap_only=bootstrap_only)
     template = plan.repository / "deploy" / plan.target / "infra" / "main.bicep"
     params = parameters_file(plan, private)
     name = f"advisor-{plan.target}-{plan.run_id}"
     cli.run(deployment_arguments(plan.target, "validate", template, params, name), "template_validate")
     cli.run(deployment_arguments(plan.target, "what-if", template, params, name), "template_what_if")
     if cli.mode == "WhatIf":
-        return report | {"mode": "WhatIf", "planned_stages": ["bootstrap", "build/push", "immutable-app"] if plan.target == "aca" else ["infrastructure", "OneDeploy-remote-build"]}
+        stages = (["empty-infrastructure"] if bootstrap_only else
+                  ["bootstrap", "build/push", "immutable-app"] if plan.target == "aca" else ["infrastructure", "OneDeploy-remote-build"])
+        return report | {"mode": "WhatIf", "planned_stages": stages}
     if supplied_confirmation != report["confirmation"]:
         raise fail("apply_confirmation_required")
-    if plan.target == "aca":
+    if plan.target == "aca" and plan.config.build_mode == "local":
         if cli.run(["info", "--format", "{{.OSType}}"], "docker_readiness", tool="docker", raw=True) != "linux":
             raise CliFailure("docker_readiness", "linux_engine_required")
     manifest.update(artifact_digest=plan.artifact.content_sha256, config_digest=plan.configuration_digest,
@@ -670,6 +980,24 @@ def deploy(plan, cli: Cli, private: PrivateFiles, supplied_confirmation: str | N
         else:
             assert_owned_group(cli, manifest)
         _infra_apply(plan, cli, manifest, params, "infra")
+        if bootstrap_only:
+            verify_app(plan, cli, manifest)
+            manifest.update(status="infrastructure_ready", updated_at=timestamp())
+            write_manifest(plan.manifest_path, manifest, plan.repository)
+            from advisor_deploy.paths import has_link
+            record_path = plan.manifest_path.with_suffix(".bootstrap.json")
+            if has_link(record_path):
+                raise fail("bootstrap_record_link_forbidden")
+            record = private.json({
+                "format": "advisor-flex-bootstrap-v1", "phase": "bootstrap_only", "run_id": plan.run_id,
+                "status": "infrastructure_ready", "regional_capacity": "unknown_deferred",
+                "code_publication": "not_run", "dependency_data_plane": "not_run",
+                "app_id": manifest["outputs"]["app_id"], "artifact_digest": manifest["artifact_digest"],
+                "config_digest": manifest["config_digest"], "observed_at": timestamp(),
+            })
+            record.replace(record_path)
+            return report | {"mode": "Apply", "status": "infrastructure_ready",
+                             "app_id": manifest["outputs"]["app_id"], "code_publication": "not_run"}
         manifest["status"] = "infrastructure_ready"
         write_manifest(plan.manifest_path, manifest, plan.repository)
         plan.artifact = verify_current_artifact(plan.artifact_path, plan.repository, plan.config)
@@ -685,29 +1013,43 @@ def deploy(plan, cli: Cli, private: PrivateFiles, supplied_confirmation: str | N
                        for item in usage.get("value", [])):
                 raise fail("aca_environment_quota_unverified")
             registry = next(value for value in resources if value["type"].lower() == "microsoft.containerregistry/registries")
-            local_tag = "advisor-local:" + plan.run_id
-            # Rebuild current verified bytes. An older true flag is not proof.
-            plan.artifact = build_current_image(plan, cli, local_tag)
-            plan.artifact = verify_current_artifact(plan.artifact_path, plan.repository, plan.config)
-            manifest["artifact_digest"] = plan.artifact.content_sha256
+            if plan.config.build_mode == "acr":
+                from advisor_deploy.remote_acr import TASK_ACTIONS, evidence_path, publish_image
+                require_permissions(cli, registry["id"], TASK_ACTIONS)
+                proof = publish_image(
+                    cli, context=plan.artifact_path, files=plan.artifact.files,
+                    binding={"artifact_sha256": plan.artifact.content_sha256,
+                             "lock_sha256": plan.artifact.lock_sha256, "config_sha256": plan.configuration_digest},
+                    registry=registry["name"], kind="aca", evidence_path=evidence_path(plan.manifest_path),
+                )
+                plan.artifact = verify_current_artifact(plan.artifact_path, plan.repository, plan.config)
+                if proof["binding"]["artifact_sha256"] != plan.artifact.content_sha256:
+                    raise fail("acr_artifact_changed")
+                manifest["image_reference"] = proof["image_reference"]
+            else:
+                local_tag = "advisor-local:" + plan.run_id
+                # Rebuild current verified bytes. An older true flag is not proof.
+                plan.artifact = build_current_image(plan, cli, local_tag)
+                plan.artifact = verify_current_artifact(plan.artifact_path, plan.repository, plan.config)
+                manifest["artifact_digest"] = plan.artifact.content_sha256
+                write_manifest(plan.manifest_path, manifest, plan.repository)
+                login = cli.run(["acr", "login", "--name", registry["name"], "--expose-token"], "acr_token", mutation=True)
+                server = login.get("loginServer", "")
+                if not re.fullmatch(r"[a-z0-9]+\.azurecr\.io", server) or not isinstance(login.get("accessToken"), str):
+                    raise fail("invalid_registry_login")
+                (private.directory / "docker").mkdir()
+                cli.run(["login", server, "--username", "00000000-0000-0000-0000-000000000000", "--password-stdin"],
+                        "docker_login", mutation=True, tool="docker", raw=True, stdin=login["accessToken"] + "\n")
+                image = "advisor:" + plan.run_id
+                cli.run(["tag", local_tag, server + "/" + image], "image_tag", mutation=True, tool="docker", raw=True)
+                cli.run(["push", server + "/" + image], "image_push", mutation=True, tool="docker", raw=True)
+                value = cli.run(["acr", "repository", "show", "--name", registry["name"], "--image", image], "image_digest")
+                immutable = value.get("digest", "")
+                if not re.fullmatch(r"sha256:[a-f0-9]{64}", immutable):
+                    raise fail("registry_digest_unverified")
+                manifest["image_reference"] = server + "/advisor@" + immutable
             write_manifest(plan.manifest_path, manifest, plan.repository)
-            login = cli.run(["acr", "login", "--name", registry["name"], "--expose-token"], "acr_token", mutation=True)
-            server = login.get("loginServer", "")
-            if not re.fullmatch(r"[a-z0-9]+\.azurecr\.io", server) or not isinstance(login.get("accessToken"), str):
-                raise fail("invalid_registry_login")
-            (private.directory / "docker").mkdir()
-            cli.run(["login", server, "--username", "00000000-0000-0000-0000-000000000000", "--password-stdin"],
-                    "docker_login", mutation=True, tool="docker", raw=True, stdin=login["accessToken"] + "\n")
-            image = "advisor:" + plan.run_id
-            cli.run(["tag", local_tag, server + "/" + image], "image_tag", mutation=True, tool="docker", raw=True)
-            cli.run(["push", server + "/" + image], "image_push", mutation=True, tool="docker", raw=True)
-            value = cli.run(["acr", "repository", "show", "--name", registry["name"], "--image", image], "image_digest")
-            immutable = value.get("digest", "")
-            if not re.fullmatch(r"sha256:[a-f0-9]{64}", immutable):
-                raise fail("registry_digest_unverified")
-            manifest["image_reference"] = server + "/advisor@" + immutable
-            write_manifest(plan.manifest_path, manifest, plan.repository)
-            params = parameters_file(plan, private, deploy_app=True, image="advisor@" + immutable)
+            params = parameters_file(plan, private, deploy_app=True, image=manifest["image_reference"].split("/", 1)[1])
             _infra_apply(plan, cli, manifest, params, "app")
         else:
             manifest["status"] = "publishing"
@@ -1041,7 +1383,7 @@ def cleanup(path: Path, repo: Path, cli: Cli, supplied_confirmation: str | None,
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="advisor-deploy-operations")
-    parser.add_argument("operation", choices=["preflight", "deploy", "identity", "set-mode", "cleanup", "bench-deploy", "bench-control"])
+    parser.add_argument("operation", choices=["preflight", "deploy", "identity", "set-mode", "cleanup", "bench-deploy", "bench-control", "reconcile"])
     parser.add_argument("--repository", type=Path, required=True)
     parser.add_argument("--private-directory", type=Path, required=True)
     parser.add_argument("--parameters-file", type=Path)
@@ -1049,7 +1391,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--target", choices=["aca", "functions"])
     parser.add_argument("--mode", choices=["WhatIf", "Apply"], default="WhatIf")
     parser.add_argument("--confirmation")
+    parser.add_argument("--deployment-name")
     parser.add_argument("--capacity-evidence-hash")
+    parser.add_argument("--bootstrap-only", action="store_true")
     parser.add_argument("--stage", choices=["Register", "Grant"], default="Register")
     parser.add_argument("--scale", choices=["Resident", "ScaleToZero"], default="ScaleToZero")
     parser.add_argument("--traffic-stopped", action="store_true")
@@ -1058,6 +1402,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bench-action", choices=["start", "status"], default="status")
     args = parser.parse_args(argv)
     try:
+        if args.bootstrap_only and (args.operation != "deploy" or args.target != "functions"):
+            raise fail("bootstrap_only_requires_functions_deploy")
         repo = args.repository.resolve()
         private = PrivateFiles(args.private_directory, repo)
         cli = Cli("WhatIf" if args.operation == "preflight" else args.mode, repo, private)
@@ -1078,7 +1424,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.operation == "preflight":
                 report, _ = preflight(plan, cli, approved_evidence=args.capacity_evidence_hash)
             else:
-                report = deploy(plan, cli, private, args.confirmation, args.capacity_evidence_hash)
+                report = deploy(plan, cli, private, args.confirmation, args.capacity_evidence_hash,
+                                bootstrap_only=args.bootstrap_only)
         elif args.operation == "identity":
             if args.parameters_file is None:
                 raise fail("benchmark_plan_required")
@@ -1088,16 +1435,24 @@ def main(argv: list[str] | None = None) -> int:
                 raise fail("ownership_manifest_required")
             if args.operation == "set-mode":
                 report = set_mode(args.outputs_file.absolute(), repo, cli, args.scale, args.confirmation)
+            elif args.operation == "reconcile":
+                report = reconcile_receipts(args.outputs_file.absolute(), repo, cli, args.deployment_name, args.confirmation)
             else:
                 report = cleanup(args.outputs_file.absolute(), repo, cli, args.confirmation, args.traffic_stopped, args.in_flight)
         print(json.dumps(report, sort_keys=True))
         return 0
     except CliFailure as error:
         report = {"ok": False, "error": {"phase": error.phase, "code": error.code, "exit_code": error.exit_code}}
+        if getattr(error, "receipt_deployment", None):
+            report["receipt_deployment"] = error.receipt_deployment
+        if getattr(error, "recovery_errors", None):
+            report["recovery_errors"] = error.recovery_errors
     except Exception as error:
         message = str(error)
         code = message.removeprefix("deployment guard: ") if message.startswith("deployment guard: ") else "configuration_or_artifact_rejected"
         report = {"ok": False, "error": {"phase": "guard", "code": code if re.fullmatch(r"[A-Za-z0-9_ :.-]{1,160}", code) else "invalid_input"}}
+        if getattr(error, "recovery_errors", None):
+            report["recovery_errors"] = error.recovery_errors
     print(json.dumps(report, sort_keys=True))
     return 2
 

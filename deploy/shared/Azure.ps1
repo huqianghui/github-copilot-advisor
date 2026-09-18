@@ -3,7 +3,7 @@
 param([switch]$CheckPrivateDirectory, [string]$Directory)
 
 $script:AdvisorRepository = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
-$script:AdvisorSubscription = 'adca540e-984c-4cab-bc86-5d38bf979841'
+$script:AdvisorSubscription = '18827cdf-a4e8-4316-a7ba-a4499139a3ec'
 
 function Assert-AdvisorNoLinks {
     param([Parameter(Mandatory)][string]$Path)

@@ -13,7 +13,12 @@ from dotenv.parser import parse_stream
 from advisor_deploy.paths import has_link
 
 
-SUBSCRIPTION = "adca540e-984c-4cab-bc86-5d38bf979841"
+SUBSCRIPTION = "18827cdf-a4e8-4316-a7ba-a4499139a3ec"
+TENANT = "4bc8a937-2b77-44c4-8790-dfc0068162f2"
+APPROVED_KEY_DEPENDENCIES = {
+    "Microsoft.CognitiveServices/accounts": "/subscriptions/adca540e-984c-4cab-bc86-5d38bf979841/resourceGroups/rg-ai-services-all/providers/Microsoft.CognitiveServices/accounts/cdc-ai-foundry-southeastasia-res",
+    "Microsoft.Search/searchServices": "/subscriptions/adca540e-984c-4cab-bc86-5d38bf979841/resourceGroups/rg-playground-aiservices/providers/Microsoft.Search/searchServices/cdc-playground-ai-search",
+}
 SECRET_NAMES = frozenset({
     "AZURE_OPENAI_API_KEY", "AZURE_SEARCH_API_KEY",
     "GITHUB_TOKEN", "TAVILY_API_KEY", "BRAVE_API_KEY",
@@ -43,7 +48,7 @@ COMMON_NAMES = frozenset({
     "BENCHMARK_RECEIVER_URL", "BENCHMARK_RECEIVER_AUDIENCE",
 })
 TARGET_NAMES = {
-    "aca": frozenset({"ACA_MIN_REPLICAS", "ACA_RESOURCE_PROFILE", "ACA_IMAGE", "ACA_DEPLOY_APP"}),
+    "aca": frozenset({"ACA_MIN_REPLICAS", "ACA_RESOURCE_PROFILE", "ACA_IMAGE", "ACA_DEPLOY_APP", "ACA_BUILD_MODE"}),
     "functions": frozenset({"FUNCTIONS_INSTANCE_MEMORY_MB", "FUNCTIONS_PACKAGE_IDENTIFIER"}),
 }
 
@@ -80,12 +85,14 @@ class DeployConfig:
     ignored_names: tuple[str, ...] = ()
     subscription_id: str = SUBSCRIPTION
     deployment_scope: str = "subscription"
+    build_mode: str = "local"
 
     def public_summary(self) -> dict[str, object]:
         return {
             "target": self.target,
             "subscription_id": self.subscription_id,
             "deployment_scope": self.deployment_scope,
+            "build_mode": self.build_mode,
             "location": "southeastasia",
             "configured_parameters": sorted(self.parameters),
             "configured_secret_names": sorted(self.secret_settings),
@@ -157,7 +164,10 @@ def _endpoint(value: str, name: str) -> str:
     return value
 
 
-def _resource_id(value: str, resource_type: str, name: str) -> str:
+def _resource_id(value: str, resource_type: str, name: str, *, auth_mode: str = "entra") -> str:
+    if (auth_mode == "key" and resource_type in APPROVED_KEY_DEPENDENCIES
+            and value.lower() == APPROVED_KEY_DEPENDENCIES[resource_type].lower()):
+        return value
     pattern = rf"/subscriptions/{SUBSCRIPTION}/resourceGroups/[A-Za-z0-9_.()-]+/providers/{resource_type}/[A-Za-z0-9_.-]+"
     if not re.fullmatch(pattern, value, flags=re.IGNORECASE):
         raise _invalid(name)
@@ -266,8 +276,10 @@ def load_deploy_config(
     parameters: dict[str, object] = {
         "location": "southeastasia",
         "environmentName": _identifier(values.get("AZURE_ENV_NAME", "copilot-advisor-exp"), "environment name"),
-        "openaiResourceId": _resource_id(_required(values, "AZURE_OPENAI_RESOURCE_ID"), "Microsoft.CognitiveServices/accounts", "model resource"),
-        "searchResourceId": _resource_id(_required(values, "AZURE_SEARCH_RESOURCE_ID"), "Microsoft.Search/searchServices", "search resource"),
+        "openaiResourceId": _resource_id(_required(values, "AZURE_OPENAI_RESOURCE_ID"), "Microsoft.CognitiveServices/accounts", "model resource",
+                                       auth_mode=values.get("AZURE_OPENAI_AUTH_MODE", "entra")),
+        "searchResourceId": _resource_id(_required(values, "AZURE_SEARCH_RESOURCE_ID"), "Microsoft.Search/searchServices", "search resource",
+                                       auth_mode=values.get("AZURE_SEARCH_AUTH_MODE", "entra")),
         "openaiEndpoint": _endpoint(_required(values, "AZURE_OPENAI_ENDPOINT"), "model endpoint"),
         "searchEndpoint": _endpoint(_required(values, "AZURE_SEARCH_ENDPOINT"), "search endpoint"),
         "modelDeploymentName": _identifier(_required(values, "AZURE_OPENAI_CHAT_DEPLOYMENT"), "model deployment"),
@@ -334,4 +346,5 @@ def load_deploy_config(
             ("ESCALATION_CONFIG", "escalation.yaml"), ("DIAGNOSTICS_CONFIG", "diagnostics.yaml")
         )},
         files, SecretSettings(secrets), ignored_names=tuple(sorted(ignored)),
+        build_mode=_choice(values, "ACA_BUILD_MODE", "local", {"local", "acr"}) if target == "aca" else "local",
     )

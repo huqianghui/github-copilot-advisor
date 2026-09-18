@@ -137,7 +137,7 @@ class PreparedPlan:
 
     @property
     def configuration_digest(self) -> str:
-        return digest(self.config.parameters)
+        return digest({"parameters": self.config.parameters, "build_mode": self.config.build_mode})
 
     def summary(self) -> dict:
         parameters = self.config.parameters
@@ -170,6 +170,7 @@ def load_plan(path: Path, repo: Path, target: str) -> PreparedPlan:
         paths[field] = (path.parent / data[field]).absolute()
         if has_link(paths[field]):
             raise fail("plan_link_forbidden")
+        paths[field] = paths[field].resolve()
     manifest_path = paths["manifest"]
     if not manifest_path.is_relative_to(repo / "deploy" / "out") or manifest_path.suffix != ".json":
         raise fail("manifest_output_scope")
@@ -182,8 +183,13 @@ def load_plan(path: Path, repo: Path, target: str) -> PreparedPlan:
     benchmark = data.get("benchmark_manifest")
     if benchmark is not None and not isinstance(benchmark, str):
         raise fail("invalid_benchmark_manifest_path")
+    benchmark_path = (path.parent / benchmark).absolute() if benchmark else None
+    if benchmark_path is not None:
+        if has_link(benchmark_path):
+            raise fail("plan_link_forbidden")
+        benchmark_path = benchmark_path.resolve()
     return PreparedPlan(repo, run_id, target, paths["env_file"], paths["artifact"], manifest_path, config, artifact,
-                        data.get("capacity_evidence"), (path.parent / benchmark).absolute() if benchmark else None)
+                        data.get("capacity_evidence"), benchmark_path)
 
 
 class PrivateFiles:

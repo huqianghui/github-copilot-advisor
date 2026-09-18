@@ -430,13 +430,16 @@ def write_result(result: RunResult, path: Path) -> None:
 
 def render_report(result: RunResult, *, stage_logs: StageLogImport | None = None) -> str:
     summary = summarize(result.samples, window_seconds=result.window_seconds)
+    functional_smoke = result.profile == "cloud-smoke"
     complete = sum(count for status, count in summary.counts.items() if status != "censored")
     target = (result.plan.get("warmup_requests", 3) if result.profile == "warmup" else
               result.plan.get("warm_target", 100) if result.profile == "warm" else
               1 if result.profile == "cold" else result.plan.get("target_completions", 50))
     minimum = 0 if result.profile in {"cold", "warmup"} else result.plan.get("min_seconds", 180)
     sufficient = complete >= target and result.submission_seconds >= minimum
-    mode = "LOCAL SYNTHETIC HTTP BOUNDARY" if result.plan.get("local_test") else "APPLICATION LINK"
+    mode = ("FUNCTIONAL SMOKE" if functional_smoke else
+            "LOCAL SYNTHETIC HTTP BOUNDARY" if result.plan.get("local_test") else "APPLICATION LINK")
+    observation_label = "Smoke observations" if functional_smoke else "Sampling"
     rows = [
         f"# Benchmark {result.run_id}",
         "",
@@ -449,7 +452,7 @@ def render_report(result: RunResult, *, stage_logs: StageLogImport | None = None
         f"Observation: {result.started_at} to {result.ended_at}.",
         f"Actual window: **{result.window_seconds:.3f} seconds**, including drain; "
         f"submission window: {result.submission_seconds:.3f} seconds.",
-        f"Stop: `{result.stop_reason}`. Sampling: **{'sufficient' if sufficient else 'insufficient'}** "
+        f"Stop: `{result.stop_reason}`. {observation_label}: **{'sufficient' if sufficient else 'insufficient'}** "
         f"({complete}/{target} terminal observations; minimum {minimum} submission seconds).",
         f"Attempted: {summary.attempted}; censored: {summary.counts['censored']}; "
         f"after-window completions: {summary.completed_after_window}.",
@@ -460,6 +463,18 @@ def render_report(result: RunResult, *, stage_logs: StageLogImport | None = None
         "| Outcome | Count | Mean ms | P50 ms | P95 ms | P99 ms | Min ms | Max ms |",
         "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
+    if functional_smoke:
+        verification = (result.plan.get("deployment") or {}).get("cloud_smoke_verified")
+        recorded = "true" if verification is True else "false" if verification is False else "not supplied"
+        rows[3:3] = [
+            "**NOT A CAPACITY OR PERFORMANCE RECOMMENDATION.**",
+            "Original request/stage timings are functional diagnostic observations only. "
+            "A terminal observation count or process exit does not certify successful smoke verification.",
+            "Operator review of completed-question and evidence is required before an explicitly "
+            "verified later warm/concurrency/cold plan; this report never promotes the gate.",
+            f"Recorded cloud_smoke_verified: {recorded} (unchanged).",
+            "",
+        ]
 
     for outcome in OUTCOMES:
         distribution = summary.distributions[outcome]
