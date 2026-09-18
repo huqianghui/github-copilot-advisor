@@ -3,7 +3,11 @@
 name = "advisor-shared"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["pydantic>=2.7"]
+dependencies = [
+    "pydantic>=2.7",
+    "azure-core[aio]>=1.30,<2",
+    "azure-identity>=1.19,<2",
+]
 
 [build-system]
 requires = ["hatchling"]

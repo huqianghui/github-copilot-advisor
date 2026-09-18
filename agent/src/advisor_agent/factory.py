@@ -1,10 +1,12 @@
 """生产装配:渠道 adapter 只调用 build_advisor(),不接触内部组件。"""
+from contextlib import AsyncExitStack
 import os
 from pathlib import Path
+from typing import Any
 
-from azure.core.credentials import AzureKeyCredential
 from azure.search.documents.aio import SearchClient
 from openai import AsyncAzureOpenAI, Timeout
+from openai.lib.azure import API_KEY_SENTINEL
 
 from advisor_agent.core import AdvisorCore
 from advisor_agent.diagnostics import NetworkDiagnostics
@@ -23,6 +25,7 @@ from advisor_agent.search.web import (
 from advisor_agent.sessions import InMemorySessionStore
 from advisor_agent.tools import AdvisorTools
 from advisor_agent.usage import CopilotUsageClient
+from advisor_shared.azure_auth import AzureAuthSettings, AzureCredentials
 
 # openai SDK 的默认 connect 超时是 5s。实测本环境到 Azure OpenAI endpoint 的
 # 成功连接耗时(13 次采样)中位数约 8s、最大 10.9s,只有 2 次落在 5s 内 ——
@@ -47,19 +50,79 @@ _TIMEOUT = Timeout(connect=15.0, read=600, write=600, pool=600)
 _MAX_RETRIES = 1
 
 
-def build_openai_client(api_version: str) -> AsyncAzureOpenAI:
+class _ExplicitAzureOpenAI(AsyncAzureOpenAI):
+    def __init__(self, **kwargs: Any):
+        if kwargs.get("azure_ad_token_provider") is not None:
+            # The SDK's sentinel satisfies its base constructor without emitting
+            # an api-key header or inferring either Azure/OpenAI environment key.
+            kwargs["api_key"] = API_KEY_SENTINEL
+        super().__init__(**kwargs)
+        # The SDK otherwise infers AZURE_OPENAI_AD_TOKEN ahead of BOTH explicit
+        # key auth and our selected identity provider, including with_options().
+        self._azure_ad_token = None
+
+
+class _CredentialHttpClient(DiagnosticAsyncHttpClient):
+    def __init__(self, owner: AzureCredentials | None):
+        super().__init__(timeout=_TIMEOUT)
+        self._credential_owner = owner
+
+    async def aclose(self) -> None:
+        try:
+            await super().aclose()
+        finally:
+            if self._credential_owner is not None:
+                await self._credential_owner.aclose()
+
+
+class AzureAdvisor(AdvisorCore):
+    """An advisor with explicit shutdown of its factory-owned Azure resources."""
+
+    def __init__(self, backend: MAFBackend, *, channel_name: str,
+                 azure_clients: tuple[AsyncAzureOpenAI | SearchClient, ...],
+                 credential_owner: AzureCredentials | None):
+        super().__init__(backend, InMemorySessionStore(), channel_name=channel_name)
+        self._azure_clients = azure_clients
+        self._credential_owner = credential_owner
+        self._azure_closed = False
+
+    async def aclose(self) -> None:
+        if self._azure_closed:
+            return
+        self._azure_closed = True
+        async with AsyncExitStack() as stack:
+            if self._credential_owner is not None:
+                stack.push_async_callback(self._credential_owner.aclose)
+            for client in self._azure_clients:
+                stack.push_async_callback(client.close)
+
+
+def _endpoint(value: str | None, name: str) -> str:
+    if not value:
+        raise ValueError(f"{name} must be configured")
+    return value
+
+
+def build_openai_client(
+        api_version: str, *, credentials: AzureCredentials | None = None,
+) -> AsyncAzureOpenAI:
     """Azure OpenAI client 的唯一出厂口 —— 超时/重试策略只在这里定义一次。
 
     embedding 与 chat 走同一个 endpoint、同一条坏网络,两边必须用同一套策略;
     历史上 chat client 藏在 MAFBackend 内部自建,漏掉了这里的加固。
+    client.close() 同时释放自建身份;外部注入的 credentials 仍由调用方关闭。
     """
-    return AsyncAzureOpenAI(
-        azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
-        api_key=os.environ["AZURE_OPENAI_API_KEY"],
+    owned = credentials is None
+    credentials = credentials or AzureCredentials(AzureAuthSettings.from_env(os.environ))
+    endpoint = _endpoint(credentials.settings.openai_endpoint, "AZURE_OPENAI_ENDPOINT")
+    auth = credentials.openai_auth()
+    return _ExplicitAzureOpenAI(
+        azure_endpoint=endpoint,
+        **auth,
         api_version=api_version,
         timeout=_TIMEOUT,
         max_retries=_MAX_RETRIES,
-        http_client=DiagnosticAsyncHttpClient(timeout=_TIMEOUT),
+        http_client=_CredentialHttpClient(credentials if owned else None),
     )
 
 
@@ -71,7 +134,10 @@ def _is_group_provider() -> bool:
     return get_request_context().is_group
 
 
-def build_advisor(channel_name: str = "generic") -> AdvisorCore:
+def build_advisor(
+        channel_name: str = "generic", *, credentials: AzureCredentials | None = None,
+) -> AzureAdvisor:
+    """Share one identity; injected credentials remain owned by the caller."""
     kb_budget = validate_seconds(
         os.environ.get("KB_SEARCH_BUDGET_SECONDS", str(SEARCH_BUDGET_SECONDS)),
         "KB_SEARCH_BUDGET_SECONDS")
@@ -84,13 +150,17 @@ def build_advisor(channel_name: str = "generic") -> AdvisorCore:
     web_timeout = validate_seconds(
         os.environ.get("WEB_SEARCH_ATTEMPT_TIMEOUT_SECONDS", "6"),
         "WEB_SEARCH_ATTEMPT_TIMEOUT_SECONDS")
+    owned = credentials is None
+    credentials = credentials or AzureCredentials(AzureAuthSettings.from_env(os.environ))
+    search_endpoint = _endpoint(credentials.settings.search_endpoint, "AZURE_SEARCH_ENDPOINT")
+    search_auth = credentials.search_credential()
     # embedding 的 api_version 保持钉死,不跟随 AZURE_OPENAI_API_VERSION ——
     # 那个变量是给 chat 调 preview 版本用的,不该拖着 embeddings 一起漂。
-    embed_client = build_openai_client("2024-10-21")
+    embed_client = build_openai_client("2024-10-21", credentials=credentials)
     search_client = SearchClient(
-        os.environ["AZURE_SEARCH_ENDPOINT"],
+        search_endpoint,
         os.environ.get("AZURE_SEARCH_INDEX", "copilot-qa"),
-        AzureKeyCredential(os.environ["AZURE_SEARCH_API_KEY"]),
+        search_auth,
     )
     combined = CombinedSearch(
         KnowledgeSearchClient(search_client, embed_client),
@@ -117,9 +187,12 @@ def build_advisor(channel_name: str = "generic") -> AdvisorCore:
     tools = AdvisorTools(combined, web, escalation, diagnostics, usage)
     # chat client 显式注入:真机冒烟的 ConnectTimeout 打的就是 chat completions
     # 端点(known-issues 5.1),它必须拿到加固后的超时,不能用 SDK 默认的 5s。
+    chat_client = build_openai_client(
+        os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21"),
+        credentials=credentials)
     backend = MAFBackend(
-        tools, _channel_id_provider, _is_group_provider,
-        client=build_openai_client(
-            os.environ.get("AZURE_OPENAI_API_VERSION", "2024-10-21")))
-    return AdvisorCore(backend, InMemorySessionStore(),
-                       channel_name=channel_name)
+        tools, _channel_id_provider, _is_group_provider, client=chat_client)
+    return AzureAdvisor(
+        backend, channel_name=channel_name,
+        azure_clients=(embed_client, search_client, chat_client),
+        credential_owner=credentials if owned else None)
