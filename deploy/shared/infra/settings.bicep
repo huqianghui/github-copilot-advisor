@@ -61,6 +61,7 @@ output settings object = {
   CONNECTIONS__SERVICE_CONNECTION__SETTINGS__ANONYMOUS_ALLOWED: 'False'
   CONNECTIONS__SERVICE_CONNECTION__SETTINGS__VALIDATE_ISSUER: 'True'
   BENCHMARK_ENABLED: string(benchmarkEnabled)
+  BENCHMARK_CASES_PATH: benchmarkEnabled ? '${runtimeConfigPath}/benchmark-cases.json' : ''
   BENCHMARK_AUTH_MODE: 'entra'
   BENCHMARK_TENANT_ID: tenant().tenantId
   BENCHMARK_AUDIENCE: benchmarkAudience

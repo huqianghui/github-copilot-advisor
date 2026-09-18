@@ -504,3 +504,39 @@ def test_approved_runtime_budgets_and_logging_reach_both_hosts(compiled_infra, t
         assert name in settings[name]
     assert settings["ADVISOR_ENTRA_CREDENTIAL"] == "managed_identity"
     assert settings["CONNECTIONS__SERVICE_CONNECTION__SETTINGS__AUTHTYPE"] == "UserManagedIdentity"
+
+
+@pytest.mark.parametrize("target", ["aca", "functions"])
+def test_opt_in_dataset_path_reaches_runtime_settings(compiled_infra, target):
+    settings = body(compiled_infra(target), "settings")["outputs"]["settings"]["value"]
+    assert settings["BENCHMARK_CASES_PATH"] == (
+        "[if(parameters('benchmarkEnabled'), "
+        "format('{0}/benchmark-cases.json', parameters('runtimeConfigPath')), '')]"
+    )
+
+
+def test_aca_benchmark_identity_is_the_actual_resource_not_caller_settings(compiled_infra):
+    app = body(compiled_infra("aca"), "app")
+    expression = app["variables"]["protectedSettings"]
+    arguments = arm_arguments(expression)
+    assert arguments[0] == "parameters('settings')"
+    assert arm_object(arguments[-1])["BENCHMARK_TARGET_ID"] == (
+        "[resourceId('Microsoft.App/containerApps', parameters('name'))]"
+    )
+    container = only(app, "Microsoft.App/containerApps")["properties"]["template"]["containers"][0]
+    assert "variables('settingsEnv')" in container["env"]
+    settings_env = next(value for value in app["variables"]["copy"] if value["name"] == "settingsEnv")
+    assert settings_env["count"] == "[length(items(variables('protectedSettings')))]"
+    assert settings_env["input"] == {
+        "name": "[items(variables('protectedSettings'))[copyIndex('settingsEnv')].key]",
+        "value": "[string(items(variables('protectedSettings'))[copyIndex('settingsEnv')].value)]",
+    }
+
+
+def test_flex_benchmark_identity_is_the_actual_resource_not_caller_settings(compiled_infra):
+    expression = argument(body(compiled_infra("functions"), "app"), "flex-site", "appSettingsKeyValuePairs")
+    arguments = arm_arguments(expression)
+    assert "parameters('settings')" in arguments[:-1]
+    assert arm_object(arguments[-1])["BENCHMARK_TARGET_ID"] == (
+        "[resourceId('Microsoft.Web/sites', parameters('name'))]"
+    )

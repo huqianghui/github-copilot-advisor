@@ -33,6 +33,7 @@ resource insights 'Microsoft.Insights/components@2020-02-02' existing = {
 }
 
 var hostSettings = {
+  BENCHMARK_TARGET_ID: resourceId('Microsoft.Web/sites', name)
   AzureWebJobsStorage__credential: 'managedidentity'
   AzureWebJobsStorage__clientId: identityClientId
   AzureWebJobsStorage__blobServiceUri: storage.properties.primaryEndpoints.blob

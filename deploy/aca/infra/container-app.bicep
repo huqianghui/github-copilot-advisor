@@ -30,7 +30,10 @@ var resourceProfiles = {
 // The protected settings win; old Azure keys are not copied in Entra mode.
 var allowedSecretNames = ['AZURE_OPENAI_API_KEY', 'AZURE_SEARCH_API_KEY', 'GITHUB_TOKEN', 'TAVILY_API_KEY', 'BRAVE_API_KEY']
 var acceptedSecrets = filter(items(secretSettings), item => contains(allowedSecretNames, item.key) && (item.key != 'AZURE_OPENAI_API_KEY' || settings.AZURE_OPENAI_AUTH_MODE == 'key') && (item.key != 'AZURE_SEARCH_API_KEY' || settings.AZURE_SEARCH_AUTH_MODE == 'key'))
-var settingsEnv = [for setting in items(settings): {
+var protectedSettings = union(settings, {
+  BENCHMARK_TARGET_ID: resourceId('Microsoft.App/containerApps', name)
+})
+var settingsEnv = [for setting in items(protectedSettings): {
   name: setting.key
   value: string(setting.value)
 }]
