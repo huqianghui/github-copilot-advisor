@@ -291,3 +291,54 @@ async def test_accept_fixture_replays_transient_admission_without_a_new_sequence
     receipt = await case.accept()
     assert receipt.duplicate and receipt.sequence == 1
     assert len(await case.jobs.pending(case.partition())) == 1
+
+
+async def test_each_job_uses_its_payload_trace_not_the_batched_wake_trace(
+        worker_case, make_payload, monkeypatch, caplog):
+    import logging
+    from advisor_shared.telemetry import current_trace, trace_scope
+    case = worker_case
+    expected = {}
+    for activity_id, trace_id in (("first", "trace-first"), ("second", "trace-second")):
+        payload = make_payload(activity_id=activity_id, user="a").model_copy(
+            update={"trace_id": trace_id})
+        await case.jobs.submit(payload)
+        expected[payload.job_id] = trace_id
+    observed = []
+    prepare, send, validate = case.executor.prepare, case.executor.send, case.executor.validate
+
+    def checked_validate(payload):
+        observed.append((payload.job_id, current_trace().trace_id))
+        return validate(payload)
+
+    async def checked_prepare(payload, history):
+        observed.append((payload.job_id, current_trace().trace_id))
+        return await prepare(payload, history)
+
+    async def checked_send(payload, prepared):
+        observed.append((payload.job_id, current_trace().trace_id))
+        return await send(payload, prepared)
+
+    monkeypatch.setattr(case.executor, "validate", checked_validate)
+    monkeypatch.setattr(case.executor, "prepare", checked_prepare)
+    monkeypatch.setattr(case.executor, "send", checked_send)
+    caplog.set_level(logging.DEBUG, logger="advisor_shared.telemetry")
+    with trace_scope(new=True, trace_id="wake-trace") as wake_trace:
+        assert await case.worker.process_session(case.partition(), "wake-trace") == "drained"
+        assert current_trace() is wake_trace
+    assert all(trace_id == expected[job_id] for job_id, trace_id in observed)
+    completed = [record.telemetry for record in caplog.records
+                 if record.msg == "step_completed"
+                 and record.telemetry.get("name") == "worker.job"]
+    assert {record["trace_id"] for record in completed} == {"trace-first", "trace-second"}
+    assert len({record["segment_id"] for record in completed}) == 2
+
+
+async def test_invalid_stored_trace_is_failed_before_history_read(worker_case, make_payload):
+    case = worker_case
+    payload = make_payload(user="a").model_copy(
+        update={"trace_id": "https://private.invalid/?token=private-token"})
+    receipt = await case.jobs.submit(payload)
+    await case.worker.process_session(case.partition(), "wake")
+    assert (await case.jobs.read(receipt.job_id)).failure_code == "invalid_payload"
+    assert case.events == []

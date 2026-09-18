@@ -1,6 +1,7 @@
 """Ordered, fenced execution using persisted preparation and delivery checkpoints."""
 import asyncio
 from collections.abc import Awaitable
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 import inspect
 import math
@@ -16,6 +17,7 @@ from advisor_agent.durable.leases import LeaseBusy, _log_failure
 from advisor_agent.durable.queue import OutboxDispatcher
 from advisor_shared.cloud import PreparedTurn, TaskPayload
 from advisor_shared.delivery import DeliveryFailure
+from advisor_shared.telemetry import step, trace_scope
 
 
 MAX_TURNS_PER_INVOCATION = 4
@@ -80,6 +82,25 @@ class SessionWorker:
         if payload.partition_key != job.partition_key:
             raise JobConflict("job payload partition mismatch")
         job.payload = payload
+        with ExitStack() as stack:
+            try:
+                stack.enter_context(trace_scope(new=True, trace_id=payload.trace_id))
+            except ValueError as error:
+                _log_failure("worker.trace_invalid", error)
+                await job.fail("invalid_payload")
+                return
+            with step("worker.job") as timing:
+                try:
+                    await self._process_payload(job, history, payload)
+                    timing.attributes["job_state"] = job.state
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    _log_failure("worker.job_failed", error)
+                    raise
+
+    async def _process_payload(self, job: LeasedJob, history: LeasedHistory,
+                               payload: TaskPayload) -> None:
         try:
             await self._validate(payload)
         except (DeliveryFailure, ValueError) as error:
