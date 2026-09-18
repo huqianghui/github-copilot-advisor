@@ -504,6 +504,169 @@ safe per-request telemetry. Throughput denominator includes drain. Small
 tail samples are labeled exploratory. Reports never infer an SLA or
 absolute platform maximum, and contain no fabricated cost results.
 
+### Per-stage latency reports and missing coverage
+
+The generated report includes an **Observed per-stage latency** section for
+all existing stage names: `ingress`, `queue_wait`, `worker_init`, `auth`,
+`connection`, `history_setup`, `synthetic`, `agent`, `kb`, `github`, `web`,
+`model`, `render`, `send`, `history_read`, and `history_commit`. By default it
+uses supplied `telemetry[].stages[]` observations, correlated by `request_id`
+to recorded samples; duplicate telemetry records, missing request IDs and
+orphan records are rejected rather than double-counted. The optional strict
+completion-log import below supplies post-callback observations without
+changing the original result.
+
+Each report is scoped to its run, profile and explicit plan scenario
+(`synthetic` or `real_agent`). A missing legacy scenario is labeled
+`unknown`, never inferred from a stage name. Results from different
+scenarios/runs are not pooled. Within that scope, request outcomes are
+separate cohorts: success, degraded, failed, unknown, expired, ignored and
+censored. Each cohort has two tables:
+
+* **Coverage:** stage observation count, distinct requests with at least one
+  observation / total cohort requests, missing/unknown request count, and
+  coverage percentage. Repeated spans for one request increase observation
+  count but count only once toward request coverage. Requests with no
+  telemetry or an empty stage list remain in the denominator. Coverage is
+  for the stage overall, not conditioned on a particular stage outcome.
+* **Latency:** count, mean, P50/P95/P99, minimum and maximum in milliseconds,
+  separately for every observed stage outcome (`success`, `degraded`,
+  `failed`, `unknown`, `empty`). The distribution consists of individual
+  observed spans, including repeated calls, not summed per-request stage
+  time. Quantiles use the existing linearly interpolated percentile helper.
+
+An absent stage is shown as `not observed`, count 0 and `n/a` timings.
+Missing means unknown coverage, not measured zero, success, failure, or
+proof that a stage did not execute. A genuine observed `0 ms` is retained
+in its distribution. An empty run shows `0/0` coverage with `n/a`, not a
+fabricated percentage. ACK durations, token counts, dependency call counts,
+observer processing overhead and bootstrap flags are never converted into
+missing stage durations. Small stage samples and tail quantiles remain
+exploratory; coverage does not establish instrumentation completeness or
+an SLA.
+
+Stages can overlap or nest and are **not additive**. In particular, do not
+sum synthetic/model subspans with Agent/pipeline spans to manufacture total
+latency. Cross-process monotonic clocks are not directly subtracted.
+End-to-end statistics still use the same observer's complete callback-body
+reception timestamp after eventual authentication/validation, not any
+stage sum. Stage coverage includes all recorded requests in the run,
+including drain and censored work; stage observations do not turn a
+censored request into a completed answer.
+
+Production coverage remains the host/telemetry integration's responsibility.
+If ingress, queue waiting, initialization, auth/connection or full send
+duration is not carried in the existing safe stage list, the report exposes
+that gap as missing coverage rather than estimating it. Only measured local
+durations with the existing stage names/outcomes belong in those fields;
+no raw question, reply or token content is needed for this report.
+
+#### Post-run completed-stage log import
+
+Full ingress, final callback HTTP/ACK completion, and durable history commit
+can finish after the original callback has already been serialized. Import
+their **actual completed observations** from a separately collected safe
+export; do not estimate them from callback ACK time or missing values:
+
+```powershell
+uv run --no-sync --package advisor-deploy python -m advisor_deploy.bench report `
+  --input deploy\out\bench\ACTUAL-RUN-ID.json `
+  --stage-logs deploy\out\bench\completed-stages.json `
+  --output deploy\out\bench\ACTUAL-RUN-ID-with-stages.md
+```
+
+This command performs no Azure query. Parent/operator collection must select
+exactly the fixed `StageCompletion` fields from
+`teams_adapter.cloud.benchmark_observations` and save a UTF-8 **JSON array**:
+
+| Required field | Contract |
+|---|---|
+| `event` | Exactly `benchmark_stage_completed` |
+| `version` | Integer `1`, not a boolean |
+| `job_id`, `trace_id` | Exact canonical callback correlation identifiers |
+| `boot_id`, `segment_id`, `span_id` | Existing bounded identifiers identifying the completed process span |
+| `stage` | Existing `StageObservation`: allowed `name`, finite nonnegative `duration_ms`, allowed `outcome` |
+
+This completed-log import is restricted to `ingress`, `history_read`,
+`history_commit`, and `send`, matching the authorized completed-phase
+producer. All other stages remain callback-sourced; attempting to import
+another stage scope is rejected.
+
+Do not pass ordinary log lines, Azure query/table envelopes, JSONL, or the
+logger's additional `timestamp`, `level`, `logger`, or `message` fields.
+Question/reply/token/URL fields and all unknown fields are rejected, not
+silently stripped. The import is bounded to 32 MiB and 100,000 input records;
+duplicate JSON fields, non-finite numbers and malformed encodings are rejected.
+The report validates this exact export contract with shared types, without
+adding a Teams/runtime dependency to the two-wheel observer package.
+
+Log identity is exactly **`(boot_id, segment_id, span_id)`**. Identical
+repeated records are deduplicated; any differing duration, outcome, stage,
+job, or trace under one identity rejects the import. Different identities
+remain real observed attempts even if their stage names/durations coincide.
+Each unique event must match exactly one original callback record by
+**both `job_id` and `trace_id`**. Missing callback correspondence, missing
+trace/job identifiers, unmatched pairs, or two requests claiming one pair
+reject the entire import. Request IDs, run labels and timing proximity are
+not substitutes for this correspondence. In particular, a request with no
+canonical callback trace/job cannot be reconstructed from these logs alone.
+
+Callback stage records do not carry process span IDs. To avoid guessing
+cross-source identity or double-counting, completed logs take precedence
+for a matched **request/stage** in the four supported phases: only its unique log spans are used for that
+stage, and its callback observations are explicitly counted as superseded.
+Other callback stages remain. This is a visible source-selection policy,
+**not** a claim that callback/log identities were matched heuristically.
+A partial export can supersede a larger callback list; collect the intended
+complete window and inspect supersession/counts. The original callback
+evidence remains intact for comparison.
+
+With an import, the report adds per-stage callback/log observation and request
+coverage, and keeps their outcome distributions separate. Overall request
+coverage uses the selected observations; it does not certify that every span
+or retry was collected. Missing stages remain unknown. Completed
+`history_read`/`history_commit` observations are not aliases for the fixture's
+`history_setup`. Imported ingress/send/history intervals can extend beyond
+callback reception or the original run window; they never change sample
+outcomes, callback-body end-to-end latency, throughput denominators, or cold
+classification. Process boot/segment/span IDs are correlation keys, not
+new platform boot/instance evidence.
+
+Provenance includes links to the original result and separate import file,
+their **original-byte SHA-256** hashes, input/unique/duplicate event counts,
+and superseded callback count. The CLI refuses to overwrite either input,
+including through a hard-link alias. It does not rewrite or append timings
+to the raw result JSON.
+
+If the collector recorded an actual query window, pass both optional
+`--stage-log-window-start` and `--stage-log-window-end` as timezone-aware
+ISO-8601 values. Partial, reversed or malformed windows are rejected.
+There are two strictly separated collection formats:
+
+* A JSON array of the exact DTOs above. Since the DTO has no timestamp, the
+  supplied window is **operator-declared and not independently checked
+  against event times**.
+* A JSON array of exact two-field collection wrappers:
+  `{"timestamp": "<actual UTC TelemetryFormatter emission time>", "completion": <exact DTO>}`.
+  The wrapper is report-collection metadata, not a change to the runtime DTO.
+  The exporter must copy the original log envelope's UTC emission timestamp
+  and select only the exact completion DTO fields. No `level`, `logger`,
+  `message`, body or other envelope fields are accepted.
+
+Do not mix the two formats in one file. In the timestamped format every
+emission timestamp must be UTC and, when a window is supplied, lie within
+its inclusive bounds. This check happens **before deduplication**, so an
+out-of-window duplicate is not hidden. Identical completion DTOs emitted at
+different times remain one observation: emission time is not part of the
+process-span identity. The report records the observed min/max emission
+range and distinguishes timestamp-checked windows from declarations.
+Emission timestamps are not used to calculate stage durations.
+
+Without window arguments, the query window remains explicitly unknown,
+even when actual emission timestamps are available; it is not manufactured
+from the run or event range. File hashes and timestamp checks do not attest
+Azure collection or establish complete attempt coverage.
+
 ## Packaging, persistence and shutdown
 
 Use the separate benchmark helper; **do not** extend the application

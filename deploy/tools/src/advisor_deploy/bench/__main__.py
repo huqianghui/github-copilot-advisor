@@ -211,12 +211,36 @@ def main(argv=None) -> int:
     report = commands.add_parser("report")
     report.add_argument("--input", type=Path, required=True)
     report.add_argument("--output", type=Path, required=True)
+    report.add_argument("--stage-logs", type=Path,
+                        help="Separate JSON list of strict benchmark_stage_completed DTOs")
+    report.add_argument("--stage-log-window-start")
+    report.add_argument("--stage-log-window-end")
     args = parser.parse_args(argv)
     try:
         if args.command == "report":
-            result = read_result(json.loads(args.input.read_text(encoding="utf-8")))
+            from hashlib import sha256
+            from advisor_deploy.bench.report import load_stage_logs
+
+            protected = [args.input] + ([args.stage_logs] if args.stage_logs else [])
+            if any(args.output.resolve() == path.resolve()
+                   or args.output.exists() and args.output.samefile(path) for path in protected):
+                raise ValueError("report output must not overwrite evidence")
+            if not args.stage_logs and (
+                args.stage_log_window_start is not None or args.stage_log_window_end is not None
+            ):
+                raise ValueError("stage-log window requires a stage-log input")
+            source_bytes = args.input.read_bytes()
+            result = read_result(json.loads(source_bytes.decode("utf-8")))
+            imported = (load_stage_logs(
+                args.stage_logs, window_start=args.stage_log_window_start,
+                window_end=args.stage_log_window_end) if args.stage_logs else None)
+            rendered = render_report(result, stage_logs=imported)
+            rendered += (
+                "\n## Raw result provenance\n\n"
+                f"Source: [original raw result]({args.input.resolve().as_uri()}).\n"
+                f"Raw-result SHA-256 (original bytes): `{sha256(source_bytes).hexdigest()}`.\n")
             args.output.parent.mkdir(parents=True, exist_ok=True)
-            args.output.write_text(render_report(result), encoding="utf-8")
+            args.output.write_text(rendered, encoding="utf-8")
             return 0
         plan = load_plan(args.plan)
         if not plan.local_test and not args.allow_cloud:
