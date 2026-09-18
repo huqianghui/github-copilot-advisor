@@ -68,9 +68,10 @@ def validate_preview(changes, ledger, state, stage, registry, container):
                 else:
                     raise fail("unowned_benchmark_collision")
             continue
-        if action not in {"Create", "Modify"} or identifier.lower() in protected:
+        if action not in {"Create", "Modify", "Deploy"} or identifier.lower() in protected:
             raise fail("main_aca_resource_change_forbidden")
-        if action == "Modify" and identifier not in previous:
+        # ResourceIdOnly reports Deploy for existing resources without property diffs.
+        if action in {"Modify", "Deploy"} and identifier not in previous:
             raise fail("unowned_benchmark_collision")
         if "/providers/microsoft.authorization/roleassignments/" in identifier.lower():
             if _role_scope(identifier).lower() not in {registry.lower(), container.lower()}:

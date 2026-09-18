@@ -43,6 +43,25 @@ def test_bootstrap_preview_forbids_main_resource_changes_and_new_accounts():
                          ledger, None, "Bootstrap", REGISTRY, CONTAINER)
 
 
+def test_resource_id_only_deploy_changes_require_previous_observer_ownership():
+    from advisor_deploy.benchmark_deploy import validate_preview
+
+    ledger = ownership()
+    ledger["owned_resource_ids"] += [IDENTITY, CONTAINER]
+    role = REGISTRY + "/providers/Microsoft.Authorization/roleAssignments/" + str(uuid4())
+    state = {"resource_ids": [IDENTITY, CONTAINER], "role_assignment_ids": [role]}
+    changes = [{"resourceId": value, "changeType": "Deploy"} for value in (IDENTITY, CONTAINER, role)]
+    changes += [{"resourceId": STORAGE, "changeType": "Ignore"},
+                {"resourceId": APP, "changeType": "Create"}]
+    assert validate_preview(changes, ledger, state, "App", REGISTRY, CONTAINER) == {
+        IDENTITY, CONTAINER, role, APP,
+    }
+    for identifier in (STORAGE, REGISTRY, IDENTITY + "-unrecorded", APP):
+        with pytest.raises(ValueError):
+            validate_preview([{"resourceId": identifier, "changeType": "Deploy"}],
+                             ledger, state, "App", REGISTRY, CONTAINER)
+
+
 def test_only_receipt_proven_driver_resources_and_roles_are_appended():
     from advisor_deploy.benchmark_deploy import append_owned_receipts
     ledger = ownership()
