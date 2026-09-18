@@ -187,6 +187,13 @@ def test_benchmark_readback_rejects_drifted_image_and_operator_allowlist():
     scale = app["properties"]["template"]["scale"]
     scale.update(cooldownPeriod=300, pollingInterval=30, rules=[])
     verify_benchmark_app(Readback(), state, selected, aca, functions, api)
+    app["identity"]["userAssignedIdentities"] = {IDENTITY.replace("/resourceGroups/", "/resourcegroups/"): {}}
+    app["properties"]["environmentId"] = ENVIRONMENT.lower()
+    verify_benchmark_app(Readback(), state, selected, aca, functions, api)
+    app["identity"]["userAssignedIdentities"] = {IDENTITY + "-unapproved": {}}
+    with pytest.raises(ValueError, match="benchmark_app_configuration_mismatch"):
+        verify_benchmark_app(Readback(), state, selected, aca, functions, api)
+    app["identity"]["userAssignedIdentities"] = {IDENTITY: {}}
     for section, key, wrong in ((resources, "cpu", 1), (resources, "memory", "2Gi"),
                                 (scale, "minReplicas", 0), (scale, "maxReplicas", 2)):
         original = section[key]

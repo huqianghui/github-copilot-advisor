@@ -546,8 +546,9 @@ def verify_benchmark_app(cli, state, selected, aca, functions, api):
     template = props.get("template", {})
     containers = template.get("containers", [])
     if (
-        identity.get("type") != "UserAssigned" or set(identity.get("userAssignedIdentities", {})) != {state["identity_id"]}
-        or props.get("environmentId") != selected["environment"]["id"] or len(containers) != 1
+        identity.get("type") != "UserAssigned"
+        or {value.lower() for value in identity.get("userAssignedIdentities", {})} != {state["identity_id"].lower()}
+        or str(props.get("environmentId", "")).lower() != selected["environment"]["id"].lower() or len(containers) != 1
         or containers[0].get("image") != state["image_reference"]
         or containers[0].get("resources", {}).get("cpu") != .5
         or containers[0].get("resources", {}).get("memory") != "1Gi"
