@@ -306,3 +306,110 @@ def make_payload(job_clock):
 def job_store(blob_gateway, job_clock):
     from advisor_agent.durable.jobs import JobStore
     return JobStore(blob_gateway, bot_id="bot-a", utc_clock=job_clock)
+
+
+class QueueTransport(ContractTransport):
+    def __init__(self, real=False):
+        super().__init__(real)
+        self.messages = {}
+
+    async def send(self, request, **kwargs):
+        query = parse_qs(urlsplit(request.url).query)
+        operation = {"POST": "send", "GET": "receive", "PUT": "update",
+                     "DELETE": "ack"}[request.method]
+        if query.get("peekonly") == ["true"]:
+            operation = "peek"
+        self.calls.append((operation, request))
+        if self.failures and self.failures[0][0] == operation:
+            _, status, code = self.failures.popleft()
+            return error_response(request, status, code)
+        if self.inner:
+            return await self.inner.send(request, **kwargs)
+        now = datetime.now(timezone.utc)
+        clock = monotonic()
+
+        def xml_message(root, message, content=True):
+            node = ET.SubElement(root, "QueueMessage")
+            for key, value in {
+                "MessageId": message["id"], "PopReceipt": message["receipt"],
+                "InsertionTime": format_datetime(message["inserted"], usegmt=True),
+                "ExpirationTime": format_datetime(message["expires"], usegmt=True),
+                "TimeNextVisible": format_datetime(now, usegmt=True),
+                "DequeueCount": str(message["count"]),
+                **({"MessageText": message["body"]} if content else {}),
+            }.items():
+                ET.SubElement(node, key).text = value
+
+        root = ET.Element("QueueMessagesList")
+        if operation == "send":
+            from datetime import timedelta
+            message = {
+                "id": str(uuid4()), "receipt": str(uuid4()), "inserted": now,
+                "expires": now + timedelta(seconds=int(query.get("messagettl", ["604800"])[0])),
+                "visible": clock, "count": 0,
+                "body": ET.fromstring(request.body).findtext("MessageText"),
+            }
+            self.messages[message["id"]] = message
+            xml_message(root, message, content=False)
+            return Response(request, 201, ET.tostring(root), {"content-type": "application/xml"})
+        if operation in ("receive", "peek"):
+            limit = int(query.get("numofmessages", ["1"])[0])
+            visible = [m for m in self.messages.values()
+                       if m["visible"] <= clock and m["expires"] > now][:limit]
+            for message in visible:
+                if operation == "receive":
+                    message["receipt"] = str(uuid4())
+                    message["count"] += 1
+                    message["visible"] = clock + int(query.get("visibilitytimeout", ["30"])[0])
+                xml_message(root, message)
+            return Response(request, 200, ET.tostring(root), {"content-type": "application/xml"})
+        message_id = urlsplit(request.url).path.rsplit("/", 1)[-1]
+        message = self.messages.get(message_id)
+        if message is None:
+            return error_response(request, 404, "MessageNotFound")
+        if query.get("popreceipt", [""])[0] != message["receipt"]:
+            return error_response(request, 400, "PopReceiptMismatch")
+        if operation == "ack":
+            del self.messages[message_id]
+            return Response(request, 204)
+        message["receipt"] = str(uuid4())
+        message["visible"] = clock + int(query.get("visibilitytimeout", ["0"])[0])
+        return Response(request, 204, headers={
+            "x-ms-popreceipt": message["receipt"],
+            "x-ms-time-next-visible": format_datetime(now, usegmt=True),
+        })
+
+
+@pytest.fixture
+async def queue_harness(request):
+    from azure.storage.queue.aio import QueueClient
+    from advisor_agent.durable.queue import SessionQueue
+
+    real = request.config.getoption("--cloud-store") == "azurite"
+    transport = QueueTransport(real)
+    endpoint = os.environ.get("ADVISOR_TEST_QUEUE_URL", "http://127.0.0.1:11001/devstoreaccount1")
+    if real and urlsplit(endpoint).hostname not in {"127.0.0.1", "::1", "localhost"}:
+        raise pytest.UsageError("Azurite contracts require a loopback endpoint")
+    key = ("Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsu"
+           "Fq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==")
+    client = QueueClient(
+        endpoint if real else "https://memory.queue.core.windows.net",
+        f"advisor-contract-{uuid4().hex}", credential=key,
+        transport=transport, retry_total=0, api_version="2023-11-03",
+        message_encode_policy=None, message_decode_policy=None)
+    if real:
+        await client.create_queue()
+    queue = SessionQueue(client)
+    try:
+        yield queue, client, transport
+    finally:
+        try:
+            if real:
+                await client.delete_queue()
+        finally:
+            await queue.aclose()
+
+
+@pytest.fixture
+def session_queue(queue_harness):
+    return queue_harness[0]
