@@ -501,3 +501,24 @@ async def test_cancelled_owner_still_logs_suppressed_cleanup_error(
     assert len(records) == 1
     assert records[0].telemetry["http_status"] == 503
     assert records[0].telemetry["service_code"] == "ServerBusy"
+
+
+@pytest.mark.parametrize("operation", ["renew", "release"])
+async def test_diagnostic_sink_failure_cannot_change_lease_failure_semantics(
+        blob_gateway, fail_next_operation, renewal_tick, monkeypatch, operation):
+    entered, tick, _ = renewal_tick
+    await blob_gateway.create("context/a", b"one")
+
+    def broken_log(*args, **kwargs):
+        raise RuntimeError("diagnostic sink failed")
+
+    monkeypatch.setattr(leases.logger, "warning", broken_log)
+    with pytest.raises(LeaseLost if operation == "renew" else ValueError):
+        async with blob_gateway.lease("context/a"):
+            fail_next_operation(operation, 503, "ServerBusy")
+            if operation == "renew":
+                await asyncio.wait_for(entered.wait(), 2)
+                tick.set()
+                await asyncio.wait_for(asyncio.Event().wait(), 2)
+            else:
+                raise ValueError("primary failure")

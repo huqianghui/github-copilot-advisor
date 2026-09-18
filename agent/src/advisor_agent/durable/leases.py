@@ -48,11 +48,13 @@ def _log_failure(event: str, error: BaseException) -> None:
                        if cls.__name__ in _ERROR_TYPES), "OtherError")
     status = getattr(error, "status_code", None)
     code = _error_code(error) if isinstance(error, HttpResponseError) else None
-    logger.warning(event, extra={"telemetry": {
-        "error_type": error_type,
-        "http_status": status if type(status) is int and 100 <= status <= 599 else None,
-        "service_code": code if isinstance(code, str) and code in _SERVICE_CODES else "Unknown",
-    }})
+    # Diagnostics must not prevent fencing or mask the primary operation failure.
+    with suppress(Exception):
+        logger.warning(event, extra={"telemetry": {
+            "error_type": error_type,
+            "http_status": status if type(status) is int and 100 <= status <= 599 else None,
+            "service_code": code if isinstance(code, str) and code in _SERVICE_CODES else "Unknown",
+        }})
 
 
 def _lease_rejected(error: HttpResponseError) -> bool:
