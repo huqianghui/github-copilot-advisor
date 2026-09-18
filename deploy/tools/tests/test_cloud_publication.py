@@ -90,3 +90,56 @@ def test_cloud_observer_publish_accepts_unbuilt_context_and_records_exact_run(tm
     proof = json.loads(paths["state_file"].with_suffix(".acr.json").read_text())
     assert proof["binding"]["context_sha256"] == state["context_digest"]
     assert context["linux_imports_verified"] is False, "do not forge local-image verification metadata"
+
+
+@pytest.mark.parametrize("proof_missing", [False, True])
+def test_cloud_control_requires_remote_proof_not_a_local_image_flag(tmp_path, monkeypatch, proof_missing):
+    from advisor_deploy import benchmark_deploy as deployment
+    from advisor_deploy.manifest import group_id, new_manifest
+    from advisor_deploy.remote_acr import publish_image
+    from advisor_deploy.render import digest
+
+    case = context_case(tmp_path, "bench")
+    context = {"files": case.files, "image_id": None, "linux_imports_verified": False,
+               "base_image_digest": None, "source_sha256": {"uv.lock": "a" * 64}, "lock_sha256": "a" * 64}
+    run = SimpleNamespace(model_dump=lambda: {"profile": "cloud-smoke"})
+    binding = {"context_sha256": digest(context), "run_plan_sha256": digest(run.model_dump()),
+               "source_sha256": digest(context["source_sha256"]), "lock_sha256": context["lock_sha256"]}
+    paths = {"context": case.context, "state_file": case.evidence.with_name("observer.json")}
+    proof_path = paths["state_file"].with_suffix(".acr.json")
+    ledger = new_manifest("aca", str(uuid4()), "fixture", "a" * 64, "b" * 64)
+
+    class Commands(RemoteCli):
+        def rest(self, *args, **kwargs):
+            return {"value": [{"actions": ["*"], "notActions": []}]}
+
+    cli = Commands(tmp_path)
+    proof = publish_image(cli, context=case.context, files=case.files, binding=binding,
+                          registry="owned", kind="bench", evidence_path=proof_path)
+    if proof_missing:
+        proof_path.unlink()
+    state = {
+        "phase": "app_deployed", "context_digest": digest(context), "run_plan_digest": digest(run.model_dump()),
+        "image_id": proof["image_id"], "image_reference": proof["image_reference"],
+        "planned_app_id": group_id("aca") + "/providers/Microsoft.App/containerApps/ca-bench-fixture",
+        "planned_app_name": "ca-bench-fixture", "identity_client_id": str(uuid4()),
+    }
+    selected = {"registry": {"name": "owned"}}
+    monkeypatch.setattr(deployment, "_prepare", lambda *args: (
+        {"build_mode": "acr"}, paths, ledger, {}, {}, state, selected))
+
+    def source_check(_path, _repo, _state, _aca, _functions, _api, require_linux=True):
+        if require_linux:
+            raise ValueError("benchmark_linux_image_verification_required")
+        return context, run
+
+    monkeypatch.setattr(deployment, "_verify_context", source_check)
+    monkeypatch.setattr(deployment, "verify_benchmark_app", lambda *args: None)
+    cli.mode = "WhatIf"
+    if proof_missing:
+        with pytest.raises(ValueError, match="unreadable_json"):
+            deployment.control_benchmark(tmp_path / "plan.json", tmp_path, cli, "start", None)
+    else:
+        result = deployment.control_benchmark(tmp_path / "plan.json", tmp_path, cli, "start", None)
+        assert result["ok"] and result["control_invoked"] is False
+        assert context["linux_imports_verified"] is False

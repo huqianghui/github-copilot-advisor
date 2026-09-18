@@ -272,6 +272,16 @@ def validate_run_bindings(run, state, aca, functions, api):
         raise fail("benchmark_plan_identity_or_storage_mismatch")
 
 
+def _verify_cloud_publication(cli, paths, state, context, run, selected):
+    from advisor_deploy.remote_acr import evidence_path, verify_evidence
+
+    verify_evidence(cli, evidence_path(paths["state_file"]), kind="bench", files=context["files"],
+                    binding={"context_sha256": digest(context), "run_plan_sha256": digest(run.model_dump()),
+                             "source_sha256": digest(context["source_sha256"]), "lock_sha256": context["lock_sha256"]},
+                    image_reference=state["image_reference"], image_id=state["image_id"],
+                    registry=selected["registry"]["name"])
+
+
 def _parameters(data, state, selected, aca, functions, api, stage):
     return {
         "enabled": True, "deployApp": stage == "App", "location": "southeastasia",
@@ -461,12 +471,7 @@ def deploy_benchmark(path, repo, cli, private, stage, supplied_confirmation):
         _save_state(paths["state_file"], state, repo)
         return report | {"image_reference": state["image_reference"], "context_digest": state["context_digest"]}
     if stage == "App" and cloud_build:
-        from advisor_deploy.remote_acr import evidence_path, verify_evidence
-        verify_evidence(cli, evidence_path(paths["state_file"]), kind="bench", files=context["files"],
-                        binding={"context_sha256": digest(context), "run_plan_sha256": digest(run.model_dump()),
-                                 "source_sha256": digest(context["source_sha256"]), "lock_sha256": context["lock_sha256"]},
-                        image_reference=state["image_reference"], image_id=state["image_id"],
-                        registry=selected["registry"]["name"])
+        _verify_cloud_publication(cli, paths, state, context, run, selected)
     if stage == "App" and (
         state["phase"] not in {"published", "app_deployed"} or state["context_digest"] != digest(context)
         or state["run_plan_digest"] != digest(run.model_dump()) or (not cloud_build and state["image_id"] != context["image_id"])
@@ -595,7 +600,11 @@ def control_benchmark(path, repo, cli, action, supplied_confirmation):
     data, paths, aca, functions, api, state, selected = _prepare(path, repo, cli)
     if state["phase"] != "app_deployed" or action not in {"start", "status"} or "context" not in paths:
         raise fail("benchmark_deployed_control_required")
-    context, run = _verify_context(paths["context"], repo, state, aca, functions, api)
+    cloud_build = data.get("build_mode", "local") == "acr"
+    context, run = (_verify_context(paths["context"], repo, state, aca, functions, api, False)
+                    if cloud_build else _verify_context(paths["context"], repo, state, aca, functions, api))
+    if cloud_build:
+        _verify_cloud_publication(cli, paths, state, context, run, selected)
     if digest(context) != state["context_digest"] or digest(run.model_dump()) != state["run_plan_digest"]:
         raise fail("benchmark_control_plan_changed")
     verify_benchmark_app(cli, state, selected, aca, functions, api)
