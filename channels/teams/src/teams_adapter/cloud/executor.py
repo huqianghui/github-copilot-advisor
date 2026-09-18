@@ -1,61 +1,34 @@
 """Two-phase SDK turns: prepare privately, then deliver a saved checkpoint."""
 import logging
-from contextlib import contextmanager
-from contextvars import ContextVar
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from typing import TYPE_CHECKING, Literal
 
 from aiohttp import ClientConnectionError, ClientResponseError
 from microsoft_agents.activity import Activity, ResourceResponse
-from microsoft_agents.hosting.aiohttp import CloudAdapter
 from microsoft_agents.hosting.core import (
     AgentApplication, ChannelServiceClientFactoryBase, MemoryStorage,
     TurnContext, TurnState,
 )
 from microsoft_agents.hosting.core.authorization import Connections
 
-from advisor_agent.factory import AdvisorComponents
 from advisor_agent.sessions import BufferedSessionStore
 from advisor_shared.cloud import PreparedTurn, TaskPayload
 from advisor_shared.events import AdvisorEvent
 from advisor_shared.telemetry import step, trace_scope
 from teams_adapter.bot import _activity_to_dict, _to_image_inputs
 from teams_adapter.cloud.errors import DeliveryFailure
+from teams_adapter.cloud.auth import ManagedCloudAdapter, _safe_sdk_logs
+from teams_adapter.cloud.observability import observe_job
 from teams_adapter.downloader import TeamsImageDownloader
 from teams_adapter.extract import build_conversation_key, should_respond
 from teams_adapter.processing import ReplyPreparation, prepare_reply
 from teams_adapter.typing import NonBlockingTypingMiddleware
 
 logger = logging.getLogger(__name__)
-_sdk_phase: ContextVar[str | None] = ContextVar("teams_cloud_sdk_phase", default=None)
 
-
-class _SafeSdkLogFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        phase = _sdk_phase.get()
-        if phase is not None:
-            error_type = (record.exc_info[0].__name__
-                          if record.exc_info and record.exc_info[0] else None)
-            record.msg = "teams_sdk_diagnostic phase=%s error_type=%s"
-            record.args = (phase, error_type)
-            record.exc_info = record.exc_text = record.stack_info = None
-        return True
-
-
-@contextmanager
-def _safe_sdk_logs(phase: str):
-    # SDK 1.5 logs raw Pydantic input and ApplicationError before re-raising.
-    # Public logging filters, scoped to this async context, preserve local turns.
-    for name in ("microsoft_agents.activity.activity",
-                 "microsoft_agents.hosting.core.app.agent_application"):
-        sdk_logger = logging.getLogger(name)
-        if not any(isinstance(item, _SafeSdkLogFilter) for item in sdk_logger.filters):
-            sdk_logger.addFilter(_SafeSdkLogFilter())
-    token = _sdk_phase.set(phase)
-    try:
-        yield
-    finally:
-        _sdk_phase.reset(token)
+if TYPE_CHECKING:
+    from advisor_agent.factory import AdvisorComponents
 
 
 def _failure(error: Exception, *, sending: bool,
@@ -106,12 +79,17 @@ def _retry_after_seconds(error: Exception) -> float | None:
         return None
 
 
-def _validated_activity(payload: TaskPayload) -> Activity:
+def _validated_activity(
+    payload: TaskPayload, *, expected_target: Literal["teams", "benchmark"] = "teams",
+) -> Activity:
     try:
-        if (payload.target != "teams"
+        if (payload.target != expected_target
                 or build_conversation_key(payload.activity) != payload.partition_key):
             raise ValueError("identity mismatch")
         activity = Activity.model_validate(payload.activity)
+        # Attachments bypass the connector and use a separate Teams HTTP downloader.
+        if expected_target == "benchmark" and activity.attachments:
+            raise ValueError("benchmark attachments are not supported")
         if (not activity.service_url or activity.channel_id != "msteams"
                 or not activity.recipient or not activity.recipient.id
                 or activity.delivery_mode not in {None, "normal"}
@@ -135,7 +113,7 @@ async def _raise_send_error(context: TurnContext, error: Exception) -> None:
     raise _failure(error, sending=True, phase="send") from None
 
 
-class _PreparationAdapter(CloudAdapter):
+class _PreparationAdapter(ManagedCloudAdapter):
     async def send_activities(
         self, context: TurnContext, activities: list[Activity],
     ) -> list[ResourceResponse]:
@@ -164,13 +142,21 @@ class TeamsTurnExecutor:
     The optional SDK connector factory replaces the outbound transport, not the
     SDK pipeline. Generation and delivery use distinct adapters so saved-reply
     delivery cannot restart typing, download attachments or call the model.
+    Benchmark reuse requires an explicit isolated connector and rejects attachments;
+    target markers and partition identity are never rewritten.
     """
 
     def __init__(
-        self, components: AdvisorComponents, connection_manager: Connections,
+        self, components: "AdvisorComponents", connection_manager: Connections,
         bot_app_id: str, *,
         channel_service_client_factory: ChannelServiceClientFactoryBase | None = None,
+        expected_target: Literal["teams", "benchmark"] = "teams",
     ):
+        if expected_target not in ("teams", "benchmark"):
+            raise ValueError("expected_target must be teams or benchmark")
+        if expected_target == "benchmark" and channel_service_client_factory is None:
+            raise ValueError("benchmark requires an explicit connector factory")
+        self._expected_target = expected_target
         self._components = components
         self._connection_manager = connection_manager
         self._bot_app_id = bot_app_id
@@ -179,16 +165,27 @@ class TeamsTurnExecutor:
             channel_service_client_factory=channel_service_client_factory)
         self._generation.on_turn_error = _raise_prepare_error
         self._generation.use(NonBlockingTypingMiddleware())
-        self._delivery = CloudAdapter(
+        self._delivery = ManagedCloudAdapter(
             connection_manager=connection_manager,
             channel_service_client_factory=channel_service_client_factory)
         self._delivery.on_turn_error = _raise_send_error
 
+    def validate(self, payload: TaskPayload) -> None:
+        """Reject invalid identity before the worker reads private history."""
+        with _safe_sdk_logs("validate"):
+            try:
+                with trace_scope(new=True, trace_id=payload.trace_id):
+                    _validated_activity(payload, expected_target=self._expected_target)
+                observe_job(payload)
+            except ValueError:
+                raise DeliveryFailure(
+                    definitely_not_sent=True, retryable=False,
+                    safe_code="invalid_payload") from None
+
     async def prepare(self, payload: TaskPayload,
                       history: list[dict]) -> PreparedTurn:
-        with _safe_sdk_logs("prepare"), trace_scope(new=True) as trace:
-            trace.trace_id = payload.trace_id
-            activity = _validated_activity(payload)
+        with _safe_sdk_logs("prepare"), trace_scope(new=True, trace_id=payload.trace_id) as trace:
+            activity = _validated_activity(payload, expected_target=self._expected_target)
             bot_id = activity.recipient.id
             if not should_respond(_activity_to_dict(activity), bot_id):
                 return PreparedTurn(reply=None, history=[], outcome="ignored")
@@ -233,9 +230,8 @@ class TeamsTurnExecutor:
         sending = False
         acknowledged = False
         receipt: str | None = None
-        with _safe_sdk_logs("send"), trace_scope(new=True) as trace:
-            trace.trace_id = payload.trace_id
-            activity = _validated_activity(payload)
+        with _safe_sdk_logs("send"), trace_scope(new=True, trace_id=payload.trace_id):
+            activity = _validated_activity(payload, expected_target=self._expected_target)
             if prepared.reply is None:
                 return None
             try:

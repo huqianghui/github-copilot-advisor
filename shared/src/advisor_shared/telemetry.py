@@ -1,6 +1,8 @@
 """Request-local stage timing; no exporters, payload capture or network I/O."""
 import asyncio
 import logging
+import os
+import re
 import time
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
@@ -18,11 +20,15 @@ logger = logging.getLogger(__name__)
 P = ParamSpec("P")
 R = TypeVar("R")
 Attribute = str | int | float | bool | None
+_BOOT_ID = uuid4().hex
 
 
 @dataclass
 class TraceContext:
     trace_id: str = field(default_factory=lambda: uuid4().hex)
+    segment_id: str = field(default_factory=lambda: uuid4().hex)
+    boot_id: str = field(default_factory=lambda: _BOOT_ID)
+    process_id: int = field(default_factory=os.getpid)
     started_at: float = field(default_factory=lambda: time.monotonic())
     timings: list[StepTiming] = field(default_factory=list)
 
@@ -40,12 +46,19 @@ def current_span() -> StepTiming | None:
 
 
 @contextmanager
-def trace_scope(*, new: bool = False) -> Iterator[TraceContext]:
+def trace_scope(*, new: bool = False,
+                trace_id: str | None = None) -> Iterator[TraceContext]:
+    if trace_id is not None and (
+        not isinstance(trace_id, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", trace_id) is None
+    ):
+        raise ValueError("invalid trace identifier")
     existing = current_trace()
-    if existing is not None and not new:
+    if existing is not None and not new and (
+            trace_id is None or trace_id == existing.trace_id):
         yield existing
         return
-    trace = TraceContext()
+    trace = TraceContext() if trace_id is None else TraceContext(trace_id=trace_id)
     trace_token = _trace.set(trace)
     span_token = _span.set(None)
     try:
@@ -79,6 +92,8 @@ class _Step(AbstractContextManager[StepTiming]):
         self.record = StepTiming(
             name=self.name, span_id=uuid4().hex[:16],
             parent_span_id=parent.span_id if parent else None,
+            segment_id=self.trace.segment_id, boot_id=self.trace.boot_id,
+            process_id=self.trace.process_id,
             started_at=datetime.now(timezone.utc).isoformat(),
             start_offset_ms=round((self.started - self.trace.started_at) * 1000, 3),
             attributes=self.attributes,

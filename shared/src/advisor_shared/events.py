@@ -11,6 +11,9 @@ class StepTiming(BaseModel):
     name: str
     span_id: str
     parent_span_id: str | None = None
+    segment_id: str | None = None
+    boot_id: str | None = None
+    process_id: int | None = None
     started_at: str
     start_offset_ms: float = Field(ge=0)
     duration_ms: float = Field(default=0, ge=0)

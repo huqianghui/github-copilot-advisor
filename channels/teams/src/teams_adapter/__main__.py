@@ -15,13 +15,15 @@ from microsoft_agents.hosting.core import (
     TurnState,
 )
 
-from advisor_agent.factory import build_advisor
 from advisor_shared.logging import TelemetryFormatter, configure_logging
 from advisor_shared.telemetry import step
-from teams_adapter.app import create_app
-from teams_adapter.bot import register_handlers
-from teams_adapter.downloader import TeamsImageDownloader
-from teams_adapter.typing import NonBlockingTypingMiddleware
+from teams_adapter.app import create_app, create_cloud_app
+
+
+def build_advisor(*args, **kwargs):
+    from advisor_agent.factory import build_advisor as build
+    logging.getLogger("openai").setLevel(logging.INFO)
+    return build(*args, **kwargs)
 
 
 def _configure_logging() -> None:
@@ -41,6 +43,10 @@ def _configure_logging() -> None:
 
 
 def build_agent_app():
+    from teams_adapter.bot import register_handlers
+    from teams_adapter.downloader import TeamsImageDownloader
+    from teams_adapter.typing import NonBlockingTypingMiddleware
+
     config = load_configuration_from_env(environ)
     connection_manager = MsalConnectionManager(**config)
     adapter = CloudAdapter(connection_manager=connection_manager)
@@ -65,8 +71,15 @@ def build_agent_app():
 def main() -> None:
     _configure_logging()
     with step("app.startup"):
-        agent_app, adapter, agent_configuration = build_agent_app()
-        app = create_app(agent_app, adapter, agent_configuration)
+        mode = environ.get("ADVISOR_PROCESSING_MODE", "direct")
+        if mode == "direct":
+            agent_app, adapter, agent_configuration = build_agent_app()
+            app = create_app(agent_app, adapter, agent_configuration)
+        elif mode == "queued":
+            from teams_adapter.cloud.runtime import get_ingress, get_worker
+            app = create_cloud_app(get_ingress(), get_worker)
+        else:
+            raise ValueError("ADVISOR_PROCESSING_MODE must be direct or queued")
     web.run_app(app, port=int(environ.get("PORT", 3978)))
 
 

@@ -58,3 +58,72 @@ def create_app(agent_app, adapter, agent_configuration) -> web.Application:
     app.router.add_post("/api/messages", messages)
     app.router.add_get("/healthz", healthz)
     return app
+
+
+def create_cloud_app(ingress, worker_factory, *, runtime=None) -> web.Application:
+    """Supervise shared queue/maintenance tasks for the lifetime of the ACA app."""
+    from teams_adapter.cloud.observability import host_invocation
+
+    if runtime is None:
+        from teams_adapter.cloud.runtime import get_runtime
+        runtime = get_runtime()
+    @web.middleware
+    async def observe_http(request, handler):
+        probe = (request.method in {"GET", "HEAD"}
+                 and request.path in {"/healthz", "/readyz"})
+        with host_invocation("http", host_kind="aca", workload=not probe) as observation:
+            try:
+                response = await handler(request)
+            except web.HTTPException as error:
+                observation.http_status(error.status)
+                raise
+            observation.http_status(response.status)
+            return response
+
+    app = web.Application(middlewares=[observe_http])
+
+    async def lifecycle(_app):
+        try:
+            await runtime.start(worker_factory=worker_factory)
+            yield
+        finally:
+            await runtime.aclose()
+
+    async def messages(request):
+        result = await ingress.handle_http(
+            request.method, request.headers, await request.read())
+        if result.body is None:
+            return web.Response(status=result.status, headers=result.headers)
+        return web.json_response(result.body, status=result.status, headers=result.headers)
+
+    async def healthz(_request):
+        return web.Response(text="ok" if runtime.healthy else "unhealthy",
+                            status=200 if runtime.healthy else 503)
+
+    async def readyz(_request):
+        ready = runtime.healthy and runtime.ready
+        return web.Response(text="ready" if ready else "not ready", status=200 if ready else 503)
+
+    async def benchmark(request, operation):
+        target = runtime.benchmark_ingress
+        if target is None or not target.settings.enabled:
+            return web.Response(status=404)
+        handler = {"runs": target.handle_runs, "messages": target.handle_messages}[operation]
+        result = await handler(request.method, request.headers, await request.read())
+        if result.body is None:
+            return web.Response(status=result.status, headers=result.headers)
+        return web.json_response(result.body, status=result.status, headers=result.headers)
+
+    async def benchmark_runs(request):
+        return await benchmark(request, "runs")
+
+    async def benchmark_messages(request):
+        return await benchmark(request, "messages")
+
+    app.cleanup_ctx.append(lifecycle)
+    app.router.add_post("/api/messages", messages)
+    app.router.add_get("/healthz", healthz)
+    app.router.add_get("/readyz", readyz)
+    app.router.add_post("/bench/runs", benchmark_runs)
+    app.router.add_post("/bench/messages", benchmark_messages)
+    return app

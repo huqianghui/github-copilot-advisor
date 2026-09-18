@@ -76,6 +76,7 @@ class ConnectorBoundary:
         self.setup_error = None
         self.send_error = None
         self.close_error = None
+        self.close_count = 0
         self.typing = asyncio.Event()
         self.identities = []
 
@@ -92,6 +93,7 @@ class ConnectorBoundary:
         return SimpleNamespace(close=self.close)
 
     async def close(self):
+        self.close_count += 1
         if self.close_error:
             raise self.close_error
 
@@ -133,6 +135,164 @@ def make_executor(case):
     return TeamsTurnExecutor(
         case.components, case.connection_manager, APP_ID,
         channel_service_client_factory=case.connector)
+
+
+def benchmark_payload():
+    return TaskPayload.model_validate({
+        **payload_for(serviceUrl="https://benchmark.invalid").model_dump(),
+        "target": "benchmark", "run_id": "offline-run", "request_id": "offline-request",
+    })
+
+
+@pytest.mark.parametrize("falsey_factory", [False, True])
+async def test_benchmark_sdk_pipeline_requires_only_explicit_connector_io(
+        executor_case, monkeypatch, falsey_factory):
+    from teams_adapter.cloud.executor import TeamsTurnExecutor
+
+    class FalseyConnector(ConnectorBoundary):
+        def __bool__(self):
+            return False
+
+    if falsey_factory:
+        executor_case.connector = FalseyConnector()
+
+    def forbidden_real_factory(*args, **kwargs):
+        pytest.fail("benchmark attempted to construct a real Teams connector")
+
+    monkeypatch.setattr(
+        "teams_adapter.cloud.auth.RestChannelServiceClientFactory", forbidden_real_factory)
+    executor = TeamsTurnExecutor(
+        executor_case.components, executor_case.connection_manager, APP_ID,
+        channel_service_client_factory=executor_case.connector, expected_target="benchmark")
+    payload = benchmark_payload()
+    original = payload.model_dump()
+    assert executor.validate(payload) is None
+    prepared = await executor.prepare(payload, [])
+    assert prepared.reply["text"] == "answer"
+    assert prepared.history == [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    assert executor_case.connector.final_sends == []
+    assert await executor.send(payload, prepared) == "reply-123"
+    assert len(executor_case.connector.final_sends) == 1
+    assert payload.model_dump() == original
+    assert payload.target == "benchmark"
+
+
+def test_benchmark_mode_cannot_fall_back_to_a_real_teams_connector(executor_case, monkeypatch):
+    from teams_adapter.cloud.executor import TeamsTurnExecutor
+
+    def forbidden_real_factory(*args, **kwargs):
+        pytest.fail("missing test connector must fail before SDK construction")
+
+    monkeypatch.setattr(
+        "teams_adapter.cloud.auth.RestChannelServiceClientFactory", forbidden_real_factory)
+    with pytest.raises(ValueError, match="explicit connector"):
+        TeamsTurnExecutor(
+            executor_case.components, executor_case.connection_manager, APP_ID,
+            expected_target="benchmark")
+
+
+async def test_benchmark_attachments_cannot_reach_the_separate_teams_downloader(
+        executor_case, monkeypatch):
+    from advisor_shared.delivery import DeliveryFailure
+    from teams_adapter.cloud.executor import TeamsTurnExecutor
+
+    def forbidden_http(*args, **kwargs):
+        pytest.fail("benchmark attachment attempted Teams HTTP I/O")
+
+    monkeypatch.setattr("teams_adapter.downloader.httpx.AsyncClient", forbidden_http)
+    executor = TeamsTurnExecutor(
+        executor_case.components, executor_case.connection_manager, APP_ID,
+        channel_service_client_factory=executor_case.connector, expected_target="benchmark")
+    payload = benchmark_payload()
+    payload.activity["attachments"] = [{
+        "contentType": "image/png", "contentUrl": "https://api.botframework.com/fake-image"}]
+    with pytest.raises(DeliveryFailure, match="invalid_payload"):
+        executor.validate(payload)
+    with pytest.raises(DeliveryFailure, match="invalid_payload"):
+        await executor.prepare(payload, [])
+    assert executor_case.connector.identities == []
+    assert executor_case.backend.calls == []
+
+
+@pytest.mark.parametrize("target", [None, "unknown", True])
+def test_executor_rejects_unsupported_target_configuration(executor_case, target):
+    from teams_adapter.cloud.executor import TeamsTurnExecutor
+
+    with pytest.raises(ValueError, match="expected_target"):
+        TeamsTurnExecutor(
+            executor_case.components, executor_case.connection_manager, APP_ID,
+            channel_service_client_factory=executor_case.connector, expected_target=target)
+
+
+@pytest.mark.parametrize("expected_target", ["teams", "benchmark"])
+@pytest.mark.parametrize("invalid", ["target", "partition"])
+async def test_target_hook_keeps_exact_target_and_partition_checks_before_io(
+        executor_case, expected_target, invalid):
+    from advisor_shared.delivery import DeliveryFailure
+    from teams_adapter.cloud.executor import TeamsTurnExecutor
+
+    class ForbiddenHistory(list):
+        def __iter__(self):
+            pytest.fail("invalid target/partition accessed private history")
+
+    if expected_target == "teams":
+        executor = make_executor(executor_case)  # Exercise the unchanged default.
+        payload = benchmark_payload() if invalid == "target" else payload_for()
+    else:
+        executor = TeamsTurnExecutor(
+            executor_case.components, executor_case.connection_manager, APP_ID,
+            channel_service_client_factory=executor_case.connector, expected_target="benchmark")
+        payload = payload_for() if invalid == "target" else benchmark_payload()
+    if invalid == "partition":
+        payload = payload.model_copy(update={"partition_key": "another-private-partition"})
+    with pytest.raises(DeliveryFailure, match="invalid_payload"):
+        executor.validate(payload)
+    with pytest.raises(DeliveryFailure, match="invalid_payload"):
+        await executor.prepare(payload, ForbiddenHistory())
+    with pytest.raises(DeliveryFailure, match="invalid_payload"):
+        await executor.send(payload, PreparedTurn(
+            reply={"type": "message", "text": "saved"}, history=[], outcome="success"))
+    assert executor_case.backend.calls == []
+    assert executor_case.connector.identities == []
+    assert executor_case.connector.sent == []
+
+
+def test_validate_is_synchronous_and_has_no_turn_side_effects(executor_case):
+    payload = payload_for()
+    original = payload.model_dump()
+    assert make_executor(executor_case).validate(payload) is None
+    assert payload.model_dump() == original
+    assert executor_case.backend.calls == []
+    assert executor_case.connector.identities == []
+    assert executor_case.connector.sent == []
+
+
+@pytest.mark.parametrize("invalid", ["partition", "sender", "activity_schema", "trace_id"])
+def test_validate_rejects_invalid_payload_with_shared_safe_failure(
+        executor_case, invalid, caplog):
+    from advisor_shared.delivery import DeliveryFailure
+
+    payload = payload_for("private-validation-text")
+    if invalid == "partition":
+        payload = payload.model_copy(update={"partition_key": "wrong-partition"})
+    elif invalid == "sender":
+        del payload.activity["from"]
+    elif invalid == "activity_schema":
+        payload.activity["text"] = {"private": "private-validation-text"}
+    else:
+        payload = payload.model_copy(update={"trace_id": "private-validation-text\n"})
+    with pytest.raises(DeliveryFailure) as caught:
+        make_executor(executor_case).validate(payload)
+    assert caught.value.safe_code == "invalid_payload"
+    assert caught.value.definitely_not_sent and not caught.value.retryable
+    assert "private-validation-text" not in str(caught.value)
+    assert "private-validation-text" not in caplog.text
+    assert executor_case.backend.calls == []
+    assert executor_case.connector.identities == []
+    assert executor_case.connector.sent == []
 
 
 async def test_prepare_never_sends_final_reply_and_send_uses_checkpoint(executor_case):
@@ -614,3 +774,33 @@ async def test_retry_after_cannot_make_post_acknowledgement_failure_retryable(
     assert caught.value.safe_code == "delivery_unknown"
     assert caught.value.retry_after_seconds == 60
     assert len(executor_case.connector.final_sends) == 1
+
+
+async def test_sdk_clients_close_when_generation_is_cancelled(executor_case):
+    entered = asyncio.Event()
+
+    async def wait_for_shutdown(text):
+        entered.set()
+        await asyncio.Event().wait()
+
+    executor_case.backend.gate = wait_for_shutdown
+    task = asyncio.create_task(make_executor(executor_case).prepare(payload_for(), []))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert executor_case.connector.close_count == 2
+    assert executor_case.connector.final_sends == []
+
+
+@pytest.mark.parametrize(("phase", "closes"), [("setup", 1), ("send", 2)])
+async def test_sdk_clients_close_after_failed_turn(executor_case, phase, closes):
+    from advisor_shared.delivery import DeliveryFailure
+    if phase == "setup":
+        executor_case.connector.setup_error = TimeoutError("private-setup")
+    else:
+        executor_case.connector.send_error = response_error(403)
+    with pytest.raises(DeliveryFailure):
+        await make_executor(executor_case).send(payload_for(), PreparedTurn(
+            reply={"type": "message", "text": "saved"}, history=[], outcome="success"))
+    assert executor_case.connector.close_count == closes
