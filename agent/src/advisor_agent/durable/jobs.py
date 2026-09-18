@@ -371,18 +371,55 @@ class JobStore:
             current = await self.gateway.read(name)
             if current is None:
                 raise JobConflict("leased job disappeared during quarantine")
-            terminal = await self.gateway.read(f"terminal-metadata/{head.job_id}.json")
-            if terminal is not None:
-                record = JobRecord.model_validate_json(terminal.body)
-                if (not record.terminal or record.job_id != head.job_id
-                        or record.partition_key != partition):
-                    raise JobConflict("terminal metadata identity mismatch")
-                guard.assert_active()
-                await self.gateway.write(name, _encode(record), etag=current.etag, lease_id=guard.id)
-                return False
+            etag = current.etag
             try:
                 slot = _JOB_SLOT.validate_json(current.body)
             except ValidationError:
+                slot = None
+
+            def terminal_matches(record: JobRecord) -> bool:
+                return (record.terminal and record.terminal_at is not None
+                        and record.job_id == head.job_id and record.partition_key == partition
+                        and record.sequence == head.sequence)
+
+            terminal_name = f"terminal-metadata/{head.job_id}.json"
+            terminal = await self.gateway.read(terminal_name)
+            if terminal is not None:
+                try:
+                    record = JobRecord.model_validate_json(terminal.body)
+                except ValidationError:
+                    record = None
+                if record is not None and terminal_matches(record) and record.result is None:
+                    guard.assert_active()
+                    await self.gateway.write(name, _encode(record), etag=etag, lease_id=guard.id)
+                    return False
+                if isinstance(slot, JobRecord) and terminal_matches(slot):
+                    # A confirmed terminal live row can reconstruct its body-free
+                    # metadata. Fence the live row and CAS the malformed metadata.
+                    repaired = slot.model_copy(update={"result": None})
+                    guard.assert_active()
+                    await self.gateway.write(name, _encode(repaired), etag=etag, lease_id=guard.id)
+                    await self.gateway.write(terminal_name, _encode(repaired), etag=terminal.etag)
+                    return False
+                if isinstance(slot, JobRecord) and (
+                        slot.job_id != head.job_id or slot.partition_key != partition):
+                    raise JobConflict("job identity mismatch during terminal reconciliation")
+                if not isinstance(slot, _QuarantineFence):
+                    slot = _QuarantineFence(
+                        partition_key=partition,
+                        record=previous or QuarantineRecord(
+                            code="invalid_job", body_digest=hashlib.sha256(terminal.body).hexdigest(),
+                            quarantined_at=candidate.record.quarantined_at,
+                            job_id=head.job_id, sequence=head.sequence))
+                if (slot.partition_key != partition or slot.record.job_id != head.job_id
+                        or slot.record.sequence != head.sequence):
+                    raise JobConflict("quarantine reservation identity mismatch")
+                guard.assert_active()
+                etag = await self.gateway.write(name, _encode(slot), etag=etag, lease_id=guard.id)
+                # Neither copy proves a terminal outcome. The reserved identity
+                # blocks replay while the malformed metadata is conditionally removed.
+                await self.gateway.delete(terminal_name, etag=terminal.etag)
+            if slot is None:
                 slot = _QuarantineFence(
                     partition_key=partition,
                     record=previous or QuarantineRecord(
@@ -403,7 +440,7 @@ class JobStore:
             if (slot.partition_key != partition or slot.record.job_id != head.job_id
                     or slot.record.sequence != head.sequence):
                 raise JobConflict("quarantine reservation identity mismatch")
-            await self._finish_quarantine(slot, current.etag, guard)
+            await self._finish_quarantine(slot, etag, guard)
             return True
 
     async def _finish_quarantine(self, fence: _QuarantineFence, etag: str,

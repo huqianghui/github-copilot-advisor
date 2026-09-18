@@ -5,10 +5,11 @@ from contextlib import asynccontextmanager
 from azure.core.exceptions import HttpResponseError
 import pytest
 
-from advisor_agent.durable.jobs import JobQuarantined, QuarantineRecord
+from advisor_agent.durable.blob import BlobConflict
+from advisor_agent.durable.jobs import JobQuarantined, JobRecord, QuarantineRecord, TaskRef
 from advisor_agent.durable.leases import LeaseLost
 from advisor_agent.durable.maintenance import Maintenance
-from advisor_shared.cloud import QueueWake
+from advisor_shared.cloud import PreparedTurn, QueueWake
 
 
 async def run_path(case, poison_harness, path):
@@ -275,3 +276,119 @@ async def test_quarantined_body_cleanup_respects_an_active_fence_lease(worker_ca
         assert await case.jobs.gateway.read(f"payload/{receipt.job_id}.json") is not None
     await case.jobs.prune()
     assert await case.jobs.gateway.read(f"payload/{receipt.job_id}.json") is None
+
+
+async def corrupt_finished_head(case, *, corrupt_live=False):
+    first = await case.accept("a")
+    second = await case.accept("next")
+    async with case.jobs.leased_job(first.job_id) as job:
+        await job.mark_running()
+        await job.save_result(PreparedTurn(
+            reply={"type": "message", "text": "private-answer"},
+            history=[{"role": "user", "content": "private-question"},
+                     {"role": "assistant", "content": "private-answer"}], outcome="success"))
+        await job.mark_sending()
+        await job.complete("first-receipt")
+    live_name = f"jobs/{first.job_id}.json"
+    live = await case.jobs.gateway.read(live_name)
+    terminal_name = f"terminal-metadata/{first.job_id}.json"
+    terminal = await case.jobs.gateway.read(terminal_name)
+    await case.jobs.gateway.write(terminal_name, b'{"version":1}', etag=terminal.etag)
+    if corrupt_live:
+        await case.jobs.gateway.write(live_name, b'{"version":1}', etag=live.etag)
+    return first, second, live.body, terminal_name
+
+
+@pytest.mark.parametrize("path", ["outbox", "poison"])
+async def test_malformed_terminal_metadata_is_reconciled_from_fenced_completed_live_row(
+        worker_case, poison_queue_harness, path):
+    case = worker_case
+    first, second, live_body, terminal_name = await corrupt_finished_head(case)
+    result = await run_path(case, poison_queue_harness, path)
+    assert result.failed == 0 and result.quarantined == 0
+    restored = await case.jobs.gateway.read(terminal_name)
+    assert JobRecord.model_validate_json(restored.body) == JobRecord.model_validate_json(live_body)
+    assert (await case.jobs.read(first.job_id)).delivery_receipt == "first-receipt"
+    assert (await case.jobs.inbox.head(case.partition())).job_id == second.job_id
+    if path == "poison":
+        assert any(op == "ack" and "/messages/" in request.url
+                   for op, request in poison_queue_harness[2].calls)
+    await case.worker.process_session(case.partition(), "review")
+    assert case.executor.sent == ["next"]
+
+
+@pytest.mark.parametrize("path", ["outbox", "poison"])
+async def test_malformed_terminal_and_live_rows_are_boundedly_quarantined(
+        worker_case, poison_queue_harness, path):
+    case = worker_case
+    first, second, _, terminal_name = await corrupt_finished_head(case, corrupt_live=True)
+    result = await run_path(case, poison_queue_harness, path)
+    assert result.quarantined == 1
+    with pytest.raises(JobQuarantined):
+        await case.jobs.read(first.job_id)
+    assert await case.jobs.gateway.read(terminal_name) is None
+    assert (await case.jobs.inbox.head(case.partition())).job_id == second.job_id
+    await case.worker.process_session(case.partition(), "review")
+    assert case.executor.sent == ["next"]
+
+
+async def test_terminal_metadata_reconciliation_respects_active_live_job_lease(worker_case):
+    case = worker_case
+    first, _, _, terminal_name = await corrupt_finished_head(case)
+    async with case.jobs.gateway.lease(f"jobs/{first.job_id}.json"):
+        result = await Maintenance(case.jobs, case.outbox).run_once()
+        assert result.skipped >= 1
+        assert (await case.jobs.gateway.read(terminal_name)).body == b'{"version":1}'
+        assert (await case.jobs.inbox.head(case.partition())).job_id == first.job_id
+    await Maintenance(case.jobs, case.outbox).run_once()
+    assert (await case.jobs.read(first.job_id)).state == "completed"
+
+
+@pytest.mark.parametrize("operation", ["read", "write"])
+@pytest.mark.parametrize("status", [403, 503])
+async def test_terminal_metadata_transport_errors_remain_errors_not_quarantine(
+        worker_case, monkeypatch, operation, status):
+    case = worker_case
+    first, _, _, terminal_name = await corrupt_finished_head(case)
+    original = getattr(case.jobs.gateway, operation)
+    error = HttpResponseError("injected terminal metadata transport failure")
+    error.status_code = status
+
+    async def fail(name, *args, **kwargs):
+        if name == terminal_name:
+            raise error
+        return await original(name, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(case.jobs.gateway, operation, fail)
+        with pytest.raises(HttpResponseError) as observed:
+            await case.jobs.quarantine_job(
+                case.partition(), TaskRef(job_id=first.job_id, sequence=first.sequence))
+        assert observed.value.status_code == status
+    assert (await case.jobs.gateway.read(terminal_name)).body == b'{"version":1}'
+    assert (await case.jobs.inbox.head(case.partition())).job_id == first.job_id
+    assert not (await case.jobs.gateway.list_page("poison/")).names
+
+
+async def test_terminal_metadata_reconciliation_is_conditional_on_its_etag(worker_case, monkeypatch):
+    case = worker_case
+    first, _, live_body, terminal_name = await corrupt_finished_head(case)
+    write = case.jobs.gateway.write
+    competitor = JobRecord.model_validate_json(live_body).model_copy(
+        update={"delivery_receipt": "concurrent-receipt"})
+    raced = False
+
+    async def race(name, body, **kwargs):
+        nonlocal raced
+        if name == terminal_name and not raced:
+            raced = True
+            current = await case.jobs.gateway.read(name)
+            await write(name, competitor.model_dump_json().encode(), etag=current.etag)
+        return await write(name, body, **kwargs)
+
+    monkeypatch.setattr(case.jobs.gateway, "write", race)
+    with pytest.raises(BlobConflict):
+        await case.jobs.quarantine_job(
+            case.partition(), TaskRef(job_id=first.job_id, sequence=first.sequence))
+    assert (await case.jobs.read(first.job_id)).delivery_receipt == "concurrent-receipt"
+    assert (await case.jobs.inbox.head(case.partition())).job_id == first.job_id
