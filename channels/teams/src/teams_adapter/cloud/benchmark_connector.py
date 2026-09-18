@@ -46,14 +46,15 @@ from advisor_shared.benchmark import (
 )
 from advisor_shared.cloud import PreparedTurn, TaskPayload
 from advisor_shared.delivery import DeliveryFailure
-from advisor_shared.telemetry import step
+from advisor_shared.telemetry import step, trace_scope
 from teams_adapter.cloud.benchmark import (
     BENCHMARK_SERVICE_URL, BenchmarkAuth, _Rejection, _log_failure,
 )
 from teams_adapter.extract import build_conversation_key
 from teams_adapter.cloud.benchmark_observations import (
     ObservedComponents, capture_preparation, host_snapshot, merge_telemetry,
-    preparation_telemetry,
+    preparation_telemetry, link_ingress_trace, completed_history_telemetry,
+    emit_stage_completion,
 )
 
 
@@ -101,7 +102,13 @@ def _retry_after(value):
 
 
 class BenchmarkReplySink:
-    """Authenticated bounded HTTP sender. Session and credential stay caller-owned."""
+    """Authenticated bounded HTTP sender. Session and credential stay caller-owned.
+
+    Completed callback-auth and HTTP send timings are trace-correlated logs, not
+    retroactively inserted into an already serialized reply. ``benchmark.send``
+    measures HTTP request through validated acknowledgement, excluding separate
+    callback auth. Typing has distinct stage names and is never a final-send sample.
+    """
 
     def __init__(
         self, session: ClientSession, callback_url: str, *,
@@ -136,8 +143,25 @@ class BenchmarkReplySink:
         except Exception:
             raise _failure("benchmark_callback_auth_unavailable", retryable=True) from None
 
-    async def _post(self, reply: BenchmarkReply) -> str:
-        headers = await self._headers()
+    async def _post(self, reply: BenchmarkReply, *, trace_id: str) -> str:
+        with trace_scope(trace_id=trace_id):
+            with step("benchmark.callback_auth" if reply.event == "final"
+                      else "benchmark.typing_auth"):
+                headers = await self._headers()
+            timing = None
+            try:
+                with step("benchmark.send" if reply.event == "final" else "benchmark.typing") as timing:
+                    return await self._post_http(reply, headers)
+            finally:
+                if reply.event == "final" and timing is not None:
+                    emit_stage_completion(
+                        trace_id=trace_id, job_id=reply.job_id, boot_id=timing.boot_id,
+                        segment_id=timing.segment_id, span_id=timing.span_id,
+                        stage=StageObservation(
+                            name="send", duration_ms=timing.duration_ms,
+                            outcome="success" if timing.status == "success" else "failed"))
+
+    async def _post_http(self, reply: BenchmarkReply, headers) -> str:
         try:
             async with asyncio.timeout(30):
                 async with self.session.post(
@@ -176,7 +200,8 @@ class BenchmarkReplySink:
     async def typing(self, payload: TaskPayload) -> str:
         return await self._post(BenchmarkReply(
             run_id=payload.run_id, request_id=payload.request_id, job_id=payload.job_id,
-            event="typing", telemetry=SafeTelemetry(trace_id=payload.trace_id)))
+            event="typing", telemetry=SafeTelemetry(trace_id=payload.trace_id)),
+            trace_id=payload.trace_id)
 
     async def send(
         self, payload: TaskPayload, prepared: PreparedTurn, *,
@@ -195,7 +220,7 @@ class BenchmarkReplySink:
                 reply=message, telemetry=telemetry or SafeTelemetry(trace_id=payload.trace_id))
         except (ValueError, TypeError, KeyError):
             raise _failure("invalid_reply") from None
-        return await self._post(reply)
+        return await self._post(reply, trace_id=payload.trace_id)
 
 
 @dataclass(frozen=True)
@@ -349,8 +374,9 @@ class BenchmarkTurnExecutor:
 
     async def validate(self, payload):
         try:
-            await self.runs.validate_payload(payload)
+            _, reservation = await self.runs.validate_payload(payload)
             self._synthetic.validate(payload)
+            link_ingress_trace(payload, reservation.telemetry)
         except (ValueError, TypeError, AttributeError, KeyError, _Rejection) as error:
             _log_failure("invalid_payload", error, status=400)
             raise _failure("invalid_payload") from None
@@ -383,7 +409,9 @@ class BenchmarkTurnExecutor:
         try:
             await self.validate(payload)
             run, reservation = await self.runs.validate_payload(payload)
-            snapshot = host_snapshot(self.host_telemetry, payload)
+            snapshot = merge_telemetry(
+                host_snapshot(self.host_telemetry, payload),
+                completed_history_telemetry(payload, "history_read"))
             record = await self.runs.jobs.read(payload.job_id)
             scenario = reservation.request.scenario
             executor = self._synthetic if scenario == "synthetic" else self._real
@@ -431,6 +459,8 @@ class BenchmarkTurnExecutor:
             raise _failure("benchmark_delivery_validation_unavailable", retryable=True) from None
         try:
             checkpoint = _Checkpoint.model_validate(prepared.reply)
+            checkpoint.telemetry = merge_telemetry(
+                checkpoint.telemetry, completed_history_telemetry(payload, "history_commit"))
             if record and record.delivery_attempts:
                 checkpoint.telemetry.delivery_attempts = record.delivery_attempts
             rendered = PreparedTurn(

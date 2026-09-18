@@ -1,9 +1,17 @@
-"""Ordered, fenced execution using persisted preparation and delivery checkpoints."""
+"""Ordered, fenced execution using persisted preparation and delivery checkpoints.
+
+history.read times model-history archive loading/materialization from an already
+leased projection, not earlier context lease/projection acquisition. history.commit
+times the archive/projection/receipt operation, not surrounding job checkpoint
+writes. Both are completed local spans under the payload trace, including failed
+attempts; recovery does not invent a read or generation span it did not execute.
+"""
 import asyncio
 from collections.abc import Awaitable
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timedelta, timezone
 import inspect
+import logging
 import math
 from typing import Literal, Protocol
 
@@ -16,12 +24,36 @@ from advisor_agent.durable.jobs import (
 from advisor_agent.durable.leases import LeaseBusy, _log_failure
 from advisor_agent.durable.queue import OutboxDispatcher
 from advisor_shared.cloud import PreparedTurn, TaskPayload
+from advisor_shared.benchmark import StageObservation
 from advisor_shared.delivery import DeliveryFailure
 from advisor_shared.telemetry import step, trace_scope
 
 
 MAX_TURNS_PER_INVOCATION = 4
 MAX_STAGE_ATTEMPTS = 3
+logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _history_stage(payload: TaskPayload, name: str):
+    with trace_scope() as trace:
+        timing = None
+        try:
+            with step(name, job_id=payload.job_id) as timing:
+                yield
+        finally:
+            if payload.target == "benchmark" and timing is not None:
+                stage = StageObservation(
+                    name={"history.read": "history_read", "history.commit": "history_commit"}[name],
+                    duration_ms=timing.duration_ms,
+                    outcome="success" if timing.status == "success" else "failed")
+                # Log-only StageCompletion contract; the agent never imports a channel.
+                logger.info("benchmark_stage_completed", extra={"telemetry": {
+                    "event": "benchmark_stage_completed", "version": 1,
+                    "trace_id": trace.trace_id, "job_id": payload.job_id,
+                    "boot_id": timing.boot_id, "segment_id": timing.segment_id,
+                    "span_id": timing.span_id, "stage": stage.model_dump(),
+                }})
 
 
 class TurnExecutor(Protocol):
@@ -113,7 +145,8 @@ class SessionWorker:
                 return
             if job.state == "running":
                 await job.retry("generation_failed")
-            messages = await history.get()
+            with _history_stage(payload, "history.read"):
+                messages = await history.get()
             history.assert_active()
             job.assert_active()
             await job.mark_running()
@@ -144,7 +177,8 @@ class SessionWorker:
                 await job.fail("history_failed")
                 return
             await job.mark_committing()
-            await history.commit(job.job_id, job.sequence, prepared.history, written_at)
+            with _history_stage(payload, "history.commit"):
+                await history.commit(job.job_id, job.sequence, prepared.history, written_at)
             await job.mark_history_committed()
         if prepared.reply is None:
             await job.complete(None)

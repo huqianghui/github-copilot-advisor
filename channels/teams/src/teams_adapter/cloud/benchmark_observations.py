@@ -13,15 +13,98 @@ Search dependency counts are observed source-operation attempts (including
 observed 429s), not inferred lower-level HTTP retries. Model rounds and usage
 come from completed ``llm.completion`` spans. HTTP model retry/throttle counts,
 cache usage, global backlog and unobserved resource metrics remain unknown.
+
+Wire stages describe operations completed before serialization, including actual
+history_read at preparation and history_commit at send when observed in that
+attempt. Full ingress and final HTTP send complete too late for their original
+snapshot: StageCompletion logs permit post-run backfill without changing original
+callback arrival latency. Missing/uningested logs remain unknown, never zero.
+``benchmark_trace_link`` also joins host ingress to job traces.
+
+Coverage boundaries: ingress auth is verify(), connection/worker_init are actual
+host/client construction (not DNS/TLS), history_setup is seeded bootstrap only,
+agent is the whole core turn, model/search/render are their existing nested spans.
+history.read covers archive loading from an already leased context, not earlier
+context acquisition. Inbound network transit, individual connection handshakes,
+and context-lease/projection acquisition are not separately observed. Final-send
+and callback-auth completion logs cannot appear in that same HTTP callback.
+These overlapping intervals are not an additive end-to-end latency decomposition.
 """
 from collections import defaultdict
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+import logging
+from typing import Literal
 
-from advisor_shared.benchmark import DependencyObservation, SafeTelemetry, StageObservation
+from pydantic import field_validator
+
+from advisor_shared.benchmark import (
+    DependencyObservation, Identifier, SafeTelemetry, StageObservation, WireModel,
+)
 from advisor_shared.events import AdvisorEvent
 from advisor_shared.telemetry import TraceContext, current_trace
+
+logger = logging.getLogger(__name__)
+
+_OUTCOMES = {
+    "success": "success", "empty": "empty", "degraded": "degraded",
+    "not_configured": "unknown", "error": "failed",
+    "timeout": "failed", "cancelled": "failed",
+}
+
+
+class StageCompletion(WireModel):
+    """Log-only export; select these fields from the ordinary logging envelope.
+
+    Join by job_id AND trace_id. Deduplicate by (boot_id, segment_id, span_id);
+    different spans are real attempts. Do not double-count an operation already
+    represented in callback stages. Process span IDs are not platform-instance
+    evidence and cannot establish a cold start. No request/run/body fields exist.
+    """
+
+    event: Literal["benchmark_stage_completed"]
+    version: Literal[1]
+    trace_id: Identifier
+    job_id: Identifier
+    boot_id: Identifier
+    segment_id: Identifier
+    span_id: Identifier
+    stage: StageObservation
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def integer_version(cls, value):
+        if type(value) is not int:
+            raise ValueError("completion version must be an integer")
+        return value
+
+
+def emit_stage_completion(**values) -> None:
+    event = StageCompletion(event="benchmark_stage_completed", version=1, **values)
+    logger.info("benchmark_stage_completed", extra={"telemetry": event.model_dump()})
+
+
+def completed_history_telemetry(
+    payload, name: Literal["history_read", "history_commit"],
+) -> SafeTelemetry:
+    trace = current_trace()
+    if trace is None or trace.trace_id != payload.trace_id:
+        return SafeTelemetry()
+    source = {"history_read": "history.read", "history_commit": "history.commit"}[name]
+    return SafeTelemetry(stages=[
+        StageObservation(name=name, duration_ms=timing.duration_ms,
+                         outcome=_OUTCOMES[timing.status])
+        for timing in trace.timings
+        if timing.name == source and timing.attributes.get("job_id") == payload.job_id
+    ])
+
+
+def link_ingress_trace(payload, telemetry: SafeTelemetry) -> None:
+    """Call only after validating the stored reservation against the payload."""
+    if telemetry.trace_id is not None:
+        logger.info("benchmark_trace_link", extra={"telemetry": {
+            "trace_id": payload.trace_id, "ingress_trace_id": telemetry.trace_id}})
 
 
 @dataclass
@@ -101,18 +184,13 @@ def preparation_telemetry(observation: PreparationObservations, *, synthetic=Fal
         "search.kb": "kb", "search.github-live": "github", "search.web": "web",
         "benchmark.synthetic": "synthetic",
     }
-    outcomes = {
-        "success": "success", "empty": "empty", "degraded": "degraded",
-        "not_configured": "unknown", "error": "failed",
-        "timeout": "failed", "cancelled": "failed",
-    }
     stages, completions = [], []
     timings = observation.trace.timings if observation.trace is not None else []
     for timing in timings:
         if timing.name in names:
             stages.append(StageObservation(
                 name=names[timing.name], duration_ms=timing.duration_ms,
-                outcome=outcomes[timing.status]))
+                outcome=_OUTCOMES[timing.status]))
         if timing.name == "llm.completion":
             completions.append(timing)
     counts = defaultdict(lambda: [0, 0])

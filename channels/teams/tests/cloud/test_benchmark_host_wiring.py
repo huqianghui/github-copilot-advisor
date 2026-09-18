@@ -110,11 +110,12 @@ async def test_aca_disabled_routes_are_present_and_do_not_use_bot_auth(runtime_c
     assert runtime_case.state.builds == 0
 
 
-async def test_aca_routes_use_canonical_protocol_real_worker_and_isolated_receiver(monkeypatch):
+async def test_aca_routes_use_canonical_protocol_real_worker_and_isolated_receiver(monkeypatch, caplog):
     from teams_adapter.app import create_cloud_app
     from teams_adapter.cloud.observability import HostObservations
     from teams_adapter.cloud import observability
 
+    caplog.set_level("INFO")
     monkeypatch.setattr(observability, "_observations", HostObservations(
         environment={"CONTAINER_APP_REPLICA_NAME": "actual-test-replica"}))
 
@@ -148,6 +149,7 @@ async def test_aca_routes_use_canonical_protocol_real_worker_and_isolated_receiv
         assert callback_session.closed
         assert runtime.queue._closed
         assert runtime.ingress.jobs.gateway._closed
+        assert_completion_exports(caplog, final)
 
 
 async def test_functions_routes_use_target_auth_and_store_same_wire_ack(monkeypatch):
@@ -172,10 +174,11 @@ async def test_functions_routes_use_target_auth_and_store_same_wire_ack(monkeypa
             await runtime.aclose()
 
 
-async def test_functions_authenticated_admission_queue_worker_and_real_callback(monkeypatch):
+async def test_functions_authenticated_admission_queue_worker_and_real_callback(monkeypatch, caplog):
     from teams_adapter.cloud import functions, observability
     from teams_adapter.cloud.observability import HostObservations
 
+    caplog.set_level("INFO")
     monkeypatch.setattr(observability, "_observations", HostObservations(
         environment={"WEBSITE_INSTANCE_ID": "observed-functions-instance"}))
     capture = {}
@@ -217,6 +220,20 @@ async def test_functions_authenticated_admission_queue_worker_and_real_callback(
             await runtime.aclose()
         assert callback_session.closed
         assert runtime.ingress.jobs.gateway._closed
+        assert_completion_exports(caplog, final)
+
+
+def assert_completion_exports(caplog, reply):
+    from teams_adapter.cloud.benchmark_observations import StageCompletion
+
+    records = [StageCompletion.model_validate(record.telemetry) for record in caplog.records
+               if record.message == "benchmark_stage_completed"]
+    assert [record.stage.name for record in records] == [
+        "ingress", "history_read", "history_commit", "send"]
+    assert all(record.job_id == reply.job_id and record.trace_id == reply.telemetry.trace_id
+               for record in records)
+    assert all(record.stage.outcome == "success" for record in records)
+    assert all(record.stage.duration_ms >= 0 for record in records)
 
 
 async def test_benchmark_key_does_not_replace_normal_bot_jwt_auth(monkeypatch, auth_case):

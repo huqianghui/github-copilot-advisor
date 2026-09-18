@@ -59,6 +59,7 @@ from advisor_shared.entra_api import (
 )
 from teams_adapter.cloud.ingress import HttpResult
 from teams_adapter.cloud.benchmark_observations import host_snapshot, merge_telemetry
+from teams_adapter.cloud.observability import observe_ingress_job
 from teams_adapter.extract import build_conversation_key
 
 
@@ -502,6 +503,7 @@ class BenchmarkIngress:
                     snapshot, SafeTelemetry(stages=[auth_observation])))
             payload = self.runs.payload(reservation, run)
             receipt = await self.jobs.submit(payload)
+            observe_ingress_job(payload)
             await self.dispatcher.notify(payload.partition_key, payload.trace_id)
             return HttpResult(202, BenchmarkAck(
                 run_id=request.run_id, request_id=request.request_id,

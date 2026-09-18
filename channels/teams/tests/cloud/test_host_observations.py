@@ -264,7 +264,8 @@ async def test_worker_setup_failure_is_observed_without_exception_text(runtime_c
                 await runtime_case.runtime.get_worker()
             observe_job(payload)
             snapshot = runtime_case.runtime.host_telemetry(payload)
-            assert [(stage.name, stage.outcome) for stage in snapshot.stages] == [
+            assert [(stage.name, stage.outcome) for stage in snapshot.stages
+                    if stage.name == "worker_init"] == [
                 ("worker_init", "failed")]
             assert snapshot.input_tokens is None and snapshot.output_tokens is None
             assert "private-setup-details" not in snapshot.model_dump_json()

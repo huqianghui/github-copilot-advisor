@@ -74,6 +74,7 @@ class BenchmarkAck(WireModel):
 class StageObservation(WireModel):
     name: Literal[
         "ingress", "queue_wait", "worker_init", "auth", "connection", "history_setup",
+        "history_read", "history_commit",
         "synthetic", "agent",
         "kb", "github", "web", "model", "render", "send",
     ]

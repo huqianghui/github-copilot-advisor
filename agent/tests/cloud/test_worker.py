@@ -9,6 +9,33 @@ from advisor_agent.durable.worker import SessionWorker
 from advisor_shared.delivery import DeliveryFailure
 
 
+async def test_history_stage_logs_include_failed_attempt_without_regeneration(worker_case, caplog):
+    caplog.set_level("INFO")
+    case = worker_case
+    await case.accept()
+    payload = case.payloads["a"]
+    case.fail_once_at("before_history_commit")
+    with pytest.raises(ConnectionError):
+        await case.worker.process_session(case.partition(), "wake-trace")
+    timings = [record.telemetry for record in caplog.records
+               if record.message == "step_completed"
+               and record.telemetry["name"].startswith("history.")]
+    assert [(timing["name"], timing["status"]) for timing in timings] == [
+        ("history.read", "success"), ("history.commit", "error")]
+    assert all(timing["trace_id"] == payload.trace_id for timing in timings)
+    assert all(timing["duration_ms"] >= 0 for timing in timings)
+    assert "question:" not in str(timings)
+    assert "injected history commit failure" not in str(timings)
+    caplog.clear()
+    assert await case.worker.process_session(case.partition(), "another-wake") == "drained"
+    timings = [record.telemetry for record in caplog.records
+               if record.message == "step_completed"
+               and record.telemetry["name"].startswith("history.")]
+    assert [(timing["name"], timing["status"]) for timing in timings] == [
+        ("history.commit", "success")]
+    assert case.executor.prepare_calls == 1
+
+
 @pytest.mark.parametrize("point", ["before_history_commit", "after_history_commit"])
 async def test_saved_result_is_reused_after_history_commit_crash(worker_case, point):
     case = worker_case

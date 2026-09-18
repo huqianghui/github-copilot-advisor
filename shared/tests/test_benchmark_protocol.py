@@ -128,6 +128,23 @@ def test_synthetic_wait_is_not_agent_or_model_dependency_telemetry():
     assert telemetry.output_tokens is None
 
 
+@pytest.mark.parametrize("name", ["history_read", "history_commit"])
+def test_durable_history_stages_are_distinct_strict_observations(name):
+    from advisor_shared.benchmark import SafeTelemetry, StageObservation
+
+    observation = {"name": name, "duration_ms": 17.25, "outcome": "success"}
+    telemetry = SafeTelemetry(stages=[observation])
+    assert telemetry.stages[0].model_dump() == observation
+    for changes in (
+        {"duration_ms": -1}, {"duration_ms": float("nan")},
+        {"duration_ms": float("inf")}, {"duration_ms": "12"},
+        {"body": "private-history"}, {"outcome": "invented"},
+    ):
+        with pytest.raises(ValidationError) as failure:
+            StageObservation(**(observation | changes))
+        assert "private-history" not in str(failure.value)
+
+
 def test_shared_dataset_validation_preserves_canonical_content_and_rejects_bad_fixtures():
     from advisor_shared.benchmark import dataset_digest, validate_dataset
 
