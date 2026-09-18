@@ -2,9 +2,10 @@
 
 ## Status
 
-Executing the approved implementation plan. Authentication and local history
-foundations are being implemented and tested. Infrastructure generation,
-deployment validation, provisioning and load tests have not started.
+Executing the approved implementation plan. Authentication and history foundations
+have been tested, and the infrastructure templates compile. Application/runtime
+wiring, packaging and deployment scripts are still in progress. Azure deployment
+validation, provisioning and load tests have not started.
 This document must not be interpreted as approval to skip deployment validation.
 
 ## Approved design
@@ -24,7 +25,11 @@ This document must not be interpreted as approval to skip deployment validation.
 - Search: `cdc-playground-ai-search` in `rg-playground-aiservices`.
 - Chat and same-name `text-embedding-3-large` deployments are present.
 - Existing Search vector schema has 3072 dimensions.
-- These checks establish metadata compatibility only, not data-plane success.
+- Initial checks established metadata compatibility. A later local read-only
+  data-plane smoke using the configured credentials passed: embedding output
+  3072 dimensions, a hybrid/semantic Search result from the 1639-document index,
+  and a nonempty chat completion. This does not validate cloud managed identities
+  or the deployed application.
 - Do not modify models, indexes, existing local Bot configuration or `.env`.
 
 ## Execution boundaries
@@ -64,7 +69,8 @@ This document must not be interpreted as approval to skip deployment validation.
 | `deploy/bench/Run.ps1` | Bounded same-region experiments |
 | `deploy/Cleanup.ps1` | Preview and confirm exact owned-resource deletion |
 
-All these paths are planned and do not yet contain implemented deployment code.
+The PowerShell entry points in this table are still planned. The target and shared
+Bicep modules now exist and have passed local compiler-contract tests.
 
 | Resource | Planned count | Initial configuration |
 |---|---|---|
@@ -121,7 +127,7 @@ remain explicit execution gates, rather than assumed passes.
 | Design approval | Complete |
 | Implementation plan | Execution authorized on 2026-09-18 |
 | Application changes and local regressions | Auth/history foundations verified; 72 Azurite storage contracts and 5 persistent-history integration tests passed; cloud runtime wiring incomplete |
-| Infrastructure/package generation | Not started |
+| Infrastructure/package generation | IaC committed as 32310b9; 40 compiler contracts passed; packaging/scripts incomplete |
 | Azure policy, quota and permission validation | Not completed |
 | Azure deployment validation | Not started |
 | ACA and Flex provisioning | Not started |
