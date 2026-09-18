@@ -209,6 +209,38 @@ The suite inspects real compiled parameter contracts and real `uv`-built
 online wheels, verifies an identical rebuild, and tests hostile ZIP/config
 fixtures. It does not read the repository's real `.env` or require Azure login.
 
+## Cloud smoke checks
+
+After a guarded deployment records status `deployed`, run:
+
+```powershell
+.\.venv\Scripts\python.exe -m advisor_deploy smoke `
+  --deployment deploy\out\runs\aca-ownership.json --auth-mode entra `
+  --output deploy\out\runs\aca-smoke.json
+```
+
+The command validates the recorded owned Azure endpoint, then performs bounded,
+anonymous health and authentication-rejection probes without following redirects.
+It does **not** acquire credentials, call models, submit a question or perform
+Teams-client validation. Missing full-answer, dependency, history-recovery and
+Teams evidence remains `not_run`; health/401/202 cannot fill those gaps. A 404
+on the disabled benchmark route is `not_run`, not a successful auth test.
+
+Optional `--evidence PATH` imports explicit prior observations, not a signed
+attestation. Its exact schema is `format=advisor-smoke-evidence-v1`,
+`resource_id`, `artifact_digest`, `config_digest`, `auth_mode`, `checks`, and
+optional observed `embedding_dimensions`. The resource/artifact/configuration
+and authentication mode must match the deployment. `checks` accepts only
+`passed`, `failed`, `blocked`, `unauthorized` or `not_run` for known check names.
+An embedding pass requires observed dimension **3072**. Do not fill these fields
+from expectations, local fixtures, unrelated deployments or health checks.
+Current HTTP observations override imported HTTP statuses.
+
+The safe JSON report separates actual HTTP observations from imported evidence;
+it contains no response or conversation bodies. Exit 0 requires all checks,
+including actual Teams acceptance; incomplete/failed checks return 1 and CLI
+input/output errors return 2. `automated_passed` does not imply Teams passed.
+
 ## Corporate networks
 
 If PyPI is blocked or slow on your network, set `UV_INDEX_URL` to point at

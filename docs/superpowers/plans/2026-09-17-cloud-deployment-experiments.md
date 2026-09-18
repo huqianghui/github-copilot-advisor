@@ -48,12 +48,14 @@ Docker。不增加 Redis、Service Bus、历史摘要或新的 Agent 框架。
 |---|---|
 | 1 | `cefb657`:认证/DTO 与 factory,224 项针对测试通过 |
 | 2 | `780baf5`:本地 30 天保留、20 条窗口及原子提交,106 项针对测试通过 |
-| 3 | `b1e97f2`:72 项 SDK memory 契约与 72 项真实 Azurite 契约通过;安全诊断日志复核修正进行中 |
+| 3 | `b1e97f2`:72 项 SDK memory 契约与 72 项真实 Azurite 契约通过;安全诊断日志修正 `e7a868c`、`9233a85` 已完成 |
 | 4 | `39680cc`:缓冲区/组件/历史算法通过针对测试;另有 5 项真实 SDK/Azurite 持久历史集成测试通过 |
 | 5-7 | 持久任务/Queue/worker 已实现;`b1d9b19`、`e242443` 修复隔离竞争和损坏终态恢复,两轮限定复核通过;最新 78 项 memory + 78 项真实 Azurite 针对契约通过 |
-| 9-10 | 原生 Core Tools + 独立 Azurite 冒烟通过;JWKS/模型/Teams 使用离线边界,不代表云端问答;最终 benchmark 接线仍在进行 |
+| 9-11 | `b6fa5f3`:宿主/压测接线完成,268 项针对测试通过;原生 Core Tools + 独立 Azurite 的六个函数及完整本地回调通过;JWKS/模型/Teams 使用离线边界 |
 | 12 | 安全打包已实现;显式实验数据集打包 52 项测试通过;当前 Docker Linux 引擎 HTTP 500,最终镜像验证尚未完成 |
 | 13 | `32310b9`:19 项 IaC/测试产物,40 项编译契约通过;三套入口编译成功,没有创建云资源 |
+| 14-15 | 共享协议 `8f2b46d`、压测工具 `baede3a`、部署脚本 `ae6cdd3`;完整部署工具回归 357 passed/5 skipped;最终元数据/打包/冒烟组合 179 项通过 |
+| 16-18 | 最终包已生成并核对源码/锁文件;ACA 实际 ARM 校验/WhatIf 通过;Docker Linux、目录授权和 Flex 实际容量门槛仍阻塞部署,没有云端时延/并发数据 |
 
 已有离线回归(排除正在开发的 `agent/tests/cloud`)为 683 passed、19 integration deselected,
 附带 19 条原有 aiohttp AppKey/RequestKey 提示。后续持久历史及相关针对测试为 101 passed。
@@ -63,6 +65,10 @@ Azurite 仍不能证明 Azure RBAC 或云部署可用。
 另用当前配置凭据做了本地只读依赖冒烟:embedding 返回 3072 维,
 1639 文档的现有索引返回实际混合/语义检索结果,聊天返回非空内容。
 这不代表云端托管身份或完整应用已验证。尚未执行实际云部署、真实 Teams 验收或性能实验。
+后续完整离线应用回归为 1238 passed、1 failed、19 integration deselected:
+唯一失败是未改动的 typing 测试对 Windows 低精度事件循环时间戳的严格递增断言,
+该文件单独运行 21 项通过。详细限制及最新状态见
+[实验状态报告](../../../deploy/reports/summary.md),不能将这次回归记为全绿。
 
 ### 0.1 依赖及宿主事实
 
