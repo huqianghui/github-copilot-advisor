@@ -9,7 +9,7 @@ import hashlib
 from typing import Annotated, Literal
 from uuid import uuid4
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
 
 from advisor_agent.durable.blob import BlobGateway
 from advisor_agent.durable.leases import LeaseBusy, LeaseGuard, LeaseLost, _log_failure
@@ -113,6 +113,25 @@ class JobRecord(_Stored):
     @property
     def terminal(self) -> bool:
         return self.state in TERMINAL_STATES
+
+
+class _QuarantineFence(_Stored):
+    """Body-free reservation of the actual job identity, not a separate lock blob."""
+
+    version: Literal[1] = 1
+    kind: Literal["quarantined_job"] = "quarantined_job"
+    partition_key: str = Field(min_length=1, repr=False)
+    record: QuarantineRecord
+
+    @model_validator(mode="after")
+    def validate_record(self) -> _QuarantineFence:
+        if (self.record.job_id is None or self.record.sequence is None
+                or self.record.code not in ("job_missing", "invalid_job")):
+            raise ValueError("invalid job quarantine reservation")
+        return self
+
+
+_JOB_SLOT = TypeAdapter(JobRecord | _QuarantineFence, config=ConfigDict(hide_input_in_errors=True))
 
 
 class OutboxSnapshot(_Stored):
@@ -313,15 +332,108 @@ class JobStore:
             quarantine = await self.gateway.read(f"poison/job-{job_id}.json")
             if quarantine is not None:
                 value = QuarantineRecord.model_validate_json(quarantine.body)
-                if value.job_id != job_id or value.code != "job_missing":
+                if value.job_id != job_id or value.code not in ("job_missing", "invalid_job"):
                     raise JobConflict("quarantine marker does not match its job")
                 if self.now() < value.quarantined_at + METADATA_RETENTION:
                     raise JobQuarantined("job is quarantined due to missing durable state")
             return None
-        record = JobRecord.model_validate_json(document.body)
+        record = _JOB_SLOT.validate_json(document.body)
+        if isinstance(record, _QuarantineFence):
+            if record.record.job_id != job_id:
+                raise JobConflict("quarantine reservation does not match its job")
+            raise JobQuarantined("job identity is reserved for quarantine")
         if record.job_id != job_id:
             raise JobConflict("job identity mismatch")
         return record
+
+    async def quarantine_job(self, partition: str, head: TaskRef) -> bool:
+        """Retire only a missing/invalid job that we own; False means a repair won."""
+        name = self._name(head.job_id)
+        original = await self.gateway.read(name)
+        marker = await self.gateway.read(f"poison/job-{head.job_id}.json")
+        previous = QuarantineRecord.model_validate_json(marker.body) if marker else None
+        if (previous is not None and (previous.job_id != head.job_id
+                or previous.sequence != head.sequence
+                or previous.code not in ("job_missing", "invalid_job"))):
+            if self.now() < previous.quarantined_at + METADATA_RETENTION:
+                raise JobConflict("quarantine marker identity mismatch")
+            previous = None
+        candidate = _QuarantineFence(
+            partition_key=partition,
+            record=previous or QuarantineRecord(
+                code="job_missing" if original is None else "invalid_job",
+                body_digest=hashlib.sha256(
+                    original.body if original else head.job_id.encode("utf-8")).hexdigest(),
+                quarantined_at=self.now(), job_id=head.job_id, sequence=head.sequence))
+        if original is None:
+            await self.gateway.create(name, _encode(candidate))
+        async with self.gateway.lease(name) as guard:
+            current = await self.gateway.read(name)
+            if current is None:
+                raise JobConflict("leased job disappeared during quarantine")
+            terminal = await self.gateway.read(f"terminal-metadata/{head.job_id}.json")
+            if terminal is not None:
+                record = JobRecord.model_validate_json(terminal.body)
+                if (not record.terminal or record.job_id != head.job_id
+                        or record.partition_key != partition):
+                    raise JobConflict("terminal metadata identity mismatch")
+                guard.assert_active()
+                await self.gateway.write(name, _encode(record), etag=current.etag, lease_id=guard.id)
+                return False
+            try:
+                slot = _JOB_SLOT.validate_json(current.body)
+            except ValidationError:
+                slot = _QuarantineFence(
+                    partition_key=partition,
+                    record=previous or QuarantineRecord(
+                        code="invalid_job", body_digest=hashlib.sha256(current.body).hexdigest(),
+                        quarantined_at=candidate.record.quarantined_at,
+                        job_id=head.job_id, sequence=head.sequence))
+            if isinstance(slot, JobRecord):
+                if slot.job_id != head.job_id or slot.partition_key != partition:
+                    raise JobConflict("job identity mismatch during quarantine")
+                # A conditional resubmission/repair beat the reservation. Make its
+                # existing acceptance visible again; never retire that reference.
+                if not slot.terminal:
+                    async with self.inbox._edit(partition) as edit:
+                        if any(ref.job_id == head.job_id for ref in edit.record.pending):
+                            edit.record.generation += 1
+                            await edit.save()
+                return False
+            if (slot.partition_key != partition or slot.record.job_id != head.job_id
+                    or slot.record.sequence != head.sequence):
+                raise JobConflict("quarantine reservation identity mismatch")
+            await self._finish_quarantine(slot, current.etag, guard)
+            return True
+
+    async def _finish_quarantine(self, fence: _QuarantineFence, etag: str,
+                                 guard: LeaseGuard) -> str:
+        job_id = fence.record.job_id
+        assert job_id is not None
+        name = self._name(job_id)
+        guard.assert_active()
+        etag = await self.gateway.write(name, _encode(fence), etag=etag, lease_id=guard.id)
+        marker_name = f"poison/job-{job_id}.json"
+        if not await self.gateway.create(marker_name, _encode(fence.record)):
+            marker = await self.gateway.read(marker_name)
+            if marker is None or QuarantineRecord.model_validate_json(marker.body) != fence.record:
+                raise JobConflict("quarantine marker changed")
+        if await self.gateway.read(self.inbox.name(fence.partition_key)) is not None:
+            async with self.inbox._edit(fence.partition_key) as edit:
+                # This write rechecks SERVER ownership after publishing the audit
+                # marker, immediately before the acceptance reference is retired.
+                guard.assert_active()
+                etag = await self.gateway.write(name, _encode(fence), etag=etag, lease_id=guard.id)
+                refs = edit.record.pending
+                if any(ref.job_id == job_id for ref in refs):
+                    if (refs[0].job_id != job_id
+                            or refs[0].sequence != fence.record.sequence):
+                        raise JobConflict("quarantine no longer matches the inbox head")
+                    refs.pop(0)
+                    if refs:
+                        edit.record.generation += 1
+                    await edit.save()
+        return etag
 
     async def load_payload(self, job_id: str) -> TaskPayload:
         self._name(job_id)
@@ -410,7 +522,9 @@ class JobStore:
             document = await self.gateway.read(name)
             if document is None:
                 raise JobConflict("leased job disappeared")
-            record = JobRecord.model_validate_json(document.body)
+            record = _JOB_SLOT.validate_json(document.body)
+            if isinstance(record, _QuarantineFence):
+                raise JobQuarantined("job identity is reserved for quarantine")
             if record.job_id != job_id:
                 raise JobConflict("leased job identity mismatch")
             payload = None
@@ -443,7 +557,11 @@ class JobStore:
             await self.gateway.delete(payload_name, etag=payload.etag)
 
     async def _prune_job(self, job_id: str, result: PruneResult) -> None:
-        record = await self.read(job_id)
+        try:
+            record = await self.read(job_id)
+        except JobQuarantined:
+            await self._prune_quarantine(job_id, result)
+            return
         if record is None or (
                 not record.terminal and self.now() < record.accepted_at + BODY_RETENTION):
             return
@@ -459,6 +577,49 @@ class JobStore:
                 await self.gateway.delete(self._name(job_id), etag=job.etag, lease_id=job.guard.id)
                 result.removed += 1
 
+    async def _prune_quarantine(self, job_id: str, result: PruneResult) -> None:
+        name = self._name(job_id)
+        if await self.gateway.read(name) is None:
+            # Upgrade a legacy marker before touching its orphaned body.
+            marker = await self.gateway.read(f"poison/job-{job_id}.json")
+            payload = await self.gateway.read(f"payload/{job_id}.json")
+            if marker is None or payload is None:
+                return
+            record = QuarantineRecord.model_validate_json(marker.body)
+            original = TaskPayload.model_validate_json(payload.body)
+            if record.job_id != job_id or original.job_id != job_id:
+                raise JobConflict("quarantined payload identity mismatch")
+            await self.gateway.create(name, _encode(
+                _QuarantineFence(partition_key=original.partition_key, record=record)))
+        async with self.gateway.lease(name) as guard:
+            document = await self.gateway.read(name)
+            if document is None:
+                raise JobConflict("leased quarantine reservation disappeared")
+            fence = _JOB_SLOT.validate_json(document.body)
+            if isinstance(fence, JobRecord):
+                return  # A repair won; do not delete its payload through a stale marker.
+            if fence.record.job_id != job_id:
+                raise JobConflict("quarantine reservation identity mismatch")
+            etag = await self._finish_quarantine(fence, document.etag, guard)
+            payload_name = f"payload/{job_id}.json"
+            payload = await self.gateway.read(payload_name)
+            if payload is not None:
+                original = TaskPayload.model_validate_json(payload.body)
+                if original.job_id != job_id or original.partition_key != fence.partition_key:
+                    raise JobConflict("quarantined payload identity mismatch")
+                if self.now() >= original.accepted_at + BODY_RETENTION:
+                    guard.assert_active()
+                    await self.gateway.delete(payload_name, etag=payload.etag)
+                    result.removed += 1
+            if self.now() >= fence.record.quarantined_at + METADATA_RETENTION:
+                guard.assert_active()
+                await self.gateway.delete(name, etag=etag, lease_id=guard.id)
+                marker_name = f"poison/job-{job_id}.json"
+                marker = await self.gateway.read(marker_name)
+                if marker is not None:
+                    await self.gateway.delete(marker_name, etag=marker.etag)
+                result.removed += 1
+
     async def _prune_candidate(self, prefix: str, name: str, result: PruneResult) -> None:
         if prefix == "jobs/":
             await self._prune_job(name.removeprefix(prefix).removesuffix(".json"), result)
@@ -468,12 +629,17 @@ class JobStore:
             return
         if prefix == "poison/":
             marker = QuarantineRecord.model_validate_json(document.body)
-            expected = (f"poison/job-{marker.job_id}.json"
-                        if marker.code == "job_missing" and marker.job_id
-                        else f"poison/wake-{marker.body_digest}.json")
-            if name != expected:
+            job_marker = f"poison/job-{marker.job_id}.json"
+            if name not in (job_marker, f"poison/wake-{marker.body_digest}.json"):
                 raise JobConflict("quarantine path mismatch")
             if self.now() >= marker.quarantined_at + METADATA_RETENTION:
+                if name == job_marker and marker.job_id is not None:
+                    await self._prune_quarantine(marker.job_id, result)
+                    if await self.gateway.read(self._name(marker.job_id)) is not None:
+                        return
+                    document = await self.gateway.read(name)
+                    if document is None:
+                        return
                 await self.gateway.delete(name, etag=document.etag)
                 result.removed += 1
             return
@@ -484,7 +650,12 @@ class JobStore:
                 raise JobConflict("payload path mismatch")
             if self.now() < payload.accepted_at + BODY_RETENTION:
                 return
-            if await self.read(payload.job_id) is None:
+            try:
+                record = await self.read(payload.job_id)
+            except JobQuarantined:
+                await self._prune_quarantine(payload.job_id, result)
+                return
+            if record is None:
                 # Reserve the actual missing job, so no concurrent submission can
                 # introduce an in-flight reference while an orphan is being removed.
                 terminal = JobRecord(

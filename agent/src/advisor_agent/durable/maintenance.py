@@ -13,7 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from advisor_agent.durable.history import BlobHistoryStore
 from advisor_agent.durable.jobs import (
-    BODY_RETENTION, JobConflict, JobQuarantined, JobStateError, JobStore, PruneCursor,
+    BODY_RETENTION, JobConflict, JobQuarantined, JobRecord, JobStateError, JobStore, PruneCursor,
     QuarantineRecord, TaskRef, _Inbox,
 )
 from advisor_agent.durable.leases import LeaseBusy, LeaseLost, _log_failure
@@ -68,6 +68,8 @@ class Maintenance:
 
     async def _quarantine(self, body: bytes, code: str, *,
                           head: TaskRef | None = None, partition: str | None = None) -> None:
+        if code == "job_missing":
+            raise JobStateError("job quarantine must reserve its actual storage identity")
         digest = hashlib.sha256(body).hexdigest()
         name = (f"poison/job-{head.job_id}.json" if head and code == "job_missing"
                 else f"poison/wake-{digest}.json")
@@ -77,6 +79,27 @@ class Maintenance:
         await self.gateway.create(name, metadata.model_dump_json().encode("utf-8"))
         if head is not None and partition is not None:
             await self.jobs.inbox.advance(partition, head.job_id)
+
+    async def _resolve_head(self, partition: str, head: TaskRef,
+                            result: MaintenanceResult) -> JobRecord | None:
+        try:
+            record = await self.jobs.read(head.job_id)
+        except (JobQuarantined, ValidationError) as error:
+            _log_failure("maintenance.job_invalid", error)
+        else:
+            if record is not None:
+                return record
+            _log_failure("maintenance.job_missing", JobStateError("job missing"))
+        if await self.jobs.quarantine_job(partition, head):
+            result.quarantined += 1
+            result.failed += 1
+            return None
+        # Submission/repair won the conditional reservation or the lease recheck.
+        # Process its current state, not the earlier missing/invalid observation.
+        record = await self.jobs.read(head.job_id)
+        if record is None:
+            raise JobConflict("repaired job disappeared")
+        return record
 
     async def _outbox_step(self, state: _State, result: MaintenanceResult) -> None:
         page = await self.gateway.list_page("inbox/", cursor=state.outbox_cursor, limit=1)
@@ -91,23 +114,8 @@ class Maintenance:
                     raise JobConflict("inbox path mismatch")
                 if record.pending:
                     head = record.pending[0]
-                    try:
-                        job_record = await self.jobs.read(head.job_id)
-                        missing = job_record is None
-                        terminal = job_record is not None and job_record.terminal
-                    except JobQuarantined:
-                        await self.jobs.inbox.advance(record.partition_key, head.job_id)
-                        missing = False
-                        terminal = False
-                        result.quarantined += 1
-                    if missing:
-                        _log_failure("maintenance.job_missing", JobStateError("job missing"))
-                        await self._quarantine(
-                            head.job_id.encode("utf-8"), "job_missing",
-                            head=head, partition=record.partition_key)
-                        result.failed += 1
-                        result.quarantined += 1
-                    elif terminal:
+                    job_record = await self._resolve_head(record.partition_key, head, result)
+                    if job_record is not None and job_record.terminal:
                         async with self.jobs.leased_job(head.job_id, include_payload=False) as job:
                             if not job.record.terminal:
                                 raise JobConflict("terminal ledger mismatch")
@@ -152,16 +160,16 @@ class Maintenance:
         if head is None:
             await delivery.ack()
             return
-        try:
-            record = await self.jobs.read(head.job_id)
-        except JobQuarantined:
-            await self.jobs.inbox.advance(wake.partition_key, head.job_id)
+        record = await self._resolve_head(wake.partition_key, head, result)
+        if record is None:
+            if await self.jobs.inbox.head(wake.partition_key) is not None:
+                await self.outbox.notify(wake.partition_key, wake.trace_id)
+                result.republished += 1
             await delivery.ack()
-            result.quarantined += 1
             return
-        if record is None or record.partition_key != wake.partition_key:
+        if record.partition_key != wake.partition_key:
             _log_failure("maintenance.poison_job_invalid", JobStateError("job inconsistent"))
-            await self._quarantine(delivery.body, "job_missing" if record is None else "invalid_job",
+            await self._quarantine(delivery.body, "invalid_job",
                                    head=head, partition=wake.partition_key)
             await delivery.ack()
             result.quarantined += 1
