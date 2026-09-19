@@ -21,6 +21,17 @@ P = ParamSpec("P")
 R = TypeVar("R")
 Attribute = str | int | float | bool | None
 _BOOT_ID = uuid4().hex
+MAX_MODEL_HTTP_ATTEMPTS = 1024
+
+
+@dataclass(frozen=True, slots=True)
+class ModelHttpAttempt:
+    """Completed HTTP-client attempt, not an inferred model invocation."""
+
+    call_id: str
+    attempt: int
+    operation: Literal["chat.completions", "embeddings"]
+    http_status: int | None
 
 
 @dataclass
@@ -31,6 +42,39 @@ class TraceContext:
     process_id: int = field(default_factory=os.getpid)
     started_at: float = field(default_factory=lambda: time.monotonic())
     timings: list[StepTiming] = field(default_factory=list)
+    _model_http_attempts: dict[tuple[str, int], ModelHttpAttempt] = field(
+        default_factory=dict, init=False, repr=False)
+    _model_http_attempts_complete: bool = field(default=True, init=False, repr=False)
+
+    @property
+    def model_http_attempts(self) -> tuple[ModelHttpAttempt, ...] | None:
+        """Read-only snapshot; invalid/conflicting/overflowed evidence is unknown."""
+        return tuple(self._model_http_attempts.values()) if self._model_http_attempts_complete else None
+
+    def observe_model_http_attempt(self, observation: ModelHttpAttempt) -> None:
+        if not self._model_http_attempts_complete:
+            return
+        if (not isinstance(observation, ModelHttpAttempt)
+                or not isinstance(observation.call_id, str)
+                or re.fullmatch(r"[0-9a-f]{32}", observation.call_id) is None
+                or type(observation.attempt) is not int
+                or not 1 <= observation.attempt <= 1_000_000
+                or observation.operation not in ("chat.completions", "embeddings")
+                or (observation.http_status is not None and (
+                    type(observation.http_status) is not int
+                    or not 100 <= observation.http_status <= 599))):
+            self._model_http_attempts_complete = False
+            self._model_http_attempts.clear()
+            return
+        key = observation.call_id, observation.attempt
+        previous = self._model_http_attempts.get(key)
+        if previous == observation:
+            return
+        if previous is not None or len(self._model_http_attempts) >= MAX_MODEL_HTTP_ATTEMPTS:
+            self._model_http_attempts_complete = False
+            self._model_http_attempts.clear()
+            return
+        self._model_http_attempts[key] = observation
 
 
 _trace: ContextVar[TraceContext | None] = ContextVar("advisor_trace", default=None)

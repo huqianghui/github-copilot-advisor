@@ -11,8 +11,13 @@ evidence is still required.
 
 Search dependency counts are observed source-operation attempts (including
 observed 429s), not inferred lower-level HTTP retries. Model rounds and usage
-come from completed ``llm.completion`` spans. HTTP model retry/throttle counts,
-cache usage, global backlog and unobserved resource metrics remain unknown.
+come from completed ``llm.completion`` spans. The model dependency instead counts
+actual completed diagnostic HTTP-client attempts for chat AND embeddings,
+including SDK retries/redirects, and observed HTTP 429 responses. It is not a
+model-round count or proof that the server accepted each request. DEBUG-off,
+absent, conflicting or capacity-exceeded attempt evidence stays omitted rather
+than becoming zero/partial counts. No headers, URLs or bodies enter this path.
+Cache usage, global backlog and unobserved resource metrics remain unknown.
 
 Wire stages describe operations completed before serialization, including actual
 history_read at preparation and history_commit at send when observed in that
@@ -194,6 +199,9 @@ def preparation_telemetry(observation: PreparationObservations, *, synthetic=Fal
         if timing.name == "llm.completion":
             completions.append(timing)
     counts = defaultdict(lambda: [0, 0])
+    attempts = observation.trace.model_http_attempts if observation.trace is not None else None
+    if attempts:
+        counts["model"] = [len(attempts), sum(item.http_status == 429 for item in attempts)]
     paths = []
     source_paths = {"kb": "kb", "github-live": "github", "web": "web"}
     source_dependencies = {"kb": "search", "github-live": "github", "web": "web"}

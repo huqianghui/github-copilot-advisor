@@ -139,6 +139,10 @@ async def test_chat_sdk_retry_attempts_have_safe_headers_gap_and_summary(
                and a["call_id"] == summary["call_id"] for a in attempts)
     assert span.attributes["input_tokens"] == 17
     assert span.attributes["output_tokens"] == 3
+    assert [(item.operation, item.attempt, item.http_status)
+            for item in trace.model_http_attempts] == [
+        ("chat.completions", 1, 429), ("chat.completions", 2, 200)]
+    assert len({item.call_id for item in trace.model_http_attempts}) == 1
     assert_private(caplog)
 
 
@@ -189,6 +193,7 @@ async def test_info_does_not_collect_state_or_attach_trace(monkeypatch, caplog):
     span = next(s for s in trace.timings if s.name == "llm.completion")
     assert span.attributes["input_tokens"] == 17
     assert span.attributes["output_tokens"] == 3
+    assert trace.model_http_attempts == ()
 
 
 @pytest.mark.parametrize("level, expected_calls", [("INFO", 0), ("DEBUG", 1)])
@@ -251,6 +256,8 @@ async def test_embedding_scope_uses_same_diagnostics_without_logging_vectors(
     assert summary["span_id"] == span.span_id
     assert summary["trace_id"] == trace.trace_id
     assert summary["usage"] == {"input_tokens": 7}
+    assert [(item.operation, item.http_status) for item in trace.model_http_attempts] == [
+        ("embeddings", 200)]
     assert_private(caplog)
 
 

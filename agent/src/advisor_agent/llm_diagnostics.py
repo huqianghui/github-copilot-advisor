@@ -3,6 +3,8 @@
 HTTP hooks observe attempts/headers, not first tokens or server/model execution.
 The public HTTP client's send boundary includes body consumption; the SDK-call
 boundary additionally includes retries, SDK processing and response parsing.
+Completed attempts also populate bounded, payload-free evidence on the trace
+captured at SDK-call entry. DEBUG-off calls collect neither logs nor attempts.
 """
 from collections.abc import Awaitable, Callable, Mapping, MutableMapping
 from contextlib import AbstractContextManager
@@ -17,7 +19,9 @@ from uuid import uuid4
 
 from openai import DefaultAsyncHttpxClient
 
-from advisor_shared.telemetry import current_span, current_trace, failure_status
+from advisor_shared.telemetry import (
+    ModelHttpAttempt, TraceContext, current_span, current_trace, failure_status,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +112,7 @@ def _safe_headers(headers: _Headers) -> tuple[dict[str, str], dict[str, int | fl
 
 @dataclass
 class _Call:
-    operation: str
+    operation: Literal["chat.completions", "embeddings"]
     started: float = field(default_factory=perf_counter)
     call_id: str = field(default_factory=lambda: uuid4().hex)
     trace_id: str | None = None
@@ -119,6 +123,7 @@ class _Call:
     sdk_retry_count: int | None = None
     usage: dict[str, int] = field(default_factory=dict)
     finished: bool = False
+    trace_context: TraceContext | None = field(default=None, repr=False)
 
     def emit(self, log_event: str, **attributes: Any) -> None:
         logger.debug(log_event, extra={"telemetry": {
@@ -161,6 +166,9 @@ class _Attempt:
     def finish(self, ended: float, error: BaseException | None,
                boundary: str) -> None:
         self.finished = True
+        if self.call.trace_context is not None:
+            self.call.trace_context.observe_model_http_attempt(ModelHttpAttempt(
+                self.call.call_id, self.number, self.call.operation, self.http_status))
         self.emit(
             "llm.http.attempt_completed",
             duration_ms=_milliseconds(self.started, ended),
@@ -304,7 +312,7 @@ class _SDKCallScope(AbstractContextManager[_Call | None]):
             return None
         trace, span = current_trace(), current_span()
         self.call = _Call(self.operation, trace_id=trace.trace_id if trace else None,
-                          span_id=span.span_id if span else None)
+                          span_id=span.span_id if span else None, trace_context=trace)
         self.token = _active_call.set(self.call)
         return self.call
 
