@@ -27,6 +27,7 @@ RESOURCE_TYPES = {
     "microsoft.containerregistry/registries", "microsoft.operationalinsights/workspaces",
     "microsoft.insights/components", "microsoft.web/sites", "microsoft.web/serverfarms",
     "microsoft.botservice/botservices",
+    "microsoft.network/networksecurityperimeters",
 }
 OUTPUT_FIELDS = {
     "target", "resource_group", "app_id", "app_name", "endpoint", "storage_id", "blob_url", "queue_url",
@@ -89,6 +90,15 @@ def experiment_resource(identifier: object) -> str:
         resource_type = (parts[6] + "/" + parts[7]).lower()
         if resource_type not in RESOURCE_TYPES or "microsoft.authorization" in identifier.lower():
             raise fail("resource_type_not_owned")
+        if resource_type == "microsoft.network/networksecurityperimeters" and (
+            parts[4].lower() != GROUPS["aca"]
+            or not (
+                len(parts) == 9
+                or len(parts) == 11 and parts[9].lower() in {"profiles", "resourceassociations"}
+                or len(parts) == 13 and parts[9].lower() == "profiles" and parts[11].lower() == "accessrules"
+            )
+        ):
+            raise fail("network_resource_type_not_owned")
     return str(identifier)
 
 

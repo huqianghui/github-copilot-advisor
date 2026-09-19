@@ -1383,7 +1383,7 @@ def cleanup(path: Path, repo: Path, cli: Cli, supplied_confirmation: str | None,
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="advisor-deploy-operations")
-    parser.add_argument("operation", choices=["preflight", "deploy", "identity", "set-mode", "cleanup", "bench-deploy", "bench-control", "reconcile"])
+    parser.add_argument("operation", choices=["preflight", "deploy", "identity", "set-mode", "cleanup", "bench-deploy", "bench-control", "reconcile", "network-deploy"])
     parser.add_argument("--repository", type=Path, required=True)
     parser.add_argument("--private-directory", type=Path, required=True)
     parser.add_argument("--parameters-file", type=Path)
@@ -1407,7 +1407,12 @@ def main(argv: list[str] | None = None) -> int:
         repo = args.repository.resolve()
         private = PrivateFiles(args.private_directory, repo)
         cli = Cli("WhatIf" if args.operation == "preflight" else args.mode, repo, private)
-        if args.operation in {"bench-deploy", "bench-control"}:
+        if args.operation == "network-deploy":
+            if args.parameters_file is None:
+                raise fail("network_plan_required")
+            from advisor_deploy.network_deploy import deploy_network
+            report = deploy_network(args.parameters_file.absolute(), repo, cli, private, args.confirmation)
+        elif args.operation in {"bench-deploy", "bench-control"}:
             if args.parameters_file is None:
                 raise fail("benchmark_deployment_plan_required")
             from advisor_deploy.benchmark_deploy import control_benchmark, deploy_benchmark

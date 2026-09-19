@@ -175,6 +175,15 @@ they are not imported from deployment configuration.
 
 ## Prerequisite and post-deployment gates
 
+For the management-group Storage policy that accepts `SecuredByPerimeter`,
+see the bounded [Enforced NSP preparation and deployment helper](network/README.md).
+It protects only the two ledger-owned Storage accounts with one subscription
+inbound rule, retains narrow MI data roles, and never reenables unrestricted
+public access or adds a policy exception. Shared state Bicep now retains the
+policy-compatible PNA intent on later target deployments. Network control-plane
+readback remains separate from the parent's actual Blob/Queue and question
+acceptance checks.
+
 Preflight checks the active subscription/tenant, provider registration,
 ownership collisions, effective ARM actions at required scopes, dependency
 existence/region/auth configuration, model deployment metadata, and the Search

@@ -2,6 +2,9 @@ param name string
 param location string
 param tags object
 param includeDeploymentContainer bool = false
+@description('Policy-compatible lockdown. SecuredByPerimeter also denies public access before association; never redeploy Enabled.')
+@allowed(['Disabled', 'SecuredByPerimeter'])
+param storagePublicNetworkAccess string = 'SecuredByPerimeter'
 
 resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   name: name
@@ -18,9 +21,9 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
     defaultToOAuthAuthentication: true
     minimumTlsVersion: 'TLS1_2'
     supportsHttpsTrafficOnly: true
-    publicNetworkAccess: 'Enabled'
+    publicNetworkAccess: storagePublicNetworkAccess
     networkAcls: {
-      defaultAction: 'Allow'
+      defaultAction: 'Deny'
       bypass: 'None'
     }
   }
