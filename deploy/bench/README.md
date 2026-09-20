@@ -6,10 +6,16 @@ observer's high-resolution monotonic `perf_counter` clock (resolution is
 recorded). Admission HTTP 202 and typing never release a
 question slot. A callback can arrive before its ACK.
 
-**Status:** the local synthetic HTTP boundary is runnable. Production target
-routes below belong to **Task 11** and must exist before cloud execution.
-This directory does not install those routes, provision resources, call a
-model, validate cloud capacity, or contain measured cloud reports.
+**Status:** local synthetic execution and the actual ACA experiment have been
+exercised; see the [measured results and limitations](../reports/summary.md).
+Flex workload deployment remains gated by actual regional quota evidence.
+Local synthetic success never substitutes for cloud capacity or performance.
+
+After measurement, use the [guarded closure workflow](CLOSURE.md) to disable
+benchmark access and suspend the temporary observer without deleting resources.
+An expired plan must not be blindly reactivated. Include build/deployment time
+when choosing a sealed plan's validity window; it starts at preparation, not
+at workload START. Preserve partial results if that window expires.
 
 ## Run locally
 

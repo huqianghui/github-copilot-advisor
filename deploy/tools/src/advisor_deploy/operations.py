@@ -90,7 +90,9 @@ class Cli:
         self._docker_endpoint = endpoint
         return endpoint
 
-    def run(self, arguments: list[str], phase: str, *, mutation=False, empty=False, raw=False, tool="az", stdin=None):
+    def run(self, arguments: list[str], phase: str, *, mutation=False, empty=False, raw=False, tool="az", stdin=None, timeout=None):
+        if timeout is not None and (type(timeout) not in {int, float} or not 0 < timeout <= 1200):
+            raise fail("invalid_command_timeout")
         if mutation and self.mode != "Apply":
             raise fail("mutation_requires_explicit_apply")
         if arguments[:2] in (["account", "set"], ["provider", "register"]):
@@ -127,7 +129,7 @@ class Cli:
         try:
             result = subprocess.run(
                 args, cwd=self.repo, env=environment, input=stdin, capture_output=True,
-                text=True, encoding="utf-8", errors="replace", timeout=1200 if mutation else 120,
+                text=True, encoding="utf-8", errors="replace", timeout=timeout if timeout is not None else (1200 if mutation else 120),
             )
         except (OSError, subprocess.TimeoutExpired):
             raise CliFailure(phase, "unavailable_or_timeout") from None
@@ -148,7 +150,7 @@ class Cli:
         except json.JSONDecodeError:
             raise CliFailure(phase, "malformed_json") from None
 
-    def rest(self, method: str, url: str, phase: str, *, body=None, resource=None, headers=None, empty=False):
+    def rest(self, method: str, url: str, phase: str, *, body=None, resource=None, headers=None, empty=False, timeout=None):
         arguments = ["rest", "--method", method, "--url", url]
         if body is not None:
             arguments += ["--body", "@" + str(self.private.json(body))]
@@ -156,7 +158,8 @@ class Cli:
             arguments += ["--resource", resource]
         if headers:
             arguments += ["--headers", "@" + str(self.private.json(headers)), "--skip-authorization-header"]
-        return self.run(arguments, phase, mutation=method.lower() not in {"get", "head"}, empty=empty)
+        return self.run(arguments, phase, mutation=method.lower() not in {"get", "head"}, empty=empty,
+                        **({"timeout": timeout} if timeout is not None else {}))
 
 
 def deployment_arguments(target: str, action: str, template: Path, parameters: Path, name: str) -> list[str]:
@@ -1383,7 +1386,7 @@ def cleanup(path: Path, repo: Path, cli: Cli, supplied_confirmation: str | None,
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="advisor-deploy-operations")
-    parser.add_argument("operation", choices=["preflight", "deploy", "identity", "set-mode", "cleanup", "bench-deploy", "bench-control", "reconcile", "network-deploy"])
+    parser.add_argument("operation", choices=["preflight", "deploy", "identity", "set-mode", "cleanup", "bench-deploy", "bench-control", "bench-close", "reconcile", "network-deploy"])
     parser.add_argument("--repository", type=Path, required=True)
     parser.add_argument("--private-directory", type=Path, required=True)
     parser.add_argument("--parameters-file", type=Path)
@@ -1407,7 +1410,12 @@ def main(argv: list[str] | None = None) -> int:
         repo = args.repository.resolve()
         private = PrivateFiles(args.private_directory, repo)
         cli = Cli("WhatIf" if args.operation == "preflight" else args.mode, repo, private)
-        if args.operation == "network-deploy":
+        if args.operation == "bench-close":
+            if args.parameters_file is None:
+                raise fail("closure_plan_required")
+            from advisor_deploy.benchmark_close import close_benchmark
+            report = close_benchmark(args.parameters_file.absolute(), repo, cli, private, args.confirmation)
+        elif args.operation == "network-deploy":
             if args.parameters_file is None:
                 raise fail("network_plan_required")
             from advisor_deploy.network_deploy import deploy_network

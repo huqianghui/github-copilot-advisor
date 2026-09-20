@@ -5,6 +5,12 @@ evidence. Their default is read-only `WhatIf`. They never select another
 subscription, register providers, enable keys, relax authentication, or adopt
 an unrecorded resource group/application.
 
+For measured results, current resource disposition and remaining blockers, see
+the [experiment report](reports/summary.md). The
+[benchmark closure workflow](bench/CLOSURE.md) disables benchmark access and
+suspends the temporary observer without deleting resources or changing Teams
+ingress; resource deletion remains a separate confirmed operation.
+
 Prerequisites: PowerShell 7.4+, Azure CLI/Bicep, the configured workspace
 `.venv`, and the Task 12 packaging tools. Select the image strategy explicitly:
 `ACA_BUILD_MODE=acr` uses guarded ACR Tasks without local Docker;

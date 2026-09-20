@@ -124,7 +124,7 @@ def _state(path, run_id, environment):
             raise fail("invalid_benchmark_state")
         for identifier in value[name]:
             arm_parts(identifier)
-    if value["phase"] not in {"planned", "bootstrapped", "published", "app_deployed", "failed"}:
+    if value["phase"] not in {"planned", "bootstrapped", "published", "app_deployed", "suspended", "failed"}:
         raise fail("invalid_benchmark_state_phase")
     if value["planned_app_id"] and (
         not re.fullmatch(r"ca-bench-[a-z0-9-]+", value["planned_app_name"])
