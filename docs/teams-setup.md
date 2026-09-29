@@ -1,7 +1,9 @@
 # Teams 联调与部署
 
 本文前四节保留原本地 dev tunnel 联调流程。ACA/Flex 的独立云部署入口见
-[部署说明](../deploy/README.md),实际验证状态见[实验报告](../deploy/reports/summary.md)。
+[部署说明](../deploy/README.md),归档验证状态见
+[中文实验报告](../deploy/reports/2026-09-20-cn/summary.md)
+([English](../deploy/reports/2026-09-20-en/summary.md))。
 云实验使用新的 Bot/托管身份,不要替换本地 Bot 的消息地址或 `.env` 凭据。
 
 ## 一、Azure Bot 注册(一次性)

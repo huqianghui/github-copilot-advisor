@@ -7,7 +7,9 @@ recorded). Admission HTTP 202 and typing never release a
 question slot. A callback can arrive before its ACK.
 
 **Status:** local synthetic execution and the actual ACA experiment have been
-exercised; see the [measured results and limitations](../reports/summary.md).
+exercised; see the [measured results and limitations](../reports/2026-09-20-en/summary.md)
+([中文](../reports/2026-09-20-cn/summary.md)) and
+[stage definitions](../reports/2026-09-20-en/stage-definitions.md).
 Flex workload deployment remains gated by actual regional quota evidence.
 Local synthetic success never substitutes for cloud capacity or performance.
 

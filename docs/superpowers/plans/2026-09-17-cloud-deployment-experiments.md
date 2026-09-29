@@ -68,7 +68,7 @@ Azurite 仍不能证明 Azure RBAC 或云部署可用。
 后续完整离线应用回归为 1238 passed、1 failed、19 integration deselected:
 唯一失败是未改动的 typing 测试对 Windows 低精度事件循环时间戳的严格递增断言,
 该文件单独运行 21 项通过。详细限制及最新状态见
-[实验状态报告](../../../deploy/reports/summary.md),不能将这次回归记为全绿。
+[实验状态报告](../../../deploy/reports/2026-09-20-cn/summary.md),不能将这次回归记为全绿。
 
 ### 0.1 依赖及宿主事实
 

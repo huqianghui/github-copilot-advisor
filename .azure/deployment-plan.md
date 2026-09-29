@@ -116,7 +116,7 @@ A later independent ARM read found target replicas0 as well.
 No resources, identities, RBAC, policy, Flex code or durable results were deleted
 or changed outside the approved control scope. Cold remains8/10 partial and
 attempt9's missing final remains unresolved. Details and exact commands are in
-`deploy/reports/aca-benchmark-closure.md`.
+`deploy/reports/2026-09-20-en/aca-benchmark-closure.md`.
 Final closure and shared-deployment regression command passed **65 tests**;
 independent live ARM readback reconfirmed the closed observer and target min0
 with actual target replicas0. HEAD was not changed.
@@ -474,5 +474,5 @@ HTTP/Queue/Timer instance count. Capacity projection must account for these grou
 and does not reserve quota. Published regional default quota is not evidence of
 the subscription's current remaining capacity.
 
-See the [experiment status report](../deploy/reports/summary.md) for the distinction
+See the [experiment status report](../deploy/reports/2026-09-20-en/summary.md) for the distinction
 between verified local behavior and all still-unmeasured cloud outcomes.

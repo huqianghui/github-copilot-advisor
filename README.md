@@ -41,9 +41,11 @@ uv run --env-file .env python -m teams_adapter  # 启动 Teams bot(见 docs/team
   模型只读取该分区最近 20 条有效历史。群内回复仍公开。
 
 入口:[部署与安全门槛](deploy/README.md) · [本地存储验证](deploy/local/README.md) ·
-[压测工具与口径](deploy/bench/README.md) · [实验状态/报告](deploy/reports/summary.md)。
-**当前尚未完成云部署或云端性能实验**;本地测试、健康检查与 HTTP 202
-不代表真实云端问答或 Teams 客户端验收通过。
+[压测工具与口径](deploy/bench/README.md) ·
+[中文实验报告](deploy/reports/2026-09-20-cn/summary.md) ·
+[English report](deploy/reports/2026-09-20-en/summary.md)。
+2026-09-20 归档记录了 ACA 实测和剩余限制,完整 ACA/Flex 对比仍未完成;
+本地测试、健康检查与 HTTP 202 不代表真实云端问答或 Teams 客户端验收通过。
 
 ## 回答策略
 

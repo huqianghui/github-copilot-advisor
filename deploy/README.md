@@ -6,7 +6,8 @@ subscription, register providers, enable keys, relax authentication, or adopt
 an unrecorded resource group/application.
 
 For measured results, current resource disposition and remaining blockers, see
-the [experiment report](reports/summary.md). The
+the [English experiment archive](reports/2026-09-20-en/summary.md)
+([中文](reports/2026-09-20-cn/summary.md)). The
 [benchmark closure workflow](bench/CLOSURE.md) disables benchmark access and
 suspends the temporary observer without deleting resources or changing Teams
 ingress; resource deletion remains a separate confirmed operation.
